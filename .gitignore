@@ -10,13 +10,6 @@ utils/__pycache__/
 .vscode/
 utils/file_processing/
 
-# papers
-SPIE_journal_papers__sample_manuscript_showing_style_and_formatting_specifications/
-article/
-paper/
-*PDF
-*json_files
-
 # training outputs
 outputs/
 outputs_distill/
@@ -34,5 +27,3 @@ sem_CKD_student_mobilefacenet.py
 test-copy.py
 
 !requirements.txt
-
-.codex
