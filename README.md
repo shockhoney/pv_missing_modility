@@ -1,113 +1,259 @@
-# 掌纹掌静脉融合识别系统
+# 掌纹-掌静脉模态缺失识别
 
-基于深度学习的轻量化多模态生物特征融合识别系统，采用知识蒸馏技术实现模型压缩与加速。
+本项目面向 PolyU 掌纹与掌静脉双模态识别，研究重点是**模态缺失场景下的验证任务**。整体流程采用三阶段训练：
 
-## 研究背景
+1. 联合预训练掌纹与掌静脉 `MobileFaceNet` 编码器，并对齐共享身份空间
+2. 在稳定特征空间上训练跨模态特征恢复器
+3. 训练 DyMo 风格的 transformer 融合与动态选择模块
 
-本项目面向生物特征识别领域，融合掌纹(Palmprint)与掌静脉(Palm Vein)两种模态信息，通过跨模态注意力机制和通道注意力融合策略，提升识别精度与鲁棒性。系统采用两阶段训练策略，并引入知识蒸馏技术将大型教师模型的知识迁移至轻量级学生模型，实现精度与效率的平衡。
+最终测试输出完整模态、单模态缺失和随机缺失场景下的 `EER`、`AUC`、`TAR@FAR` 等指标。
 
-## 方法概述
+## 仓库结构
 
-### 网络架构
-
-
-### 训练策略
-
-**阶段一：单模态预训练**
-- 分别训练掌纹、掌静脉特征提取网络
-- 使用ArcFace Loss进行度量学习
-
-**阶段二：融合模型训练**
-- 加载预训练的单模态网络
-- 引入跨模态注意力机制
-- 端到端微调融合网络
-
-**知识蒸馏**
-- 教师模型：MobileFaceNet + Stage2Fusion
-- 学生模型：TinyMobileFaceNet + StudentFusion
-- 蒸馏损失：Embedding KD + Relational KD + Classification Loss
-
-### 核心模块
-
-| 模块 | 描述 |
-|------|------|
-| MobileFaceNet | 教师骨干网络，基于深度可分离卷积 |
-| TinyMobileFaceNet | 学生骨干网络，更少的通道数和残差块，附加ECA注意力 |
-| CrossModalAttention | 跨模态注意力机制，增强模态间信息交互 |
-| ChannelAttentionFusion | 通道注意力融合，自适应学习模态权重 |
-| Stage2FusionStudent_BottleneckGate | 学生融合模块，采用瓶颈结构与门控机制 |
-
-
+```text
+pv_missing_modility/
+|-- build_polyu_missing_protocol.py
+|-- train_encoder.py
+|-- train_recoverer.py
+|-- train_dymo.py
+|-- prepare_dymo_stats.py
+|-- test_dymo.py
+|-- requirements.txt
+|-- README.md
+|-- data/
+|-- data_txt/
+|-- models/
+|   |-- stage1_mobileFacenet.py
+|   `-- dymo.py
+`-- utils/
+    |-- datasets_txt.py
+    |-- dymo_stats.py
+    |-- metrics.py
+    `-- prototype_loss.py
 ```
 
-## 环境配置
+## 数据与协议
 
-### 依赖要求
+默认使用 PolyU 数据集，原始目录为：
 
-- Python 3.8+
-- PyTorch 1.10+ (支持CUDA)
-- 其他依赖见 `requirements.txt`
+```text
+data/PolyU/
+```
 
-### 安装
+协议文件位于：
+
+```text
+data_txt/
+```
+
+默认使用四个协议文件：
+
+- `polyu_train_full.txt`
+- `polyu_val_full.txt`
+- `polyu_val_missing_fixed.txt`
+- `polyu_test_missing_protocol.txt`
+
+协议格式：
+
+```text
+palm_path vein_path label palm_exists vein_exists split
+```
+
+含义：
+
+- `palm_path`：掌纹图像路径，缺失时为 `NA`
+- `vein_path`：掌静脉图像路径，缺失时为 `NA`
+- `label`：类别标签
+- `palm_exists` / `vein_exists`：模态是否存在
+- `split`：协议类型，如 `train`、`val`、`full`、`palm_only`、`vein_only`、`random_missing`
+
+如需重新生成协议：
 
 ```bash
-# 安装PyTorch (根据CUDA版本选择)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+python build_polyu_missing_protocol.py --root_dir data/PolyU --output_dir data_txt
+```
 
-# 安装其他依赖
+## 模型流程
+
+### 1. 共享身份空间编码器
+
+- `train_encoder.py --modality joint`
+
+联合训练掌纹与掌静脉两路 `MobileFaceNet`，使用共享分类头和跨模态监督对比损失，让两种模态落在同一个身份空间中。训练完成后仍会导出兼容下游脚本的 `palm_best.pth` 和 `vein_best.pth`。
+
+### 2. 特征恢复器
+
+恢复器学习两条映射：
+
+- `palm -> recovered vein`
+- `vein -> recovered palm`
+
+恢复器只在特征空间工作，不做图像生成。训练时先冻结编码器，再小学习率微调。
+
+### 3. DyMo 主模型
+
+DyMo 主体包括：
+
+- 双分支 `MobileFaceNet`
+- 缺失模态恢复器
+- token 化与动态 transformer 融合
+- 分类头与验证 embedding 投影头
+- DyMo 动态选择器
+
+DyMo 会分别比较：
+
+- 只使用真实可用模态
+- 加入恢复模态后再次融合
+
+如果加入恢复模态后质量更高，就接受恢复模态用于最终验证。
+
+## 环境安装
+
+```bash
 pip install -r requirements.txt
 ```
 
-## 使用方法
+## 训练流程
 
-### 数据准备
+推荐按以下顺序运行。
 
-数据集列表文件格式 (`txt-datasets/`)：
-
-**单模态列表** (用于阶段一)：
-```
-/path/to/image1.jpg label1
-/path/to/image2.jpg label2
-...
-```
-
-**配对列表** (用于阶段二)：
-```
-/path/to/palm1.jpg /path/to/vein1.jpg label1
-/path/to/palm2.jpg /path/to/vein2.jpg label2
-...
-```
-
-### 训练教师模型
+### 第一步：联合预训练掌纹/掌静脉编码器
 
 ```bash
-python train_teacher.py
+python train_encoder.py ^
+  --modality joint ^
+  --train_full_list data_txt/polyu_train_full.txt ^
+  --val_full_list data_txt/polyu_val_full.txt ^
+  --save_dir outputs_dymo/encoders
 ```
 
-训练参数配置位于脚本内Config类：
+输出：
 
-### 知识蒸馏训练
+```text
+outputs_dymo/encoders/palm_best.pth
+outputs_dymo/encoders/vein_best.pth
+outputs_dymo/encoders/joint_best.pth
+```
+
+如需保留旧的单模态独立训练方式，仍可分别运行 `--modality palm` 与 `--modality vein`。
+
+### 第二步：训练特征恢复器
 
 ```bash
-python train_s_vkd.py \
-    --train_list txt-datasets/polyu_phase2_train.txt \
-    --val_list txt-datasets/polyu_phase2_val.txt \
-    --teacher_ckpt outputs/models/stage2_best.pth \
-    --epochs 200 \
-    --batch_size 16 \
-    --lambda_emb 2.0 \
-    --lambda_rel 2.0
+python train_recoverer.py ^
+  --train_full_list data_txt/polyu_train_full.txt ^
+  --val_full_list data_txt/polyu_val_full.txt ^
+  --palm_ckpt outputs_dymo/encoders/palm_best.pth ^
+  --vein_ckpt outputs_dymo/encoders/vein_best.pth ^
+  --save_dir outputs_dymo/recoverer
 ```
 
-### 模型测试
+输出：
+
+```text
+outputs_dymo/recoverer/recoverer_best.pth
+```
+
+### 第三步：训练 DyMo 主模型
 
 ```bash
-python test.py
+python train_dymo.py ^
+  --train_full_list data_txt/polyu_train_full.txt ^
+  --val_full_list data_txt/polyu_val_full.txt ^
+  --val_missing_list data_txt/polyu_val_missing_fixed.txt ^
+  --palm_ckpt outputs_dymo/encoders/palm_best.pth ^
+  --vein_ckpt outputs_dymo/encoders/vein_best.pth ^
+  --recoverer_ckpt outputs_dymo/recoverer/recoverer_best.pth ^
+  --save_dir outputs_dymo/dymo
 ```
 
-测试配置（位于脚本内Config类）：
+默认会：
 
+- 用 palm / vein 预训练 checkpoint 初始化两路编码器
+- 用 recoverer checkpoint 初始化恢复器
+- 低学习率微调编码器
+- 冻结恢复器，仅训练 transformer 与 DyMo 主体
 
-## 引用
+如需让 recoverer 在 DyMo 阶段继续联合训练，可加：
 
-如果本项目对您的研究有帮助，请引用相关论文。
+```bash
+--train_recoverers
+```
+
+输出：
+
+```text
+outputs_dymo/dymo/dymo_best.pth
+```
+
+### 第四步：生成 DyMo 统计量
+
+```bash
+python prepare_dymo_stats.py ^
+  --train_full_list data_txt/polyu_train_full.txt ^
+  --checkpoint outputs_dymo/dymo/dymo_best.pth
+```
+
+输出：
+
+```text
+outputs_dymo/dymo/gaussian/subset_gaussian.pt
+```
+
+### 第五步：测试
+
+```bash
+python test_dymo.py ^
+  --train_full_list data_txt/polyu_train_full.txt ^
+  --val_protocol_list data_txt/polyu_val_missing_fixed.txt ^
+  --protocol_list data_txt/polyu_test_missing_protocol.txt ^
+  --palm_ckpt outputs_dymo/encoders/palm_best.pth ^
+  --vein_ckpt outputs_dymo/encoders/vein_best.pth ^
+  --checkpoint outputs_dymo/dymo/dymo_best.pth ^
+  --stats_path outputs_dymo/dymo/gaussian/subset_gaussian.pt ^
+  --selection_mode open ^
+  --search_tau
+```
+
+## 测试输出
+
+测试脚本会输出三组结果：
+
+1. `Single-Modality Baseline`
+   - palm encoder baseline
+   - vein encoder baseline
+
+2. `DyMo Without Recovered Selection`
+   - 只使用真实可用模态，不启用恢复模态
+
+3. `DyMo With Recovered Selection`
+   - 启用 log-prob reward 的 DyMo 选择器
+   - 可在验证集搜索 `palm_only` / `vein_only` 的固定 `tau` 后再测试
+
+正式测试协议覆盖：
+
+- `full`
+- `palm_only`
+- `vein_only`
+- `random_missing`
+
+指标包括：
+
+- `AUC`
+- `EER`
+- `ACC@EER threshold`
+- `TAR@FAR=1e-5`
+- `TAR@FAR=1e-4`
+- `TAR@FAR=1e-3`
+- `Recovered modality accepted ratio`
+
+## 推荐执行顺序
+
+```bash
+python build_polyu_missing_protocol.py --root_dir data/PolyU --output_dir data_txt
+python train_encoder.py --modality joint --train_full_list data_txt/polyu_train_full.txt --val_full_list data_txt/polyu_val_full.txt --save_dir outputs_dymo/encoders
+python train_recoverer.py --train_full_list data_txt/polyu_train_full.txt --val_full_list data_txt/polyu_val_full.txt --palm_ckpt outputs_dymo/encoders/palm_best.pth --vein_ckpt outputs_dymo/encoders/vein_best.pth --save_dir outputs_dymo/recoverer
+python train_dymo.py --train_full_list data_txt/polyu_train_full.txt --val_full_list data_txt/polyu_val_full.txt --val_missing_list data_txt/polyu_val_missing_fixed.txt --palm_ckpt outputs_dymo/encoders/palm_best.pth --vein_ckpt outputs_dymo/encoders/vein_best.pth --recoverer_ckpt outputs_dymo/recoverer/recoverer_best.pth --save_dir outputs_dymo/dymo
+python prepare_dymo_stats.py --train_full_list data_txt/polyu_train_full.txt --checkpoint outputs_dymo/dymo/dymo_best.pth
+python test_dymo.py --train_full_list data_txt/polyu_train_full.txt --val_protocol_list data_txt/polyu_val_missing_fixed.txt --protocol_list data_txt/polyu_test_missing_protocol.txt --palm_ckpt outputs_dymo/encoders/palm_best.pth --vein_ckpt outputs_dymo/encoders/vein_best.pth --checkpoint outputs_dymo/dymo/dymo_best.pth --stats_path outputs_dymo/dymo/gaussian/subset_gaussian.pt --selection_mode open --search_tau
+```
