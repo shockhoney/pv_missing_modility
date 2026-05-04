@@ -117,6 +117,7 @@ def score_embeddings(
         "ics_gaussian": ics_gaussian,
         "open_quality": open_quality,
         "open_gaussian": open_gaussian,
+        "quality_mode": quality_mode,
     }
 
 
@@ -125,6 +126,7 @@ def calibrated_reward(
     before_gaussian: torch.Tensor,
     after_quality: torch.Tensor,
     after_gaussian: torch.Tensor,
+    quality_mode: str = "log_prob",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     calibration = torch.ones_like(before_quality)
     calibration = torch.where(
@@ -132,25 +134,35 @@ def calibrated_reward(
         after_gaussian / (before_gaussian + COSINE_EPS),
         calibration,
     )
-    reward = after_quality * calibration - before_quality
+    if quality_mode == "log_prob":
+        reward = after_quality - before_quality + torch.log(calibration.clamp_min(COSINE_EPS))
+    elif quality_mode == "probability":
+        reward = after_quality * calibration - before_quality
+    else:
+        raise ValueError(f"Unsupported selector quality_mode: {quality_mode}")
     return reward, calibration
 
 
 def compute_selection_rewards(
     before_scores: Dict[str, torch.Tensor],
     after_scores: Dict[str, torch.Tensor],
+    quality_mode: str | None = None,
 ) -> Dict[str, torch.Tensor]:
+    if quality_mode is None:
+        quality_mode = after_scores.get("quality_mode", before_scores.get("quality_mode", "log_prob"))
     open_reward, open_calibration = calibrated_reward(
         before_scores["open_quality"],
         before_scores["open_gaussian"],
         after_scores["open_quality"],
         after_scores["open_gaussian"],
+        quality_mode=quality_mode,
     )
     ics_reward, ics_calibration = calibrated_reward(
         before_scores["ics_quality"],
         before_scores["ics_gaussian"],
         after_scores["ics_quality"],
         after_scores["ics_gaussian"],
+        quality_mode=quality_mode,
     )
     return {
         "open_reward": open_reward,

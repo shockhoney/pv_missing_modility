@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from models.dymo import PalmVeinDynamicTransformer
 from utils.datasets_txt import MissingPairTxtDataset
+from utils.head import ArcFace
 
 
 def get_transforms(img_size: int, strong: bool):
@@ -200,10 +201,10 @@ def validate(model, palm_head, vein_head, loader, device, args):
         labels = labels.to(device, non_blocking=True)
 
         encoded = model.encode_modalities(palm, vein)
-        logits_palm = palm_head(F.normalize(encoded["palm_global"], dim=1))
-        logits_vein = vein_head(F.normalize(encoded["vein_global"], dim=1))
-        logits_rec_palm = palm_head(F.normalize(encoded["recovered_palm_global"], dim=1))
-        logits_rec_vein = vein_head(F.normalize(encoded["recovered_vein_global"], dim=1))
+        logits_palm = palm_head(F.normalize(encoded["palm_global"], dim=1), None)
+        logits_vein = vein_head(F.normalize(encoded["vein_global"], dim=1), None)
+        logits_rec_palm = palm_head(F.normalize(encoded["recovered_palm_global"], dim=1), None)
+        logits_rec_vein = vein_head(F.normalize(encoded["recovered_vein_global"], dim=1), None)
 
         losses = compute_losses(encoded, logits_palm, logits_vein, logits_rec_palm, logits_rec_vein, labels, ce)
         loss = (
@@ -249,7 +250,7 @@ def main():
     parser.add_argument("--vein_ckpt", type=str, default="outputs_dymo/encoders/vein_best.pth")
     parser.add_argument("--save_dir", type=str, default="outputs_dymo/recoverer")
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--freeze_encoder_epochs", type=int, default=50)
+    parser.add_argument("--freeze_encoder_epochs", type=int, default=999999)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--input_size", type=int, default=224)
@@ -269,6 +270,8 @@ def main():
     parser.add_argument("--lambda_token_l2", type=float, default=2.0)
     parser.add_argument("--lambda_token_cos", type=float, default=1.0)
     parser.add_argument("--lambda_conf", type=float, default=0.2)
+    parser.add_argument("--arcface_s", type=float, default=64.0)
+    parser.add_argument("--arcface_m", type=float, default=0.5)
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -301,8 +304,8 @@ def main():
         transformer_layers=args.transformer_layers,
         projection_dim=args.projection_dim,
     ).to(device)
-    palm_head = nn.Linear(args.encoder_dim, num_classes).to(device)
-    vein_head = nn.Linear(args.encoder_dim, num_classes).to(device)
+    palm_head = ArcFace(args.encoder_dim, num_classes, s=args.arcface_s, m=args.arcface_m).to(device)
+    vein_head = ArcFace(args.encoder_dim, num_classes, s=args.arcface_s, m=args.arcface_m).to(device)
 
     load_encoder_checkpoint(model.cnn_palm, args.palm_ckpt, device)
     load_encoder_checkpoint(model.cnn_vein, args.vein_ckpt, device)
@@ -338,10 +341,10 @@ def main():
             labels = labels.to(device, non_blocking=True)
 
             encoded = model.encode_modalities(palm, vein)
-            logits_palm = palm_head(F.normalize(encoded["palm_global"], dim=1))
-            logits_vein = vein_head(F.normalize(encoded["vein_global"], dim=1))
-            logits_rec_palm = palm_head(F.normalize(encoded["recovered_palm_global"], dim=1))
-            logits_rec_vein = vein_head(F.normalize(encoded["recovered_vein_global"], dim=1))
+            logits_palm = palm_head(F.normalize(encoded["palm_global"], dim=1), labels)
+            logits_vein = vein_head(F.normalize(encoded["vein_global"], dim=1), labels)
+            logits_rec_palm = palm_head(F.normalize(encoded["recovered_palm_global"], dim=1), labels)
+            logits_rec_vein = vein_head(F.normalize(encoded["recovered_vein_global"], dim=1), labels)
 
             losses = compute_losses(encoded, logits_palm, logits_vein, logits_rec_palm, logits_rec_vein, labels, ce)
             loss = (
@@ -395,11 +398,7 @@ def main():
         writer.add_scalar("val/acc_real", val_metrics["acc_real"], epoch)
         writer.add_scalar("val/acc_rec", val_metrics["acc_rec"], epoch)
 
-        score = (
-            0.4 * val_metrics["global_cos"]
-            + 0.4 * val_metrics["token_cos"]
-            + 0.2 * val_metrics["acc_rec"]
-        )
+        score = 0.45 * val_metrics["global_cos"] + 0.45 * val_metrics["token_cos"] - 0.10 * val_metrics["conf_mse"]
         print(
             f"[Epoch {epoch}] train_loss={train_loss:.4f} "
             f"train_global_cos={train_global_cos:.4f} train_token_cos={train_token_cos:.4f} "

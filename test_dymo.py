@@ -52,6 +52,16 @@ def build_pair_scores(features, labels):
     return scores, pair_labels
 
 
+def build_pair_scores_with_states(features, labels, states):
+    scores, pair_labels = build_pair_scores(features, labels)
+    states = np.asarray(states)
+    i, j = np.triu_indices(states.shape[0], k=1)
+    pair_types = np.full(scores.shape, "cross-state", dtype=object)
+    pair_types[(states[i] == "palm") & (states[j] == "palm")] = "palm-palm"
+    pair_types[(states[i] == "vein") & (states[j] == "vein")] = "vein-vein"
+    return scores, pair_labels, pair_types
+
+
 def eval_with_metrics(scores, pair_labels, name):
     eer, thr = compute_eer(scores, pair_labels, is_similarity=True, return_threshold=True)
     _, _, _, auc_val = roc_auc(scores, pair_labels, is_similarity=True)
@@ -69,6 +79,18 @@ def eval_with_metrics(scores, pair_labels, name):
     print("TAR @ FAR:")
     for far, info in tar_info.items():
         print(f"  FAR={far:.1e}: TAR={info['TAR']:.4f}, thr={info['threshold']:.4f}")
+
+
+def eval_random_missing_breakdown(features, labels, states, name):
+    scores, pair_labels, pair_types = build_pair_scores_with_states(features, labels, states)
+    print(f"\n----- {name} random_missing pair breakdown -----")
+    for pair_type in ["palm-palm", "vein-vein", "cross-state"]:
+        loc = pair_types == pair_type
+        if loc.sum() == 0 or (pair_labels[loc] == 1).sum() == 0 or (pair_labels[loc] == 0).sum() == 0:
+            print(f"{pair_type}: insufficient pairs")
+            continue
+        eer = compute_eer(scores[loc], pair_labels[loc], is_similarity=True)
+        print(f"{pair_type}: EER={eer * 100:.3f}% pairs={int(loc.sum())}")
 
 
 def compute_eer_from_features(features, labels):
@@ -136,10 +158,18 @@ def extract_single_modality_features(encoder, loader, modality: str, device, req
     return np.concatenate(feats, axis=0), np.concatenate(labels, axis=0)
 
 
+def masks_to_states(mask):
+    mask = np.asarray(mask)
+    states = np.full(mask.shape[0], "full", dtype=object)
+    states[(mask[:, 0] > 0.5) & (mask[:, 1] < 0.5)] = "palm"
+    states[(mask[:, 0] < 0.5) & (mask[:, 1] > 0.5)] = "vein"
+    return states
+
+
 @torch.no_grad()
-def extract_dymo_real_only(model, loader, device):
+def extract_dymo_real_only(model, loader, device, return_states: bool = False):
     model.eval()
-    feats, labels = [], []
+    feats, labels, states = [], [], []
 
     for palm_img, vein_img, labs, mask in tqdm(loader, desc="Extract DyMo real", dynamic_ncols=True, leave=False):
         palm_img = palm_img.to(device)
@@ -154,7 +184,37 @@ def extract_dymo_real_only(model, loader, device):
         )
         feats.append(output["embedding"].cpu().numpy())
         labels.append(labs.cpu().numpy())
+        if return_states:
+            states.append(masks_to_states(mask.cpu().numpy()))
 
+    if return_states:
+        return np.concatenate(feats, axis=0), np.concatenate(labels, axis=0), np.concatenate(states, axis=0)
+    return np.concatenate(feats, axis=0), np.concatenate(labels, axis=0)
+
+
+@torch.no_grad()
+def extract_dymo_all_recovered(model, loader, device, return_states: bool = False):
+    model.eval()
+    feats, labels, states = [], [], []
+
+    for palm_img, vein_img, labs, mask in tqdm(loader, desc="Extract DyMo all recovered", dynamic_ncols=True, leave=False):
+        palm_img = palm_img.to(device)
+        vein_img = vein_img.to(device)
+        labs = labs.to(device)
+        missing_mask = (1.0 - mask.to(device)).bool()
+        output = model(
+            palm_img,
+            vein_img,
+            missing_mask=missing_mask,
+            use_recovered_mask=missing_mask,
+        )
+        feats.append(output["embedding"].cpu().numpy())
+        labels.append(labs.cpu().numpy())
+        if return_states:
+            states.append(masks_to_states(mask.cpu().numpy()))
+
+    if return_states:
+        return np.concatenate(feats, axis=0), np.concatenate(labels, axis=0), np.concatenate(states, axis=0)
     return np.concatenate(feats, axis=0), np.concatenate(labels, axis=0)
 
 
@@ -168,10 +228,15 @@ def extract_dymo_selected(
     temperature: float,
     selection_tau,
     quality_mode: str,
+    max_shift: float | None = None,
+    min_density: float | None = None,
+    return_states: bool = False,
 ):
     selector.eval()
-    feats, labels = [], []
+    feats, labels, states = [], [], []
     selected_ratio = []
+    reward_key = "open_reward" if selection_mode == "open" else "ics_reward"
+    density_key = "open_gaussian" if selection_mode == "open" else "ics_gaussian"
 
     for palm_img, vein_img, labs, mask in tqdm(loader, desc="Extract DyMo selected", dynamic_ncols=True, leave=False):
         palm_img = palm_img.to(device)
@@ -188,25 +253,58 @@ def extract_dymo_selected(
             temperature=temperature,
             selection_tau=selection_tau,
             quality_mode=quality_mode,
-            return_details=False,
+            return_details=max_shift is not None or min_density is not None,
         )
+        if max_shift is not None or min_density is not None:
+            selected_tau = output["selection_tau"]
+            reward = output["rewards"][reward_key]
+            use_recovered = (reward > selected_tau)[:, None] & missing_mask
+            if max_shift is not None:
+                shift = 1.0 - F.cosine_similarity(output["before"]["embedding"], output["after"]["embedding"], dim=1)
+                use_recovered = use_recovered & (shift <= max_shift)[:, None]
+            if min_density is not None:
+                density = output["after_scores"][density_key]
+                use_recovered = use_recovered & (density >= min_density)[:, None]
+            output = selector.backbone.forward_from_encoded(
+                selector.backbone.encode_modalities(palm_img, vein_img),
+                missing_mask=missing_mask,
+                use_recovered_mask=use_recovered,
+            )
+            output["selected_recovered_mask"] = use_recovered
         feats.append(output["embedding"].cpu().numpy())
         labels.append(labs.cpu().numpy())
         selected_ratio.append(output["selected_recovered_mask"].any(dim=1).float().cpu().numpy())
+        if return_states:
+            states.append(masks_to_states(mask.cpu().numpy()))
 
-    return (
+    result = [
         np.concatenate(feats, axis=0),
         np.concatenate(labels, axis=0),
         float(np.concatenate(selected_ratio, axis=0).mean()) if selected_ratio else 0.0,
-    )
+    ]
+    if return_states:
+        result.append(np.concatenate(states, axis=0))
+    return tuple(result)
 
 
 @torch.no_grad()
-def collect_dymo_selection_candidates(selector, loader, stats, device, selection_mode: str, temperature: float, quality_mode: str):
+def collect_dymo_selection_candidates(
+    selector,
+    loader,
+    stats,
+    device,
+    selection_mode: str,
+    temperature: float,
+    quality_mode: str,
+    max_shift: float | None = None,
+    min_density: float | None = None,
+):
     selector.eval()
     before_feats, after_feats, labels = [], [], []
     rewards, has_candidate, missing_indices = [], [], []
     reward_key = "open_reward" if selection_mode == "open" else "ics_reward"
+    density_key = "open_gaussian" if selection_mode == "open" else "ics_gaussian"
+    shifts, densities = [], []
 
     for palm_img, vein_img, labs, mask in tqdm(loader, desc="Collect DyMo candidates", dynamic_ncols=True, leave=False):
         palm_img = palm_img.to(device)
@@ -231,15 +329,24 @@ def collect_dymo_selection_candidates(selector, loader, stats, device, selection
         rewards.append(output["rewards"][reward_key].cpu().numpy())
         has_candidate.append(missing_mask.any(dim=1).cpu().numpy())
         missing_indices.append(missing_mask.float().argmax(dim=1).long().cpu().numpy())
+        shifts.append((1.0 - F.cosine_similarity(output["before"]["embedding"], output["after"]["embedding"], dim=1)).cpu().numpy())
+        densities.append(output["after_scores"][density_key].cpu().numpy())
 
-    return {
+    candidates = {
         "before": np.concatenate(before_feats, axis=0),
         "after": np.concatenate(after_feats, axis=0),
         "labels": np.concatenate(labels, axis=0),
         "rewards": np.concatenate(rewards, axis=0),
         "has_candidate": np.concatenate(has_candidate, axis=0).astype(bool),
         "missing_index": np.concatenate(missing_indices, axis=0).astype(np.int64),
+        "shift": np.concatenate(shifts, axis=0),
+        "density": np.concatenate(densities, axis=0),
     }
+    if max_shift is not None:
+        candidates["has_candidate"] &= candidates["shift"] <= max_shift
+    if min_density is not None:
+        candidates["has_candidate"] &= candidates["density"] >= min_density
+    return candidates
 
 
 def select_candidate_features(candidates, selection_tau):
@@ -260,7 +367,18 @@ def select_candidate_features(candidates, selection_tau):
     return features, candidates["labels"], float(use_after.mean()) if use_after.size else 0.0
 
 
-def search_best_tau(selector, loader, stats, device, selection_mode: str, temperature: float, quality_mode: str, tau_grid):
+def search_best_tau(
+    selector,
+    loader,
+    stats,
+    device,
+    selection_mode: str,
+    temperature: float,
+    quality_mode: str,
+    tau_grid,
+    max_shift: float | None = None,
+    min_density: float | None = None,
+):
     candidates = collect_dymo_selection_candidates(
         selector,
         loader,
@@ -269,6 +387,8 @@ def search_best_tau(selector, loader, stats, device, selection_mode: str, temper
         selection_mode=selection_mode,
         temperature=temperature,
         quality_mode=quality_mode,
+        max_shift=max_shift,
+        min_density=min_density,
     )
     before_eer = compute_eer_from_features(candidates["before"], candidates["labels"])
 
@@ -312,10 +432,12 @@ def main():
     parser.add_argument("--selection_temperature", type=float, default=0.1)
     parser.add_argument("--selection_tau", type=float, default=0.0)
     parser.add_argument("--quality_mode", type=str, default="log_prob", choices=["log_prob", "probability"])
+    parser.add_argument("--max_shift", type=float, default=None)
+    parser.add_argument("--min_density", type=float, default=None)
     parser.add_argument("--search_tau", action="store_true")
-    parser.add_argument("--tau_min", type=float, default=-0.2)
-    parser.add_argument("--tau_max", type=float, default=0.5)
-    parser.add_argument("--tau_steps", type=int, default=71)
+    parser.add_argument("--tau_min", type=float, default=-1.0)
+    parser.add_argument("--tau_max", type=float, default=1.0)
+    parser.add_argument("--tau_steps", type=int, default=201)
     parser.add_argument("--input_size", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -375,6 +497,8 @@ def main():
                 temperature=args.selection_temperature,
                 quality_mode=args.quality_mode,
                 tau_grid=tau_grid,
+                max_shift=args.max_shift,
+                min_density=args.min_density,
             )
             if split_name == "palm_only":
                 tau_by_missing[1] = result["tau"]
@@ -408,13 +532,31 @@ def main():
 
     print("\n########## DyMo Without Recovered Selection ##########")
     for split_name, loader in loaders.items():
-        feats, labels = extract_dymo_real_only(model, loader, device=device)
+        if split_name == "random_missing":
+            feats, labels, states = extract_dymo_real_only(model, loader, device=device, return_states=True)
+        else:
+            feats, labels = extract_dymo_real_only(model, loader, device=device)
+            states = None
         scores, pair_labels = build_pair_scores(feats, labels)
         eval_with_metrics(scores, pair_labels, name=f"DyMo Real-Only - {split_name}")
+        if states is not None:
+            eval_random_missing_breakdown(feats, labels, states, "DyMo Real-Only")
+
+    print("\n########## DyMo All Recovered ##########")
+    for split_name, loader in loaders.items():
+        if split_name == "random_missing":
+            feats, labels, states = extract_dymo_all_recovered(model, loader, device=device, return_states=True)
+        else:
+            feats, labels = extract_dymo_all_recovered(model, loader, device=device)
+            states = None
+        scores, pair_labels = build_pair_scores(feats, labels)
+        eval_with_metrics(scores, pair_labels, name=f"DyMo All-Recovered - {split_name}")
+        if states is not None:
+            eval_random_missing_breakdown(feats, labels, states, "DyMo All-Recovered")
 
     print("\n########## DyMo With Recovered Selection ##########")
     for split_name, loader in loaders.items():
-        feats, labels, selected_ratio = extract_dymo_selected(
+        selected = extract_dymo_selected(
             selector,
             loader,
             stats=stats,
@@ -423,9 +565,19 @@ def main():
             temperature=args.selection_temperature,
             selection_tau=selection_tau,
             quality_mode=args.quality_mode,
+            max_shift=args.max_shift,
+            min_density=args.min_density,
+            return_states=split_name == "random_missing",
         )
+        if split_name == "random_missing":
+            feats, labels, selected_ratio, states = selected
+        else:
+            feats, labels, selected_ratio = selected
+            states = None
         scores, pair_labels = build_pair_scores(feats, labels)
         eval_with_metrics(scores, pair_labels, name=f"DyMo Selected - {split_name}")
+        if states is not None:
+            eval_random_missing_breakdown(feats, labels, states, "DyMo Selected")
         print(f"Recovered modality accepted ratio: {selected_ratio:.4f}")
 
 

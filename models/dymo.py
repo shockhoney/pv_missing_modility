@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from models.stage1_mobileFacenet import MobileFaceNet
 from utils.dymo_stats import compute_selection_rewards, score_embeddings
+from utils.head import ArcFace
 
 
 def resolve_selection_tau(selection_tau, selected_reward: torch.Tensor, missing_index: torch.Tensor) -> torch.Tensor:
@@ -64,9 +65,68 @@ class CrossModalRecoverer(nn.Module):
         }
 
 
+class CrossModalAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, feat_a: torch.Tensor, feat_b: torch.Tensor):
+        batch_size = feat_a.size(0)
+
+        q_a = self.q_proj(feat_a).view(batch_size, self.num_heads, self.head_dim)
+        k_b = self.k_proj(feat_b).view(batch_size, self.num_heads, self.head_dim)
+        v_b = self.v_proj(feat_b).view(batch_size, self.num_heads, self.head_dim)
+        attn_a = (q_a * k_b).sum(dim=-1, keepdim=True) * self.scale
+        attn_a = F.softmax(attn_a, dim=1)
+        out_a = (attn_a * v_b).reshape(batch_size, -1)
+        enhanced_a = self.norm(feat_a + self.out_proj(out_a))
+
+        q_b = self.q_proj(feat_b).view(batch_size, self.num_heads, self.head_dim)
+        k_a = self.k_proj(feat_a).view(batch_size, self.num_heads, self.head_dim)
+        v_a = self.v_proj(feat_a).view(batch_size, self.num_heads, self.head_dim)
+        attn_b = (q_b * k_a).sum(dim=-1, keepdim=True) * self.scale
+        attn_b = F.softmax(attn_b, dim=1)
+        out_b = (attn_b * v_a).reshape(batch_size, -1)
+        enhanced_b = self.norm(feat_b + self.out_proj(out_b))
+
+        return enhanced_a, enhanced_b
+
+
+class ChannelAttentionFusion(nn.Module):
+    def __init__(self, dim: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden_dim = max(dim // reduction, 16)
+        self.attention = nn.Sequential(
+            nn.Linear(2 * dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 2 * dim),
+        )
+        for module in self.attention:
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                nn.init.zeros_(module.bias)
+
+    def forward(self, feat_a: torch.Tensor, feat_b: torch.Tensor) -> torch.Tensor:
+        logits = self.attention(torch.cat([feat_a, feat_b], dim=1))
+        weights = F.softmax(logits.view(feat_a.size(0), 2, -1), dim=1)
+        return weights[:, 0] * feat_a + weights[:, 1] * feat_b
+
+
 class PalmVeinDynamicTransformer(nn.Module):
     """
     DyMo-style backbone for palmprint-palmvein missing-modality recognition.
+    The current fusion core uses the teacher-style cross-modal attention and
+    channel attention from the reference palm/vein fusion model.
 
     `missing_mask` uses DyMo semantics:
         False -> modality available
@@ -85,6 +145,8 @@ class PalmVeinDynamicTransformer(nn.Module):
         transformer_mlp_ratio: float = 4.0,
         projection_dim: int = 256,
         dropout: float = 0.1,
+        arcface_s: float = 64.0,
+        arcface_m: float = 0.5,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -97,6 +159,10 @@ class PalmVeinDynamicTransformer(nn.Module):
         self.cnn_palm = MobileFaceNet(input_channel=3, input_size=input_size, embedding_size=encoder_dim)
         self.cnn_vein = MobileFaceNet(input_channel=3, input_size=input_size, embedding_size=encoder_dim)
         self.token_pool = nn.AdaptiveAvgPool2d((token_grid, token_grid))
+        self.palm_global_proj = nn.Linear(encoder_dim, transformer_dim)
+        self.vein_global_proj = nn.Linear(encoder_dim, transformer_dim)
+        self.palm_global_norm = nn.LayerNorm(transformer_dim)
+        self.vein_global_norm = nn.LayerNorm(transformer_dim)
         self.palm_token_proj = nn.Linear(encoder_dim, transformer_dim)
         self.vein_token_proj = nn.Linear(encoder_dim, transformer_dim)
         self.palm_token_norm = nn.LayerNorm(transformer_dim)
@@ -104,43 +170,35 @@ class PalmVeinDynamicTransformer(nn.Module):
 
         self.vein_from_palm = CrossModalRecoverer(
             feature_dim=encoder_dim,
-            token_dim=transformer_dim,
+            token_dim=encoder_dim,
             num_tokens=self.num_tokens,
             hidden_dim=max(transformer_dim * 2, 512),
             dropout=dropout,
         )
         self.palm_from_vein = CrossModalRecoverer(
             feature_dim=encoder_dim,
-            token_dim=transformer_dim,
+            token_dim=encoder_dim,
             num_tokens=self.num_tokens,
             hidden_dim=max(transformer_dim * 2, 512),
             dropout=dropout,
         )
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, transformer_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + 2 * self.num_tokens, transformer_dim))
         self.modality_embed = nn.Embedding(2, transformer_dim)
         self.source_embed = nn.Embedding(3, transformer_dim)  # 0 absent, 1 real, 2 recovered
         self.embed_dropout = nn.Dropout(dropout)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=transformer_dim,
-            nhead=transformer_heads,
-            dim_feedforward=int(transformer_dim * transformer_mlp_ratio),
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.global_cross_attn = CrossModalAttention(transformer_dim, num_heads=transformer_heads)
+        self.global_channel_fusion = ChannelAttentionFusion(transformer_dim, reduction=4)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(transformer_dim, int(transformer_dim * transformer_mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(transformer_dim * transformer_mlp_ratio), transformer_dim),
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=transformer_layers)
         self.out_norm = nn.LayerNorm(transformer_dim)
 
-        self.classifier = nn.Linear(transformer_dim, num_classes)
+        self.classifier = ArcFace(transformer_dim, num_classes, s=arcface_s, m=arcface_m)
         self.projection = nn.Linear(transformer_dim, projection_dim)
         self.register_buffer("prototypes", F.normalize(torch.randn(num_classes, projection_dim), dim=1))
-
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
     def _extract_modality(self, encoder: MobileFaceNet, image: torch.Tensor):
         feat_map = encoder(image, return_spatial=True)
@@ -152,9 +210,6 @@ class PalmVeinDynamicTransformer(nn.Module):
     def encode_modalities(self, palm: torch.Tensor, vein: torch.Tensor) -> Dict[str, torch.Tensor]:
         palm_global, palm_tokens = self._extract_modality(self.cnn_palm, palm)
         vein_global, vein_tokens = self._extract_modality(self.cnn_vein, vein)
-
-        palm_tokens = self.palm_token_norm(self.palm_token_proj(palm_tokens))
-        vein_tokens = self.vein_token_norm(self.vein_token_proj(vein_tokens))
 
         recovered_vein = self.vein_from_palm(palm_global)
         recovered_palm = self.palm_from_vein(vein_global)
@@ -172,7 +227,7 @@ class PalmVeinDynamicTransformer(nn.Module):
             "recovered_vein_confidence": recovered_vein["confidence"],
         }
 
-    def _assemble_sequence(
+    def _select_global_features(
         self,
         encoded: Dict[str, torch.Tensor],
         missing_mask: torch.Tensor,
@@ -189,67 +244,98 @@ class PalmVeinDynamicTransformer(nn.Module):
         vein_active_real = ~missing_mask[:, 1]
         vein_active_recovered = use_recovered_mask[:, 1]
 
-        palm_tokens = torch.zeros_like(encoded["palm_tokens"])
-        vein_tokens = torch.zeros_like(encoded["vein_tokens"])
+        palm_global = torch.zeros_like(encoded["palm_global"])
+        vein_global = torch.zeros_like(encoded["vein_global"])
 
-        palm_tokens = torch.where(
-            palm_active_real[:, None, None],
-            encoded["palm_tokens"],
-            palm_tokens,
+        palm_global = torch.where(
+            palm_active_real[:, None],
+            encoded["palm_global"],
+            palm_global,
         )
-        palm_tokens = torch.where(
-            palm_active_recovered[:, None, None],
-            encoded["recovered_palm_tokens"],
-            palm_tokens,
+        palm_global = torch.where(
+            palm_active_recovered[:, None],
+            encoded["recovered_palm_global"],
+            palm_global,
+        )
+        vein_global = torch.where(
+            vein_active_real[:, None],
+            encoded["vein_global"],
+            vein_global,
+        )
+        vein_global = torch.where(
+            vein_active_recovered[:, None],
+            encoded["recovered_vein_global"],
+            vein_global,
         )
 
-        vein_tokens = torch.where(
-            vein_active_real[:, None, None],
-            encoded["vein_tokens"],
-            vein_tokens,
-        )
-        vein_tokens = torch.where(
-            vein_active_recovered[:, None, None],
-            encoded["recovered_vein_tokens"],
-            vein_tokens,
-        )
-
-        palm_source = torch.zeros(batch_size, self.num_tokens, dtype=torch.long, device=device)
-        vein_source = torch.zeros(batch_size, self.num_tokens, dtype=torch.long, device=device)
+        palm_source = torch.zeros(batch_size, dtype=torch.long, device=device)
+        vein_source = torch.zeros(batch_size, dtype=torch.long, device=device)
         palm_source[palm_active_real] = 1
         palm_source[palm_active_recovered] = 2
         vein_source[vein_active_real] = 1
         vein_source[vein_active_recovered] = 2
 
-        palm_mod = self.modality_embed(torch.zeros(batch_size, self.num_tokens, dtype=torch.long, device=device))
-        vein_mod = self.modality_embed(torch.ones(batch_size, self.num_tokens, dtype=torch.long, device=device))
-        palm_tokens = palm_tokens + palm_mod + self.source_embed(palm_source)
-        vein_tokens = vein_tokens + vein_mod + self.source_embed(vein_source)
+        palm_feat = self.palm_global_norm(self.palm_global_proj(palm_global))
+        vein_feat = self.vein_global_norm(self.vein_global_proj(vein_global))
+        palm_feat = palm_feat + self.modality_embed(torch.zeros(batch_size, dtype=torch.long, device=device))
+        vein_feat = vein_feat + self.modality_embed(torch.ones(batch_size, dtype=torch.long, device=device))
+        palm_feat = palm_feat + self.source_embed(palm_source)
+        vein_feat = vein_feat + self.source_embed(vein_source)
+        return self.embed_dropout(palm_feat), self.embed_dropout(vein_feat), palm_source, vein_source
 
-        tokens = torch.cat([palm_tokens, vein_tokens], dim=1)
-        cls = self.cls_token.expand(batch_size, -1, -1)
-        tokens = torch.cat([cls, tokens], dim=1)
-        tokens = self.embed_dropout(tokens + self.pos_embed[:, : tokens.size(1)])
+    def _select_projected_tokens(
+        self,
+        encoded: Dict[str, torch.Tensor],
+        missing_mask: torch.Tensor,
+        use_recovered_mask: torch.Tensor,
+    ):
+        missing_mask = missing_mask.bool()
+        use_recovered_mask = use_recovered_mask.bool() & missing_mask
 
-        key_padding_mask = torch.zeros(batch_size, 1 + 2 * self.num_tokens, dtype=torch.bool, device=device)
-        key_padding_mask[:, 1 : 1 + self.num_tokens] = ~(palm_active_real | palm_active_recovered)[:, None]
-        key_padding_mask[:, 1 + self.num_tokens :] = ~(vein_active_real | vein_active_recovered)[:, None]
-        return tokens, key_padding_mask
+        palm_active_real = ~missing_mask[:, 0]
+        palm_active_recovered = use_recovered_mask[:, 0]
+        vein_active_real = ~missing_mask[:, 1]
+        vein_active_recovered = use_recovered_mask[:, 1]
+
+        palm_tokens = torch.zeros_like(encoded["palm_tokens"])
+        vein_tokens = torch.zeros_like(encoded["vein_tokens"])
+        palm_tokens = torch.where(palm_active_real[:, None, None], encoded["palm_tokens"], palm_tokens)
+        palm_tokens = torch.where(
+            palm_active_recovered[:, None, None],
+            encoded["recovered_palm_tokens"],
+            palm_tokens,
+        )
+        vein_tokens = torch.where(vein_active_real[:, None, None], encoded["vein_tokens"], vein_tokens)
+        vein_tokens = torch.where(
+            vein_active_recovered[:, None, None],
+            encoded["recovered_vein_tokens"],
+            vein_tokens,
+        )
+        return {
+            "palm_tokens": self.palm_token_norm(self.palm_token_proj(palm_tokens)),
+            "vein_tokens": self.vein_token_norm(self.vein_token_proj(vein_tokens)),
+        }
 
     def forward_from_encoded(
         self,
         encoded: Dict[str, torch.Tensor],
         missing_mask: torch.Tensor,
         use_recovered_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         return_details: bool = False,
     ) -> Dict[str, torch.Tensor]:
         if use_recovered_mask is None:
             use_recovered_mask = torch.zeros_like(missing_mask)
 
-        tokens, key_padding_mask = self._assemble_sequence(encoded, missing_mask, use_recovered_mask)
-        features = self.transformer(tokens, src_key_padding_mask=key_padding_mask)
-        cls_feat = self.out_norm(features[:, 0])
-        logits = self.classifier(cls_feat)
+        palm_feat, vein_feat, palm_source, vein_source = self._select_global_features(
+            encoded,
+            missing_mask,
+            use_recovered_mask,
+        )
+        palm_enhanced, vein_enhanced = self.global_cross_attn(palm_feat, vein_feat)
+        fused = self.global_channel_fusion(palm_enhanced, vein_enhanced)
+        cls_feat = self.out_norm(fused + self.fusion_mlp(fused))
+        logits = self.classifier(cls_feat, labels)
         embedding = F.normalize(self.projection(cls_feat), dim=1)
 
         output = {
@@ -258,13 +344,15 @@ class PalmVeinDynamicTransformer(nn.Module):
             "cls_feat": cls_feat,
             "missing_mask": missing_mask.bool(),
             "use_recovered_mask": use_recovered_mask.bool(),
+            "palm_source": palm_source,
+            "vein_source": vein_source,
             "recovery_confidence": torch.stack(
                 [encoded["recovered_palm_confidence"], encoded["recovered_vein_confidence"]],
                 dim=1,
             ),
         }
         if return_details:
-            output["key_padding_mask"] = key_padding_mask
+            output["projected_tokens"] = self._select_projected_tokens(encoded, missing_mask, use_recovered_mask)
         return output
 
     def forward(
@@ -273,6 +361,7 @@ class PalmVeinDynamicTransformer(nn.Module):
         vein: torch.Tensor,
         missing_mask: torch.Tensor,
         use_recovered_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         return_details: bool = False,
     ) -> Dict[str, torch.Tensor]:
         encoded = self.encode_modalities(palm, vein)
@@ -280,6 +369,7 @@ class PalmVeinDynamicTransformer(nn.Module):
             encoded,
             missing_mask=missing_mask,
             use_recovered_mask=use_recovered_mask,
+            labels=labels,
             return_details=return_details,
         )
 
@@ -300,6 +390,8 @@ class PalmVeinDyMoSelector(nn.Module):
         temperature: float = 0.1,
         selection_tau=0.0,
         quality_mode: str = "log_prob",
+        max_shift: Optional[float] = None,
+        min_density: Optional[float] = None,
         return_details: bool = False,
     ) -> Dict[str, torch.Tensor]:
         if selection_mode not in {"open", "ics"}:
@@ -343,11 +435,17 @@ class PalmVeinDyMoSelector(nn.Module):
             temperature=temperature,
             quality_mode=quality_mode,
         )
-        rewards = compute_selection_rewards(before_scores, after_scores)
+        rewards = compute_selection_rewards(before_scores, after_scores, quality_mode=quality_mode)
 
         selected_reward = rewards["open_reward"] if selection_mode == "open" else rewards["ics_reward"]
+        selected_density = after_scores["open_gaussian"] if selection_mode == "open" else after_scores["ics_gaussian"]
         selected_tau = resolve_selection_tau(selection_tau, selected_reward, missing_index)
         use_recovered = (selected_reward > selected_tau)[:, None] & candidate_recovered
+        embedding_shift = 1.0 - F.cosine_similarity(before["embedding"], after["embedding"], dim=1)
+        if max_shift is not None:
+            use_recovered = use_recovered & (embedding_shift <= max_shift)[:, None]
+        if min_density is not None:
+            use_recovered = use_recovered & (selected_density >= min_density)[:, None]
 
         final = self.backbone.forward_from_encoded(
             encoded,
@@ -361,5 +459,7 @@ class PalmVeinDyMoSelector(nn.Module):
             final["before_scores"] = before_scores
             final["after_scores"] = after_scores
             final["rewards"] = rewards
+            final["embedding_shift"] = embedding_shift
+            final["selected_density"] = selected_density
             final["selection_tau"] = selected_tau
         return final

@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from models.stage1_mobileFacenet import MobileFaceNet
 from utils.datasets_txt import MissingPairTxtDataset, SingleModalityFromPairDataset
+from utils.head import ArcFace
 from utils.metrics import compute_eer, tar_at_far
 
 
@@ -167,7 +168,7 @@ def validate(model, classifier, loader, device):
         labels = labels.to(device, non_blocking=True)
 
         feats = model(images)
-        logits = classifier(F.normalize(feats, dim=1))
+        logits = classifier(F.normalize(feats, dim=1), None)
         loss = ce(logits, labels)
 
         batch_size = labels.size(0)
@@ -218,8 +219,8 @@ def validate_joint(palm_encoder, vein_encoder, classifier, loader, device):
         palm_feat = F.normalize(palm_encoder(palm), dim=1)
         vein_feat = F.normalize(vein_encoder(vein), dim=1)
         fused_feat = F.normalize(palm_feat + vein_feat, dim=1)
-        palm_logits = classifier(palm_feat)
-        vein_logits = classifier(vein_feat)
+        palm_logits = classifier(palm_feat, None)
+        vein_logits = classifier(vein_feat, None)
         loss = 0.5 * (ce(palm_logits, labels) + ce(vein_logits, labels))
 
         batch_size = labels.size(0)
@@ -313,7 +314,7 @@ def train_single(args, device, writer, num_classes):
     )
 
     encoder = MobileFaceNet(input_channel=3, input_size=args.input_size, embedding_size=args.embedding_size).to(device)
-    classifier = nn.Linear(args.embedding_size, num_classes).to(device)
+    classifier = ArcFace(args.embedding_size, num_classes, s=args.arcface_s, m=args.arcface_m).to(device)
     optimizer = torch.optim.AdamW(
         list(encoder.parameters()) + list(classifier.parameters()),
         lr=args.lr,
@@ -336,7 +337,7 @@ def train_single(args, device, writer, num_classes):
             labels = labels.to(device, non_blocking=True)
 
             feats = F.normalize(encoder(images), dim=1)
-            logits = classifier(feats)
+            logits = classifier(feats, labels)
             loss = ce(logits, labels)
 
             optimizer.zero_grad()
@@ -393,7 +394,7 @@ def train_joint(args, device, writer, num_classes):
 
     palm_encoder = MobileFaceNet(input_channel=3, input_size=args.input_size, embedding_size=args.embedding_size).to(device)
     vein_encoder = MobileFaceNet(input_channel=3, input_size=args.input_size, embedding_size=args.embedding_size).to(device)
-    classifier = nn.Linear(args.embedding_size, num_classes).to(device)
+    classifier = ArcFace(args.embedding_size, num_classes, s=args.arcface_s, m=args.arcface_m).to(device)
     optimizer = torch.optim.AdamW(
         list(palm_encoder.parameters()) + list(vein_encoder.parameters()) + list(classifier.parameters()),
         lr=args.lr,
@@ -424,8 +425,8 @@ def train_joint(args, device, writer, num_classes):
 
             palm_feat = F.normalize(palm_encoder(palm), dim=1)
             vein_feat = F.normalize(vein_encoder(vein), dim=1)
-            palm_logits = classifier(palm_feat)
-            vein_logits = classifier(vein_feat)
+            palm_logits = classifier(palm_feat, labels)
+            vein_logits = classifier(vein_feat, labels)
 
             loss_cls = 0.5 * (ce(palm_logits, labels) + ce(vein_logits, labels))
             loss_cm = cross_modal_supcon_loss(palm_feat, vein_feat, labels, args.supcon_temperature)
@@ -514,6 +515,8 @@ def main():
     parser.add_argument("--lambda_cm", type=float, default=0.2)
     parser.add_argument("--lambda_align", type=float, default=0.1)
     parser.add_argument("--supcon_temperature", type=float, default=0.1)
+    parser.add_argument("--arcface_s", type=float, default=64.0)
+    parser.add_argument("--arcface_m", type=float, default=0.5)
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)

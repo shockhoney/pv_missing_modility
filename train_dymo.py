@@ -110,10 +110,17 @@ def load_recoverer_checkpoint(model: PalmVeinDynamicTransformer, checkpoint_path
 
     prefixes = ("vein_from_palm.", "palm_from_vein.")
     current_state = model.state_dict()
-    recoverer_state = {k: v for k, v in state_dict.items() if k.startswith(prefixes) and k in current_state}
+    recoverer_state = {
+        k: v
+        for k, v in state_dict.items()
+        if k.startswith(prefixes) and k in current_state and current_state[k].shape == v.shape
+    }
     current_state.update(recoverer_state)
     model.load_state_dict(current_state, strict=False)
+    skipped = [k for k, v in state_dict.items() if k.startswith(prefixes) and (k not in recoverer_state)]
     print(f"[Info] loaded recoverer weights from {checkpoint_path}")
+    if skipped:
+        print(f"[Info] skipped incompatible recoverer keys: {len(skipped)}")
 
 
 def build_optimizer(model, args):
@@ -145,20 +152,41 @@ def mode_masks(batch_size: int, device) -> Dict[str, torch.Tensor]:
     }
 
 
-def forward_training_states(model: PalmVeinDynamicTransformer, palm, vein):
+def forward_training_states(model: PalmVeinDynamicTransformer, palm, vein, labels):
     encoded = model.encode_modalities(palm, vein)
     masks = mode_masks(palm.size(0), palm.device)
 
     states = {
-        "full": model.forward_from_encoded(encoded, masks["full"], use_recovered_mask=torch.zeros_like(masks["full"])),
+        "full": model.forward_from_encoded(
+            encoded,
+            masks["full"],
+            use_recovered_mask=torch.zeros_like(masks["full"]),
+            labels=labels,
+        ),
         "palm_only_real": model.forward_from_encoded(
-            encoded, masks["palm_only"], use_recovered_mask=torch.zeros_like(masks["palm_only"])
+            encoded,
+            masks["palm_only"],
+            use_recovered_mask=torch.zeros_like(masks["palm_only"]),
+            labels=labels,
         ),
         "vein_only_real": model.forward_from_encoded(
-            encoded, masks["vein_only"], use_recovered_mask=torch.zeros_like(masks["vein_only"])
+            encoded,
+            masks["vein_only"],
+            use_recovered_mask=torch.zeros_like(masks["vein_only"]),
+            labels=labels,
         ),
-        "palm_only_rec": model.forward_from_encoded(encoded, masks["palm_only"], use_recovered_mask=masks["palm_only"]),
-        "vein_only_rec": model.forward_from_encoded(encoded, masks["vein_only"], use_recovered_mask=masks["vein_only"]),
+        "palm_only_rec": model.forward_from_encoded(
+            encoded,
+            masks["palm_only"],
+            use_recovered_mask=masks["palm_only"],
+            labels=labels,
+        ),
+        "vein_only_rec": model.forward_from_encoded(
+            encoded,
+            masks["vein_only"],
+            use_recovered_mask=masks["vein_only"],
+            labels=labels,
+        ),
     }
     return encoded, states
 
@@ -283,7 +311,9 @@ def main():
     parser.add_argument("--lambda_cons_real", type=float, default=0.2)
     parser.add_argument("--lambda_cons_rec", type=float, default=0.5)
     parser.add_argument("--lambda_distill_full", type=float, default=0.5)
-    parser.add_argument("--lambda_distill_real", type=float, default=0.5)
+    parser.add_argument("--lambda_distill_real", type=float, default=0.1)
+    parser.add_argument("--lambda_state_real", type=float, default=0.2)
+    parser.add_argument("--lambda_state_rec", type=float, default=0.1)
     parser.add_argument("--lambda_rel", type=float, default=0.1)
     parser.add_argument("--full_baseline_eer", type=float, default=None)
     parser.add_argument("--pt_warmup_epochs", type=int, default=3)
@@ -291,6 +321,8 @@ def main():
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--train_recoverers", action="store_true")
     parser.add_argument("--far_list", type=float, nargs="+", default=[1e-4, 1e-5])
+    parser.add_argument("--arcface_s", type=float, default=64.0)
+    parser.add_argument("--arcface_m", type=float, default=0.5)
     args = parser.parse_args()
     if args.lambda_cons is not None:
         args.lambda_cons_real = args.lambda_cons
@@ -332,6 +364,13 @@ def main():
             strong=False,
             split_filter="vein_only",
         ),
+        "mixed_missing": build_loader(
+            args.val_missing_list,
+            input_size=args.input_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            strong=False,
+        ),
     }
 
     model = PalmVeinDynamicTransformer(
@@ -343,6 +382,8 @@ def main():
         transformer_heads=args.transformer_heads,
         transformer_layers=args.transformer_layers,
         projection_dim=args.projection_dim,
+        arcface_s=args.arcface_s,
+        arcface_m=args.arcface_m,
     ).to(device)
     load_encoder_checkpoint(model.cnn_palm, args.palm_ckpt, device)
     load_encoder_checkpoint(model.cnn_vein, args.vein_ckpt, device)
@@ -375,6 +416,8 @@ def main():
             "cons_rec": 0.0,
             "distill_full": 0.0,
             "distill_real": 0.0,
+            "state_real": 0.0,
+            "state_rec": 0.0,
             "rel": 0.0,
             "before_q": 0.0,
             "after_q": 0.0,
@@ -387,7 +430,7 @@ def main():
             vein = vein.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            encoded, states = forward_training_states(model, palm, vein)
+            encoded, states = forward_training_states(model, palm, vein, labels)
             labels_one_hot = F.one_hot(labels, num_classes=num_classes).float()
 
             loss_full_cls = ce(states["full"]["logits"], labels)
@@ -421,6 +464,12 @@ def main():
                 states["vein_only_rec"]["embedding"], states["full"]["embedding"].detach(), dim=1
             ).mean()
             loss_distill_full, loss_distill_real, loss_rel = compute_distillation_losses(encoded, states)
+            loss_state_real = 1.0 - F.cosine_similarity(
+                states["palm_only_real"]["embedding"], states["vein_only_real"]["embedding"], dim=1
+            ).mean()
+            loss_state_rec = 1.0 - F.cosine_similarity(
+                states["palm_only_rec"]["embedding"], states["vein_only_rec"]["embedding"], dim=1
+            ).mean()
 
             loss = args.lambda_full_cls * (loss_full_cls / 5.0)
             loss = loss + args.lambda_partial_cls * ((2.0 * loss_partial_real_cls + 2.0 * loss_partial_rec_cls) / 5.0)
@@ -430,6 +479,8 @@ def main():
             loss = loss + args.lambda_cons_rec * loss_cons_rec
             loss = loss + args.lambda_distill_full * loss_distill_full
             loss = loss + args.lambda_distill_real * loss_distill_real
+            loss = loss + args.lambda_state_real * loss_state_real
+            loss = loss + args.lambda_state_rec * loss_state_rec
             loss = loss + args.lambda_rel * loss_rel
 
             optimizer.zero_grad()
@@ -458,6 +509,8 @@ def main():
             running["cons_rec"] += loss_cons_rec.item() * batch_size
             running["distill_full"] += loss_distill_full.item() * batch_size
             running["distill_real"] += loss_distill_real.item() * batch_size
+            running["state_real"] += loss_state_real.item() * batch_size
+            running["state_rec"] += loss_state_rec.item() * batch_size
             running["rel"] += loss_rel.item() * batch_size
             running["before_q"] += before_quality.mean().item() * batch_size
             running["after_q"] += after_quality.mean().item() * batch_size
@@ -478,6 +531,8 @@ def main():
         writer.add_scalar("train/consistency_rec", running["cons_rec"] / max(sample_count, 1), epoch)
         writer.add_scalar("train/distill_full", running["distill_full"] / max(sample_count, 1), epoch)
         writer.add_scalar("train/distill_real", running["distill_real"] / max(sample_count, 1), epoch)
+        writer.add_scalar("train/state_real", running["state_real"] / max(sample_count, 1), epoch)
+        writer.add_scalar("train/state_rec", running["state_rec"] / max(sample_count, 1), epoch)
         writer.add_scalar("train/distill_rel", running["rel"] / max(sample_count, 1), epoch)
         writer.add_scalar("train/before_quality", running["before_q"] / max(sample_count, 1), epoch)
         writer.add_scalar("train/after_quality", running["after_q"] / max(sample_count, 1), epoch)
@@ -493,13 +548,14 @@ def main():
         full_eer = val_rec["full"]["eer"]
         palm_eer = val_rec["palm_only"]["eer"]
         vein_eer = val_rec["vein_only"]["eer"]
-        mean_eer_rec = float(np.nanmean([full_eer, palm_eer, vein_eer]))
+        mixed_eer = val_rec["mixed_missing"]["eer"]
+        mean_eer_rec = float(np.nanmean([full_eer, palm_eer, vein_eer, mixed_eer]))
         full_penalty = 0.0
         if args.full_baseline_eer is not None:
             full_penalty = 0.5 * max(0.0, full_eer - args.full_baseline_eer)
         score = -mean_eer_rec - full_penalty
 
-        for split_name in ["full", "palm_only", "vein_only"]:
+        for split_name in ["full", "palm_only", "vein_only", "mixed_missing"]:
             metrics_real = val_real[split_name]
             metrics_rec = val_rec[split_name]
             writer.add_scalar(f"val_real/{split_name}_eer", metrics_real["eer"], epoch)
