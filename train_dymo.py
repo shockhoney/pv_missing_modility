@@ -79,14 +79,17 @@ def build_loader(list_path: str, input_size: int, batch_size: int, num_workers: 
         transform_vein=tf,
         split_filter=split_filter,
     )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=strong,
-        drop_last=strong,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": strong,
+        "drop_last": strong,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 1
+        loader_kwargs["persistent_workers"] = False
+    return DataLoader(dataset, **loader_kwargs)
 
 
 def load_encoder_checkpoint(module: nn.Module, checkpoint_path: str, device):
@@ -129,13 +132,18 @@ def build_optimizer(model, args):
     other_ids = {id(param) for param in encoder_params + recoverer_params}
     other_params = [param for param in model.parameters() if id(param) not in other_ids]
 
-    param_groups = [
-        {"params": encoder_params, "lr": args.encoder_lr},
-        {"params": other_params, "lr": args.transformer_lr},
-    ]
+    param_groups = [{"params": other_params, "lr": args.transformer_lr}]
+    if args.finetune_encoders:
+        param_groups.insert(0, {"params": encoder_params, "lr": args.encoder_lr})
     if args.train_recoverers:
         param_groups.append({"params": recoverer_params, "lr": args.recoverer_lr})
     return torch.optim.AdamW(param_groups, weight_decay=args.wd)
+
+
+def set_encoders_trainable(model: PalmVeinDynamicTransformer, trainable: bool):
+    for encoder in [model.cnn_palm, model.cnn_vein]:
+        for param in encoder.parameters():
+            param.requires_grad = trainable
 
 
 def set_recoverers_trainable(model: PalmVeinDynamicTransformer, trainable: bool):
@@ -292,7 +300,7 @@ def main():
     parser.add_argument("--save_dir", type=str, default="outputs_dymo/dymo")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=2 if os.name == "nt" else 4)
     parser.add_argument("--input_size", type=int, default=224)
     parser.add_argument("--encoder_dim", type=int, default=256)
     parser.add_argument("--token_grid", type=int, default=4)
@@ -319,6 +327,7 @@ def main():
     parser.add_argument("--pt_warmup_epochs", type=int, default=3)
     parser.add_argument("--prototype_temperature", type=float, default=0.1)
     parser.add_argument("--eval_every", type=int, default=5)
+    parser.add_argument("--finetune_encoders", action="store_true")
     parser.add_argument("--train_recoverers", action="store_true")
     parser.add_argument("--far_list", type=float, nargs="+", default=[1e-4, 1e-5])
     parser.add_argument("--arcface_s", type=float, default=64.0)
@@ -387,6 +396,11 @@ def main():
     ).to(device)
     load_encoder_checkpoint(model.cnn_palm, args.palm_ckpt, device)
     load_encoder_checkpoint(model.cnn_vein, args.vein_ckpt, device)
+    set_encoders_trainable(model, trainable=args.finetune_encoders)
+    if args.finetune_encoders:
+        print(f"[Info] encoders will be fine-tuned with lr={args.encoder_lr}.")
+    else:
+        print("[Info] encoders frozen for DyMo training.")
     load_recoverer_checkpoint(model, args.recoverer_ckpt, device)
     if not args.train_recoverers:
         set_recoverers_trainable(model, trainable=False)
@@ -404,6 +418,9 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        if not args.finetune_encoders:
+            model.cnn_palm.eval()
+            model.cnn_vein.eval()
         class_sum = torch.zeros(num_classes, args.projection_dim, device=device)
         class_count = torch.zeros(num_classes, 1, device=device)
         running = {

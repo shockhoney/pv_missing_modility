@@ -90,7 +90,6 @@ def set_encoder_trainable(model: PalmVeinDynamicTransformer, trainable: bool):
 
 
 def build_optimizer(model, palm_head, vein_head, args):
-    encoder_params = list(model.cnn_palm.parameters()) + list(model.cnn_vein.parameters())
     recoverer_params = (
         list(model.vein_from_palm.parameters())
         + list(model.palm_from_vein.parameters())
@@ -98,10 +97,7 @@ def build_optimizer(model, palm_head, vein_head, args):
         + list(vein_head.parameters())
     )
     return torch.optim.AdamW(
-        [
-            {"params": encoder_params, "lr": args.encoder_lr},
-            {"params": recoverer_params, "lr": args.lr},
-        ],
+        [{"params": recoverer_params, "lr": args.lr}],
         weight_decay=args.wd,
     )
 
@@ -310,20 +306,16 @@ def main():
     load_encoder_checkpoint(model.cnn_palm, args.palm_ckpt, device)
     load_encoder_checkpoint(model.cnn_vein, args.vein_ckpt, device)
     set_encoder_trainable(model, trainable=False)
+    print("[Info] encoders frozen for recoverer training.")
     optimizer = build_optimizer(model, palm_head, vein_head, args)
     ce = nn.CrossEntropyLoss()
 
     best_score = float("-inf")
     best_path = os.path.join(args.save_dir, "recoverer_best.pth")
-    encoders_unfrozen = False
-
     for epoch in range(1, args.epochs + 1):
-        if (not encoders_unfrozen) and epoch > args.freeze_encoder_epochs:
-            set_encoder_trainable(model, trainable=True)
-            encoders_unfrozen = True
-            print(f"[Info] unfroze encoders at epoch {epoch}; encoder lr={args.encoder_lr}")
-
         model.train()
+        model.cnn_palm.eval()
+        model.cnn_vein.eval()
         palm_head.train()
         vein_head.train()
 
