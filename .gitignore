@@ -12,7 +12,6 @@ utils/file_processing/
 
 # training outputs
 outputs/
-outputs_distill/
 runs/
 runs_all/
 **/runs/
