@@ -4,6 +4,14 @@ from sklearn.metrics import roc_curve, auc
 def _ensure_numpy(x):
     return np.asarray(x)
 
+def _safe_threshold(thresholds, idx):
+    if np.isfinite(thresholds[idx]):
+        return thresholds[idx]
+    finite = np.where(np.isfinite(thresholds))[0]
+    if finite.size == 0:
+        return 0.0
+    return thresholds[finite[np.argmin(np.abs(finite - idx))]]
+
 def compute_confusion_from_scores(scores, labels, threshold, is_similarity=True):
 
     scores = _ensure_numpy(scores)
@@ -64,10 +72,12 @@ def compute_eer(scores, labels, is_similarity=True, return_threshold=False):
             frac = 0.0
         eer_interp = y[0] + frac * (y[1] - y[0])
         eer = eer_interp
-        # threshold interpolation
-        thr = thresholds[i] + frac * (thresholds[i+1] - thresholds[i])
+        if np.isfinite(thresholds[i]) and np.isfinite(thresholds[i + 1]):
+            thr = thresholds[i] + frac * (thresholds[i + 1] - thresholds[i])
+        else:
+            thr = _safe_threshold(thresholds, i + 1)
     else:
-        thr = thresholds[idxE]
+        thr = _safe_threshold(thresholds, idxE)
     if return_threshold:
         # if we inverted scores earlier, thr corresponds to scores_
         if not is_similarity:
