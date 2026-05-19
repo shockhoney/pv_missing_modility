@@ -1,4 +1,5 @@
 import argparse
+import os
 from typing import Tuple
 
 import numpy as np
@@ -38,6 +39,24 @@ def load_encoder(ckpt_path: str, input_size: int, encoder_dim: int, device):
     encoder.load_state_dict(ckpt.get("encoder", ckpt.get("model", ckpt)), strict=False)
     encoder.eval()
     return encoder
+
+
+def load_joint_encoders(args, device):
+    if os.path.exists(args.joint_ckpt):
+        ckpt = safe_torch_load(args.joint_ckpt, device)
+        encoders = ckpt.get("encoder", {})
+        if ckpt.get("modality") == "joint" and {"palm", "vein"} <= set(encoders):
+            palm = build_encoder("palm", input_channel=3, input_size=args.input_size, embedding_size=args.encoder_dim).to(device)
+            vein = build_encoder("vein", input_channel=3, input_size=args.input_size, embedding_size=args.encoder_dim).to(device)
+            palm.load_state_dict(encoders["palm"], strict=False)
+            vein.load_state_dict(encoders["vein"], strict=False)
+            palm.eval()
+            vein.eval()
+            return palm, vein
+    return (
+        load_encoder(args.palm_ckpt, args.input_size, args.encoder_dim, device),
+        load_encoder(args.vein_ckpt, args.input_size, args.encoder_dim, device),
+    )
 
 
 def build_loader(protocol_list: str, split_name: str, img_size: int, batch_size: int, num_workers: int):
@@ -91,8 +110,11 @@ def extract_features(encoder, loader, modality: str, device):
 
 def eval_metrics(feats: np.ndarray, labels: np.ndarray, name: str):
     scores, pair_labels = build_pair_scores(feats, labels)
+    positives = int((pair_labels == 1).sum())
+    negatives = int((pair_labels == 0).sum())
+    print(f"\n===== {name} =====")
+    print(f"Samples: {len(labels)}, positive_pairs={positives}, negative_pairs={negatives}")
     if (pair_labels == 1).sum() == 0 or (pair_labels == 0).sum() == 0:
-        print(f"\n===== {name} =====")
         print("insufficient positive or negative pairs")
         return
 
@@ -100,7 +122,6 @@ def eval_metrics(feats: np.ndarray, labels: np.ndarray, name: str):
     _, _, _, auc_val = roc_auc(scores, pair_labels, is_similarity=True)
     thr_stats = far_frr_acc_at_threshold(scores, pair_labels, thr, is_similarity=True)
 
-    print(f"\n===== {name} =====")
     print(f"AUC : {auc_val:.4f}")
     print(f"EER : {eer * 100:.3f}% (threshold = {thr:.4f})")
     print(
@@ -127,12 +148,41 @@ def evaluate_encoder(modality: str, ckpt_path: str, args, device):
             eval_metrics(feats, labels, f"{modality.capitalize()} Encoder - {split_name}")
 
 
+@torch.no_grad()
+def extract_joint_features(palm_encoder, vein_encoder, loader, device):
+    feats, labels = [], []
+    for palm_img, vein_img, batch_labels, mask in tqdm(loader, desc="Extract joint", dynamic_ncols=True, leave=False):
+        available = (mask[:, 0] > 0.5) & (mask[:, 1] > 0.5)
+        if available.sum() == 0:
+            continue
+        palm = palm_img[available].to(device, non_blocking=True)
+        vein = vein_img[available].to(device, non_blocking=True)
+        joint = F.normalize(F.normalize(palm_encoder(palm), dim=1) + F.normalize(vein_encoder(vein), dim=1), dim=1)
+        feats.append(joint.cpu().numpy())
+        labels.append(batch_labels[available].numpy())
+    if not feats:
+        return None, None
+    return np.concatenate(feats, axis=0), np.concatenate(labels, axis=0)
+
+
+def evaluate_joint(args, device):
+    palm_encoder, vein_encoder = load_joint_encoders(args, device)
+    for split_name in ["full", "random_missing"]:
+        loader = build_loader(args.protocol_list, split_name, args.input_size, args.batch_size, args.num_workers)
+        if loader is None:
+            continue
+        feats, labels = extract_joint_features(palm_encoder, vein_encoder, loader, device)
+        if feats is not None:
+            eval_metrics(feats, labels, f"Joint Encoder - {split_name}")
+
+
 def main():
-    parser = argparse.ArgumentParser("Evaluate single-modality Hetero-MMRNet encoders")
+    parser = argparse.ArgumentParser("Evaluate Hetero-MMRNet encoders")
     parser.add_argument("--protocol_list", type=str, default="data_txt/polyu/test_missing_protocol.txt")
-    parser.add_argument("--modality", type=str, choices=["palm", "vein", "all"], default="all")
+    parser.add_argument("--modality", type=str, choices=["palm", "vein", "joint", "all"], default="all")
     parser.add_argument("--palm_ckpt", type=str, default="outputs/encoders/palm_best.pth")
     parser.add_argument("--vein_ckpt", type=str, default="outputs/encoders/vein_best.pth")
+    parser.add_argument("--joint_ckpt", type=str, default="outputs/encoders/joint_best.pth")
     parser.add_argument("--input_size", type=int, default=224)
     parser.add_argument("--encoder_dim", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -144,6 +194,8 @@ def main():
         evaluate_encoder("palm", args.palm_ckpt, args, device)
     if args.modality in {"vein", "all"}:
         evaluate_encoder("vein", args.vein_ckpt, args, device)
+    if args.modality in {"joint", "all"}:
+        evaluate_joint(args, device)
 
 
 if __name__ == "__main__":

@@ -103,6 +103,16 @@ def metrics_from_features(feats, labels):
     }
 
 
+def initial_best(metric):
+    return float("inf") if metric == "eer" else -float("inf")
+
+
+def metric_improved(current, best, metric, min_delta):
+    if metric == "eer":
+        return current < best - min_delta
+    return current > best + min_delta
+
+
 @torch.no_grad()
 def validate_single(encoder, loader, device, desc):
     encoder.eval()
@@ -242,7 +252,7 @@ def train_single(args):
     ce = nn.CrossEntropyLoss()
     augmenter = UAAAffineAugmenter() if args.modality == "palm" else None
     mixer = StarMix() if args.modality == "vein" else None
-    best_eer, bad_epochs, prev_uaa = float("inf"), 0, None
+    best_value, bad_epochs, prev_uaa = initial_best(args.select_metric), 0, None
     best_path = os.path.join(args.save_dir, f"{args.modality}_best.pth")
 
     for epoch in range(1, args.epochs + 1):
@@ -268,13 +278,14 @@ def train_single(args):
         val = validate_single(encoder, val_loader, device, f"Validate {args.modality}")
         print(
             f"[Epoch {epoch}] {args.modality} loss={loss_sum / max(total, 1):.4f} "
-            f"acc={correct / max(total, 1):.4f} val_eer={val['eer'] * 100:.3f}%"
+            f"acc={correct / max(total, 1):.4f} val_eer={val['eer'] * 100:.3f}% "
+            f"tar1e4={val['tar_1e4']:.4f} tar1e5={val['tar_1e5']:.4f}"
         )
-        improved = val["eer"] < best_eer - args.min_delta
+        improved = metric_improved(val[args.select_metric], best_value, args.select_metric, args.min_delta)
         if improved:
-            best_eer, bad_epochs = val["eer"], 0
+            best_value, bad_epochs = val[args.select_metric], 0
             save_checkpoint(best_path, epoch, args.modality, encoder, head, args, num_classes)
-            print(f"[Info] saved {best_path}")
+            print(f"[Info] saved {best_path} by {args.select_metric}")
         else:
             bad_epochs += 1
             if bad_epochs >= args.patience:
@@ -304,13 +315,14 @@ def train_joint(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     ce = nn.CrossEntropyLoss()
     augmenter, mixer = UAAAffineAugmenter(), StarMix()
-    best = {"palm": float("inf"), "vein": float("inf"), "joint": float("inf")}
+    best = {name: initial_best(args.select_metric) for name in ("palm", "vein", "joint")}
     bad_epochs, prev_uaa = 0, None
 
     for epoch in range(1, args.epochs + 1):
         for module in modules:
             module.train()
-        loss_sum = 0.0
+        loss_sums = {"total": 0.0, "palm": 0.0, "vein": 0.0, "align": 0.0, "joint": 0.0}
+        seen = 0
         for palm, vein, labels, _ in tqdm(train_loader, desc=f"joint epoch {epoch}", dynamic_ncols=True):
             palm = palm.to(device, non_blocking=True)
             vein = vein.to(device, non_blocking=True)
@@ -324,7 +336,9 @@ def train_joint(args):
             )
             palm_feat = palm_encoder(palm)
             vein_feat = vein_encoder(vein)
-            loss = loss_palm + loss_vein + args.lambda_align * (1.0 - F.cosine_similarity(palm_feat, vein_feat).mean())
+            loss_align = 1.0 - F.cosine_similarity(palm_feat, vein_feat).mean()
+            loss_joint = torch.zeros((), device=device)
+            loss = loss_palm + loss_vein + args.lambda_align * loss_align
 
             if heads["joint"] is not None:
                 _, loss_joint = arcface_loss(heads["joint"], F.normalize(palm_feat + vein_feat, dim=1), labels, ce)
@@ -333,24 +347,39 @@ def train_joint(args):
             if not optimizer_step(loss, optimizer, params):
                 print("[Warn] skipped non-finite training step")
                 continue
-            loss_sum += loss.item() * labels.size(0)
+            batch_size = labels.size(0)
+            seen += batch_size
+            loss_sums["total"] += loss.item() * batch_size
+            loss_sums["palm"] += loss_palm.item() * batch_size
+            loss_sums["vein"] += loss_vein.item() * batch_size
+            loss_sums["align"] += loss_align.item() * batch_size
+            loss_sums["joint"] += loss_joint.item() * batch_size
 
         scheduler.step()
         val = validate_joint(palm_encoder, vein_encoder, val_loader, device)
+        denom = max(seen, 1)
         print(
-            f"[Epoch {epoch}] joint loss={loss_sum / max(len(train_loader.dataset), 1):.4f} "
+            f"[Epoch {epoch}] joint loss={loss_sums['total'] / denom:.4f} "
+            f"palm_loss={loss_sums['palm'] / denom:.4f} "
+            f"vein_loss={loss_sums['vein'] / denom:.4f} "
+            f"align_loss={loss_sums['align'] / denom:.4f} "
+            f"joint_loss={loss_sums['joint'] / denom:.4f} "
             f"palm_eer={val['palm']['eer'] * 100:.3f}% "
             f"vein_eer={val['vein']['eer'] * 100:.3f}% "
-            f"joint_eer={val['joint']['eer'] * 100:.3f}%"
+            f"joint_eer={val['joint']['eer'] * 100:.3f}% "
+            f"joint_tar1e4={val['joint']['tar_1e4']:.4f} "
+            f"joint_tar1e5={val['joint']['tar_1e5']:.4f}"
         )
 
-        joint_improved = val["joint"]["eer"] < best["joint"] - args.min_delta
+        joint_improved = metric_improved(
+            val["joint"][args.select_metric], best["joint"], args.select_metric, args.min_delta
+        )
         for name in ("palm", "vein"):
-            if val[name]["eer"] < best[name] - args.min_delta:
-                best[name] = val[name]["eer"]
+            if metric_improved(val[name][args.select_metric], best[name], args.select_metric, args.min_delta):
+                best[name] = val[name][args.select_metric]
                 save_checkpoint(os.path.join(args.save_dir, f"{name}_best.pth"), epoch, name, encoders[name], heads[name], args, num_classes)
         if joint_improved:
-            best["joint"] = val["joint"]["eer"]
+            best["joint"] = val["joint"][args.select_metric]
             save_joint(os.path.join(args.save_dir, "joint_best.pth"), epoch, palm_encoder, vein_encoder, heads, args, num_classes)
 
         bad_epochs = 0 if joint_improved else bad_epochs + 1
@@ -384,6 +413,7 @@ def parse_args():
     parser.add_argument("--uaa_gamma", type=float, default=0.5)
     parser.add_argument("--patience", type=int, default=100)
     parser.add_argument("--min_delta", type=float, default=0.001)
+    parser.add_argument("--select_metric", choices=["eer", "tar_1e4", "tar_1e5"], default="eer")
     return parser.parse_args()
 
 
