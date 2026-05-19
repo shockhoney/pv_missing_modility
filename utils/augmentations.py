@@ -24,10 +24,12 @@ class UAAAffineAugmenter(nn.Module):
             raise ValueError("params must be [..., 4] in [tx, ty, theta, scale] order")
         if not torch.is_floating_point(params):
             params = params.float()
-        tx = params[..., 0].clamp(-self.max_translate, self.max_translate)
-        ty = params[..., 1].clamp(-self.max_translate, self.max_translate)
-        theta = params[..., 2].clamp(-self.max_rotate, self.max_rotate)
-        scale = params[..., 3].clamp(self.min_scale + 1e-6, self.max_scale - 1e-6)
+        offset = torch.nan_to_num(params[..., :3], nan=0.0, posinf=0.0, neginf=0.0)
+        raw_scale = torch.nan_to_num(params[..., 3], nan=1.0, posinf=self.max_scale, neginf=self.min_scale)
+        tx = offset[..., 0].clamp(-self.max_translate, self.max_translate)
+        ty = offset[..., 1].clamp(-self.max_translate, self.max_translate)
+        theta = offset[..., 2].clamp(-self.max_rotate, self.max_rotate)
+        scale = raw_scale.clamp(self.min_scale + 1e-6, self.max_scale - 1e-6)
         return torch.stack([tx, ty, theta, scale], dim=-1)
 
     def forward(self, images: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
@@ -103,9 +105,13 @@ def optimize_uaa_params(
                 params = params.detach().requires_grad_(True)
                 logits = _classifier_forward(classifier, encoder(augmenter(selected_images, params)), selected_labels)
                 loss = F.cross_entropy(logits, selected_labels)
+                if not torch.isfinite(loss):
+                    break
                 grad = torch.autograd.grad(loss, params, only_inputs=True, allow_unused=True)[0]
                 if grad is None:
                     grad = torch.zeros_like(params)
+                else:
+                    grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
                 params = augmenter.project(params + step_size * grad.sign()).detach()
     finally:
         encoder.train(encoder_was_training)

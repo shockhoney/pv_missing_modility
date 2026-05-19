@@ -78,7 +78,22 @@ def pair_scores(feats, labels):
 
 
 def metrics_from_features(feats, labels):
+    feats = np.asarray(feats, dtype=np.float32)
+    labels = np.asarray(labels)
+    valid = np.isfinite(feats).all(axis=1)
+    if not valid.all():
+        print(f"[Warn] dropped {int((~valid).sum())} non-finite validation embeddings")
+        feats, labels = feats[valid], labels[valid]
+    if feats.shape[0] < 2:
+        return {"eer": float("inf"), "tar_1e4": 0.0, "tar_1e5": 0.0}
+
     scores, pair_labels = pair_scores(feats, labels)
+    valid = np.isfinite(scores)
+    if not valid.all():
+        scores, pair_labels = scores[valid], pair_labels[valid]
+    if scores.size == 0 or np.unique(pair_labels).size < 2:
+        return {"eer": float("inf"), "tar_1e4": 0.0, "tar_1e5": 0.0}
+
     tar_1e4 = tar_at_far(scores, pair_labels, 1e-4, is_similarity=True)
     tar_1e5 = tar_at_far(scores, pair_labels, 1e-5, is_similarity=True)
     return {
@@ -180,6 +195,20 @@ def arcface_loss(head, feat, labels, ce):
     return logits, ce(logits, labels)
 
 
+def optimizer_step(loss, optimizer, params):
+    if not torch.isfinite(loss):
+        optimizer.zero_grad(set_to_none=True)
+        return False
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(params, 5.0)
+    if not torch.isfinite(grad_norm):
+        optimizer.zero_grad(set_to_none=True)
+        return False
+    optimizer.step()
+    return True
+
+
 def modality_loss(modality, encoder, head, images, labels, ce, args, augmenter=None, mixer=None, prev_params=None):
     if modality == "palm":
         images, labels, prev_params = apply_uaa(images, labels, encoder, head, augmenter, args, prev_params)
@@ -227,10 +256,9 @@ def train_single(args):
                 args.modality, encoder, head, images, labels, ce, args, augmenter, mixer, prev_uaa
             )
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 5.0)
-            optimizer.step()
+            if not optimizer_step(loss, optimizer, params):
+                print("[Warn] skipped non-finite training step")
+                continue
 
             total += used_labels.size(0)
             loss_sum += loss.item() * used_labels.size(0)
@@ -302,10 +330,9 @@ def train_joint(args):
                 _, loss_joint = arcface_loss(heads["joint"], F.normalize(palm_feat + vein_feat, dim=1), labels, ce)
                 loss = loss + args.lambda_joint * loss_joint
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 5.0)
-            optimizer.step()
+            if not optimizer_step(loss, optimizer, params):
+                print("[Warn] skipped non-finite training step")
+                continue
             loss_sum += loss.item() * labels.size(0)
 
         scheduler.step()
