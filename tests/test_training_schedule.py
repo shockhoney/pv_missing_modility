@@ -1,76 +1,39 @@
 import unittest
-from types import SimpleNamespace
+import warnings
 
 import numpy as np
 import torch
-import torch.nn as nn
+from PIL import Image
+from torchvision import transforms
 
 import test_encoder
 import train_encoder
 from models.backbones import build_encoder
-from utils.augmentations import UAAAffineAugmenter
-
-
-class TinyEncoder(nn.Module):
-    def forward(self, x):
-        return x.mean(dim=(2, 3))
-
-
-class TinyHead(nn.Module):
-    def forward(self, feat, labels=None):
-        return torch.stack([feat[:, 0], -feat[:, 0]], dim=1)
+from utils.preprocess import CLAHE, build_palm_transform, build_vein_transform
 
 
 class ScheduleAndFusionTest(unittest.TestCase):
-    def test_default_args_disable_stage_one_augmentations(self):
+    def test_modality_transforms_are_separate(self):
+        palm_ops = [type(op) for op in build_palm_transform(224, train=True).transforms]
+        vein_ops = [type(op) for op in build_vein_transform(224, train=True).transforms]
+        self.assertNotIn(transforms.RandomHorizontalFlip, palm_ops)
+        self.assertIn(transforms.RandomAffine, palm_ops)
+        self.assertIn(transforms.ColorJitter, palm_ops)
+        self.assertIn(CLAHE, vein_ops)
+        self.assertIn(transforms.RandomAffine, vein_ops)
+        self.assertNotIn(transforms.ColorJitter, vein_ops)
+
+    def test_modality_transforms_keep_three_channels(self):
+        image = Image.fromarray(np.full((16, 16), 128, dtype=np.uint8))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            self.assertEqual(build_palm_transform(32)(image).shape[0], 3)
+            self.assertEqual(build_vein_transform(32)(image).shape[0], 3)
+
+    def test_default_args_train_palm_baseline_only(self):
         args = train_encoder.parse_args([])
-        self.assertFalse(args.use_uaa)
-        self.assertFalse(args.use_starmix)
-
-    def test_epoch_settings(self):
-        args = SimpleNamespace(
-            use_uaa=True,
-            use_starmix=True,
-            starmix_start_epoch=51,
-            uaa_start_epoch=151,
-            align_start_epoch=51,
-            lambda_align=0.0,
-            align_final=0.03,
-            arcface_s=16.0,
-            arcface_m=0.25,
-            arcface_s_final=24.0,
-            arcface_m_final=0.35,
-        )
-        self.assertEqual(train_encoder.epoch_settings(args, 1)["lambda_align"], 0.0)
-        self.assertFalse(train_encoder.epoch_settings(args, 1)["use_starmix"])
-        self.assertFalse(train_encoder.epoch_settings(args, 1)["use_uaa"])
-
-        mid = train_encoder.epoch_settings(args, 51)
-        self.assertTrue(mid["use_starmix"])
-        self.assertFalse(mid["use_uaa"])
-        self.assertEqual(mid["lambda_align"], 0.03)
-        self.assertEqual(mid["arcface_s"], 24.0)
-
-        late = train_encoder.epoch_settings(args, 151)
-        self.assertTrue(late["use_starmix"])
-        self.assertTrue(late["use_uaa"])
-
-    def test_apply_uaa_keeps_full_batch(self):
-        args = SimpleNamespace(
-            use_uaa=True,
-            uaa_steps=1,
-            uaa_step_size=0.01,
-            uaa_beta=0.5,
-            uaa_gamma=0.5,
-        )
-        images = torch.randn(4, 2, 8, 8)
-        labels = torch.tensor([0, 1, 0, 1])
-        out, out_labels, params = train_encoder.apply_uaa(
-            images, labels, TinyEncoder(), TinyHead(), UAAAffineAugmenter(), args, None, enabled=True
-        )
-        self.assertEqual(out.shape, images.shape)
-        self.assertTrue(torch.equal(out_labels, labels))
-        self.assertEqual(params.shape[-1], 4)
+        self.assertEqual(args.modality, "palm")
+        self.assertEqual(train_encoder.parse_args(["--modality", "vein"]).modality, "vein")
 
     def test_weighted_fusion_is_normalized(self):
         palm = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)

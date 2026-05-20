@@ -51,7 +51,7 @@ palm_path vein_path label palm_exists vein_exists split
 | 模态 | 编码器方案 |
 |---|---|
 | 掌纹 | ResNet50 + UAA 图像增强 |
-| 掌静脉 | StarLKNet 方法 |
+| 掌静脉 | ConvNeXt V2-Tiny 方法 |
 
 特征表示：
 

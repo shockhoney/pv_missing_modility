@@ -6,27 +6,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torchvision import transforms
 from tqdm import tqdm
 
 from models.backbones import build_encoder
 from utils.datasets_txt import MissingPairTxtDataset
 from utils.metrics import compute_eer, far_frr_acc_at_threshold, roc_auc, tar_at_far
+from utils.preprocess import build_palm_transform, build_vein_transform
 
 FARS = (1e-5, 1e-4, 1e-3)
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
-
-
-def get_transforms(img_size: int):
-    return transforms.Compose(
-        [
-            transforms.Resize((img_size, img_size)),
-            transforms.Grayscale(num_output_channels=3),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ]
-    )
 
 
 def safe_torch_load(path: str, device):
@@ -66,8 +53,8 @@ def load_joint_encoders(args, device):
 def build_loader(protocol_list: str, split_name: str, img_size: int, batch_size: int, num_workers: int):
     dataset = MissingPairTxtDataset(
         protocol_list,
-        transform_palm=get_transforms(img_size),
-        transform_vein=get_transforms(img_size),
+        transform_palm=build_palm_transform(img_size),
+        transform_vein=build_vein_transform(img_size),
         split_filter=split_name,
     )
     if len(dataset) == 0:

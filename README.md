@@ -7,7 +7,7 @@ This project trains palmprint and palm-vein encoders for missing-modality recogn
 - Training head: ArcFace
 - Test stage: normalized embedding with cosine similarity
 
-This stage trains strong single-modality baselines first. UAA and StarMix are kept in code but disabled by default.
+This stage trains only strong single-modality baselines. Joint alignment is not used.
 
 
 ## Protocol
@@ -53,8 +53,6 @@ python train_encoder.py --modality palm
 python train_encoder.py --modality vein
 ```
 
-UAA and StarMix are disabled by default in this stage. Use `--use_uaa` or `--use_starmix` only for later experiments.
-
 ## Test
 
 ```bash
@@ -67,7 +65,6 @@ python test_encoder.py ^
 ## Main Files
 
 - `models/backbones.py`: ResNet50 and ConvNeXt V2-Tiny encoders
-- `utils/augmentations.py`: UAA geometry and StarMix
 - `utils/datasets_txt.py`: protocol generation and datasets
 - `train_encoder.py`: encoder training
 - `test_encoder.py`: encoder evaluation
