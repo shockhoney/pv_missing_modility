@@ -7,6 +7,7 @@ import torch.nn as nn
 
 import test_encoder
 import train_encoder
+from models.backbones import build_encoder
 from utils.augmentations import UAAAffineAugmenter
 
 
@@ -21,6 +22,11 @@ class TinyHead(nn.Module):
 
 
 class ScheduleAndFusionTest(unittest.TestCase):
+    def test_default_args_disable_stage_one_augmentations(self):
+        args = train_encoder.parse_args([])
+        self.assertFalse(args.use_uaa)
+        self.assertFalse(args.use_starmix)
+
     def test_epoch_settings(self):
         args = SimpleNamespace(
             use_uaa=True,
@@ -71,6 +77,21 @@ class ScheduleAndFusionTest(unittest.TestCase):
         vein = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
         fused = test_encoder.weighted_fusion(palm, vein, 0.75)
         np.testing.assert_allclose(np.linalg.norm(fused, axis=1), np.ones(2), rtol=1e-6)
+
+    def test_resnet50_palm_encoder_output_shape(self):
+        encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
+        encoder.eval()
+        with torch.no_grad():
+            out = encoder(torch.randn(2, 3, 64, 64))
+        self.assertEqual(tuple(out.shape), (2, 16))
+
+    def test_convnextv2_tiny_vein_encoder_output_shape(self):
+        encoder = build_encoder("vein", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
+        self.assertEqual(encoder.__class__.__name__, "ConvNeXtV2TinyVeinEncoder")
+        encoder.eval()
+        with torch.no_grad():
+            out = encoder(torch.randn(2, 3, 64, 64))
+        self.assertEqual(tuple(out.shape), (2, 16))
 
 
 if __name__ == "__main__":

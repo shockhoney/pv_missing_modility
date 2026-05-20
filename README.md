@@ -2,10 +2,12 @@
 
 This project trains palmprint and palm-vein encoders for missing-modality recognition.
 
-- Palm encoder: ResNet50 + UAA geometric adversarial augmentation
-- Vein encoder: StarLKNet/LaKNet + StarMix
+- Palm encoder baseline: TorchVision ResNet50
+- Vein encoder baseline: ConvNeXt V2-Tiny
 - Training head: ArcFace
 - Test stage: normalized embedding with cosine similarity
+
+This stage trains strong single-modality baselines first. UAA and StarMix are kept in code but disabled by default.
 
 
 ## Protocol
@@ -36,20 +38,22 @@ data_txt/<dataset_name>/test_missing_protocol.txt
 
 ## Train
 
-```bash
-python train_encoder.py ^
-  --modality joint ^
-  --train_full_list data_txt/polyu/train_full.txt ^
-  --val_full_list data_txt/polyu/val_full.txt ^
-  --save_dir outputs/encoders
+Download pretrained weights first:
+
+```powershell
+New-Item -ItemType Directory -Force pretrained
+Invoke-WebRequest -Uri "https://download.pytorch.org/models/resnet50-11ad3fa6.pth" -OutFile "pretrained/resnet50_imagenet1k_v2.pth"
+Invoke-WebRequest -Uri "https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_tiny_22k_224_ema.pt" -OutFile "pretrained/convnextv2_tiny_22k_224_ema.pt"
 ```
 
-Single branch:
+Single-modality baselines:
 
 ```bash
 python train_encoder.py --modality palm
 python train_encoder.py --modality vein
 ```
+
+UAA and StarMix are disabled by default in this stage. Use `--use_uaa` or `--use_starmix` only for later experiments.
 
 ## Test
 
@@ -62,7 +66,7 @@ python test_encoder.py ^
 
 ## Main Files
 
-- `models/backbones.py`: palm and vein encoders
+- `models/backbones.py`: ResNet50 and ConvNeXt V2-Tiny encoders
 - `utils/augmentations.py`: UAA geometry and StarMix
 - `utils/datasets_txt.py`: protocol generation and datasets
 - `train_encoder.py`: encoder training

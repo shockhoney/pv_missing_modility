@@ -14,6 +14,8 @@ from utils.datasets_txt import MissingPairTxtDataset
 from utils.metrics import compute_eer, far_frr_acc_at_threshold, roc_auc, tar_at_far
 
 FARS = (1e-5, 1e-4, 1e-3)
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 def get_transforms(img_size: int):
@@ -22,7 +24,7 @@ def get_transforms(img_size: int):
             transforms.Resize((img_size, img_size)),
             transforms.Grayscale(num_output_channels=3),
             transforms.ToTensor(),
-            transforms.Normalize([0.5] * 3, [0.5] * 3),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
     )
 
