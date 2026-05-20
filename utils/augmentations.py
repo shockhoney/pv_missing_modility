@@ -87,7 +87,7 @@ def optimize_uaa_params(
     beta: float = 0.5,
     prev_params: torch.Tensor | None = None,
     gamma: float = 0.5,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = images.size(0)
     selected_count = max(1, min(batch_size, int(round(batch_size * gamma))))
     selected_idx = torch.randperm(batch_size, device=images.device)[:selected_count]
@@ -119,7 +119,7 @@ def optimize_uaa_params(
 
     with torch.no_grad():
         augmented = augmenter(selected_images, params)
-    return augmented.detach(), selected_labels, params.detach()
+    return augmented.detach(), selected_labels, params.detach(), selected_idx.detach()
 
 
 class StarMix:

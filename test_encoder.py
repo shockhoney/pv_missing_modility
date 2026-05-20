@@ -13,6 +13,8 @@ from models.backbones import build_encoder
 from utils.datasets_txt import MissingPairTxtDataset
 from utils.metrics import compute_eer, far_frr_acc_at_threshold, roc_auc, tar_at_far
 
+FARS = (1e-5, 1e-4, 1e-3)
+
 
 def get_transforms(img_size: int):
     return transforms.Compose(
@@ -85,6 +87,18 @@ def build_pair_scores(feats: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray
     return scores, pair_labels
 
 
+def weighted_fusion(palm_feats: np.ndarray, vein_feats: np.ndarray, alpha: float) -> np.ndarray:
+    fused = alpha * palm_feats + (1.0 - alpha) * vein_feats
+    return fused / np.maximum(np.linalg.norm(fused, axis=1, keepdims=True), 1e-12)
+
+
+def encode_selected(encoder, images, selected, device):
+    if not bool(selected.any()):
+        return None
+    images = images[selected].to(device, non_blocking=True)
+    return F.normalize(encoder(images), dim=1)
+
+
 @torch.no_grad()
 def extract_features(encoder, loader, modality: str, device):
     feats, labels = [], []
@@ -96,12 +110,9 @@ def extract_features(encoder, loader, modality: str, device):
             continue
 
         images = palm_img if modality == "palm" else vein_img
-        images = images[available].to(device, non_blocking=True)
-        batch_labels = batch_labels[available]
-
-        embeddings = F.normalize(encoder(images), dim=1)
+        embeddings = encode_selected(encoder, images, available, device)
         feats.append(embeddings.cpu().numpy())
-        labels.append(batch_labels.numpy())
+        labels.append(batch_labels[available].numpy())
 
     if not feats:
         return None, None
@@ -121,7 +132,6 @@ def eval_metrics(feats: np.ndarray, labels: np.ndarray, name: str):
     eer, thr = compute_eer(scores, pair_labels, is_similarity=True, return_threshold=True)
     _, _, _, auc_val = roc_auc(scores, pair_labels, is_similarity=True)
     thr_stats = far_frr_acc_at_threshold(scores, pair_labels, thr, is_similarity=True)
-
     print(f"AUC : {auc_val:.4f}")
     print(f"EER : {eer * 100:.3f}% (threshold = {thr:.4f})")
     print(
@@ -129,7 +139,7 @@ def eval_metrics(feats: np.ndarray, labels: np.ndarray, name: str):
         f"FAR={thr_stats['FAR']:.4f}, FRR={thr_stats['FRR']:.4f}"
     )
     print("TAR @ FAR:")
-    for far in [1e-5, 1e-4, 1e-3]:
+    for far in FARS:
         info = tar_at_far(scores, pair_labels, far, is_similarity=True)
         print(f"  FAR={far:.1e}: TAR={info['TAR']:.4f}, thr={info['threshold']:.4f}")
 
@@ -150,16 +160,39 @@ def evaluate_encoder(modality: str, ckpt_path: str, args, device):
 
 @torch.no_grad()
 def extract_joint_features(palm_encoder, vein_encoder, loader, device):
-    feats, labels = [], []
+    palm_feats, vein_feats, labels = [], [], []
     for palm_img, vein_img, batch_labels, mask in tqdm(loader, desc="Extract joint", dynamic_ncols=True, leave=False):
         available = (mask[:, 0] > 0.5) & (mask[:, 1] > 0.5)
         if available.sum() == 0:
             continue
-        palm = palm_img[available].to(device, non_blocking=True)
-        vein = vein_img[available].to(device, non_blocking=True)
-        joint = F.normalize(F.normalize(palm_encoder(palm), dim=1) + F.normalize(vein_encoder(vein), dim=1), dim=1)
-        feats.append(joint.cpu().numpy())
+        palm_feats.append(encode_selected(palm_encoder, palm_img, available, device).cpu().numpy())
+        vein_feats.append(encode_selected(vein_encoder, vein_img, available, device).cpu().numpy())
         labels.append(batch_labels[available].numpy())
+    if not palm_feats:
+        return None, None, None
+    return np.concatenate(palm_feats, axis=0), np.concatenate(vein_feats, axis=0), np.concatenate(labels, axis=0)
+
+
+@torch.no_grad()
+def extract_missing_aware_features(palm_encoder, vein_encoder, loader, alpha: float, device):
+    feats, labels = [], []
+    for palm_img, vein_img, batch_labels, mask in tqdm(loader, desc="Extract missing-aware", dynamic_ncols=True, leave=False):
+        has_palm = mask[:, 0] > 0.5
+        has_vein = mask[:, 1] > 0.5
+        groups = ((has_palm & has_vein, "both"), (has_palm & ~has_vein, "palm"), (~has_palm & has_vein, "vein"))
+        for selected, source in groups:
+            if not bool(selected.any()):
+                continue
+            if source == "both":
+                palm_feat = encode_selected(palm_encoder, palm_img, selected, device)
+                vein_feat = encode_selected(vein_encoder, vein_img, selected, device)
+                feat = F.normalize(alpha * palm_feat + (1.0 - alpha) * vein_feat, dim=1)
+            elif source == "palm":
+                feat = encode_selected(palm_encoder, palm_img, selected, device)
+            else:
+                feat = encode_selected(vein_encoder, vein_img, selected, device)
+            feats.append(feat.cpu().numpy())
+            labels.append(batch_labels[selected].numpy())
     if not feats:
         return None, None
     return np.concatenate(feats, axis=0), np.concatenate(labels, axis=0)
@@ -171,9 +204,15 @@ def evaluate_joint(args, device):
         loader = build_loader(args.protocol_list, split_name, args.input_size, args.batch_size, args.num_workers)
         if loader is None:
             continue
-        feats, labels = extract_joint_features(palm_encoder, vein_encoder, loader, device)
-        if feats is not None:
-            eval_metrics(feats, labels, f"Joint Encoder - {split_name}")
+        if split_name == "full":
+            palm_feats, vein_feats, labels = extract_joint_features(palm_encoder, vein_encoder, loader, device)
+            if palm_feats is None:
+                continue
+            eval_metrics(weighted_fusion(palm_feats, vein_feats, 0.5), labels, f"Joint Encoder - {split_name} alpha=0.50")
+        else:
+            feats, labels = extract_missing_aware_features(palm_encoder, vein_encoder, loader, 0.5, device)
+            if feats is not None:
+                eval_metrics(feats, labels, f"Joint Encoder - {split_name} missing-aware")
 
 
 def main():

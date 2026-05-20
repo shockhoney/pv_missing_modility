@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 
 import numpy as np
@@ -113,6 +114,66 @@ def metric_improved(current, best, metric, min_delta):
     return current > best + min_delta
 
 
+def epoch_settings(args, epoch):
+    align_final = args.lambda_align if args.align_final is None else args.align_final
+    use_starmix = args.use_starmix and epoch >= args.starmix_start_epoch
+    use_uaa = args.use_uaa and epoch >= args.uaa_start_epoch
+    use_align = epoch >= args.align_start_epoch
+    use_final_arcface = epoch >= args.align_start_epoch
+    return {
+        "use_uaa": use_uaa,
+        "use_starmix": use_starmix,
+        "lambda_align": align_final if use_align else 0.0,
+        "arcface_s": args.arcface_s_final if use_final_arcface and args.arcface_s_final is not None else args.arcface_s,
+        "arcface_m": args.arcface_m_final if use_final_arcface and args.arcface_m_final is not None else args.arcface_m,
+    }
+
+
+def set_arcface(head, scale, margin):
+    if head is None:
+        return
+    head.s = float(scale)
+    head.m = float(margin)
+    head.cos_m = math.cos(head.m)
+    head.sin_m = math.sin(head.m)
+    head.th = math.cos(math.pi - head.m)
+    head.mm = math.sin(math.pi - head.m) * head.m
+
+
+def set_heads(heads, settings):
+    for head in heads:
+        set_arcface(head, settings["arcface_s"], settings["arcface_m"])
+
+
+def apply_epoch_settings(args, epoch, optimizer, heads):
+    settings = epoch_settings(args, epoch)
+    lr = epoch_lr(args, epoch)
+    set_lr(optimizer, lr)
+    set_heads(heads, settings)
+    return settings, lr
+
+
+def modality_flags(settings, modality):
+    return {
+        "use_uaa": modality == "palm" and settings["use_uaa"],
+        "use_starmix": modality == "vein" and settings["use_starmix"],
+    }
+
+
+def epoch_lr(args, epoch):
+    if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
+        return args.lr * epoch / args.warmup_epochs
+    span = max(1, args.epochs - args.warmup_epochs)
+    step = max(0, epoch - args.warmup_epochs)
+    scale = 0.5 * (1.0 + math.cos(math.pi * min(step, span) / span))
+    return args.min_lr + (args.lr - args.min_lr) * scale
+
+
+def set_lr(optimizer, lr):
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
 @torch.no_grad()
 def validate_single(encoder, loader, device, desc):
     encoder.eval()
@@ -175,14 +236,14 @@ def save_joint(path, epoch, palm_encoder, vein_encoder, heads, args, num_classes
     )
 
 
-def apply_uaa(images, labels, encoder, classifier, augmenter, args, prev_params):
-    if not args.use_uaa:
+def apply_uaa(images, labels, encoder, classifier, augmenter, args, prev_params, enabled=True):
+    if not enabled:
         return images, labels, prev_params
     was_training = encoder.training, classifier.training
     encoder.eval()
     classifier.eval()
     try:
-        aug, selected_labels, params = optimize_uaa_params(
+        aug, _, params, selected_idx = optimize_uaa_params(
             encoder,
             classifier,
             images,
@@ -197,7 +258,9 @@ def apply_uaa(images, labels, encoder, classifier, augmenter, args, prev_params)
     finally:
         encoder.train(was_training[0])
         classifier.train(was_training[1])
-    return aug.detach(), selected_labels.detach(), params.detach()
+    out = images.clone()
+    out[selected_idx] = aug.to(dtype=out.dtype)
+    return out.detach(), labels, params.detach()
 
 
 def arcface_loss(head, feat, labels, ce):
@@ -219,13 +282,28 @@ def optimizer_step(loss, optimizer, params):
     return True
 
 
-def modality_loss(modality, encoder, head, images, labels, ce, args, augmenter=None, mixer=None, prev_params=None):
+def modality_loss(
+    modality,
+    encoder,
+    head,
+    images,
+    labels,
+    ce,
+    args,
+    augmenter=None,
+    mixer=None,
+    prev_params=None,
+    use_uaa=True,
+    use_starmix=True,
+):
     if modality == "palm":
-        images, labels, prev_params = apply_uaa(images, labels, encoder, head, augmenter, args, prev_params)
+        images, labels, prev_params = apply_uaa(
+            images, labels, encoder, head, augmenter, args, prev_params, enabled=use_uaa
+        )
         logits, loss = arcface_loss(head, encoder(images), labels, ce)
         return logits, loss, labels, prev_params
 
-    if args.use_starmix:
+    if use_starmix:
         mixed, labels_a, labels_b, lam = mixer(images, labels)
         feat = encoder(mixed)
         logits_a = head(feat, labels_a)
@@ -248,7 +326,6 @@ def train_single(args):
     head = ArcFace(args.embedding_size, num_classes, args.arcface_s, args.arcface_m).to(device)
     params = list(encoder.parameters()) + list(head.parameters())
     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.wd)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     ce = nn.CrossEntropyLoss()
     augmenter = UAAAffineAugmenter() if args.modality == "palm" else None
     mixer = StarMix() if args.modality == "vein" else None
@@ -256,6 +333,8 @@ def train_single(args):
     best_path = os.path.join(args.save_dir, f"{args.modality}_best.pth")
 
     for epoch in range(1, args.epochs + 1):
+        settings, lr = apply_epoch_settings(args, epoch, optimizer, [head])
+        flags = modality_flags(settings, args.modality)
         encoder.train()
         head.train()
         loss_sum = correct = total = 0
@@ -263,7 +342,17 @@ def train_single(args):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             logits, loss, used_labels, prev_uaa = modality_loss(
-                args.modality, encoder, head, images, labels, ce, args, augmenter, mixer, prev_uaa
+                args.modality,
+                encoder,
+                head,
+                images,
+                labels,
+                ce,
+                args,
+                augmenter=augmenter,
+                mixer=mixer,
+                prev_params=prev_uaa,
+                **flags,
             )
 
             if not optimizer_step(loss, optimizer, params):
@@ -274,12 +363,13 @@ def train_single(args):
             loss_sum += loss.item() * used_labels.size(0)
             correct += (logits.argmax(1) == used_labels).sum().item()
 
-        scheduler.step()
         val = validate_single(encoder, val_loader, device, f"Validate {args.modality}")
+        avg_loss = loss_sum / max(total, 1)
         print(
-            f"[Epoch {epoch}] {args.modality} loss={loss_sum / max(total, 1):.4f} "
+            f"[Epoch {epoch}] {args.modality} loss={avg_loss:.4f} "
             f"acc={correct / max(total, 1):.4f} val_eer={val['eer'] * 100:.3f}% "
-            f"tar1e4={val['tar_1e4']:.4f} tar1e5={val['tar_1e5']:.4f}"
+            f"tar1e4={val['tar_1e4']:.4f} tar1e5={val['tar_1e5']:.4f} "
+            f"lr={lr:.6g} uaa={int(flags['use_uaa'])} starmix={int(flags['use_starmix'])}"
         )
         improved = metric_improved(val[args.select_metric], best_value, args.select_metric, args.min_delta)
         if improved:
@@ -312,13 +402,13 @@ def train_joint(args):
     modules = [palm_encoder, vein_encoder, heads["palm"], heads["vein"]] + ([heads["joint"]] if heads["joint"] else [])
     params = [p for module in modules for p in module.parameters()]
     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.wd)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     ce = nn.CrossEntropyLoss()
     augmenter, mixer = UAAAffineAugmenter(), StarMix()
     best = {name: initial_best(args.select_metric) for name in ("palm", "vein", "joint")}
     bad_epochs, prev_uaa = 0, None
 
     for epoch in range(1, args.epochs + 1):
+        settings, lr = apply_epoch_settings(args, epoch, optimizer, heads.values())
         for module in modules:
             module.train()
         loss_sums = {"total": 0.0, "palm": 0.0, "vein": 0.0, "align": 0.0, "joint": 0.0}
@@ -329,16 +419,33 @@ def train_joint(args):
             labels = labels.to(device, non_blocking=True)
 
             palm_logits, loss_palm, _, prev_uaa = modality_loss(
-                "palm", palm_encoder, heads["palm"], palm, labels, ce, args, augmenter, None, prev_uaa
+                "palm",
+                palm_encoder,
+                heads["palm"],
+                palm,
+                labels,
+                ce,
+                args,
+                augmenter=augmenter,
+                prev_params=prev_uaa,
+                **modality_flags(settings, "palm"),
             )
             vein_logits, loss_vein, _, _ = modality_loss(
-                "vein", vein_encoder, heads["vein"], vein, labels, ce, args, None, mixer
+                "vein",
+                vein_encoder,
+                heads["vein"],
+                vein,
+                labels,
+                ce,
+                args,
+                mixer=mixer,
+                **modality_flags(settings, "vein"),
             )
             palm_feat = palm_encoder(palm)
             vein_feat = vein_encoder(vein)
             loss_align = 1.0 - F.cosine_similarity(palm_feat, vein_feat).mean()
             loss_joint = torch.zeros((), device=device)
-            loss = loss_palm + loss_vein + args.lambda_align * loss_align
+            loss = loss_palm + loss_vein + settings["lambda_align"] * loss_align
 
             if heads["joint"] is not None:
                 _, loss_joint = arcface_loss(heads["joint"], F.normalize(palm_feat + vein_feat, dim=1), labels, ce)
@@ -355,22 +462,23 @@ def train_joint(args):
             loss_sums["align"] += loss_align.item() * batch_size
             loss_sums["joint"] += loss_joint.item() * batch_size
 
-        scheduler.step()
         val = validate_joint(palm_encoder, vein_encoder, val_loader, device)
         denom = max(seen, 1)
+        losses = {name: value / denom for name, value in loss_sums.items()}
         print(
-            f"[Epoch {epoch}] joint loss={loss_sums['total'] / denom:.4f} "
-            f"palm_loss={loss_sums['palm'] / denom:.4f} "
-            f"vein_loss={loss_sums['vein'] / denom:.4f} "
-            f"align_loss={loss_sums['align'] / denom:.4f} "
-            f"joint_loss={loss_sums['joint'] / denom:.4f} "
+            f"[Epoch {epoch}] joint loss={losses['total']:.4f} "
+            f"palm_loss={losses['palm']:.4f} "
+            f"vein_loss={losses['vein']:.4f} "
+            f"align_loss={losses['align']:.4f} "
+            f"joint_loss={losses['joint']:.4f} "
             f"palm_eer={val['palm']['eer'] * 100:.3f}% "
             f"vein_eer={val['vein']['eer'] * 100:.3f}% "
             f"joint_eer={val['joint']['eer'] * 100:.3f}% "
             f"joint_tar1e4={val['joint']['tar_1e4']:.4f} "
-            f"joint_tar1e5={val['joint']['tar_1e5']:.4f}"
+            f"joint_tar1e5={val['joint']['tar_1e5']:.4f} "
+            f"lr={lr:.6g} align={settings['lambda_align']:.4f} "
+            f"uaa={int(settings['use_uaa'])} starmix={int(settings['use_starmix'])}"
         )
-
         joint_improved = metric_improved(
             val["joint"][args.select_metric], best["joint"], args.select_metric, args.min_delta
         )
@@ -400,13 +508,21 @@ def parse_args():
     parser.add_argument("--input_size", type=int, default=224)
     parser.add_argument("--embedding_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument("--wd", type=float, default=1e-4)
     parser.add_argument("--arcface_s", type=float, default=32.0)
     parser.add_argument("--arcface_m", type=float, default=0.25)
+    parser.add_argument("--arcface_s_final", type=float, default=None)
+    parser.add_argument("--arcface_m_final", type=float, default=None)
     parser.add_argument("--lambda_align", type=float, default=1.0)
+    parser.add_argument("--align_final", type=float, default=None)
     parser.add_argument("--lambda_joint", type=float, default=0.0)
     parser.add_argument("--use_uaa", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_starmix", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--starmix_start_epoch", type=int, default=1)
+    parser.add_argument("--uaa_start_epoch", type=int, default=1)
+    parser.add_argument("--align_start_epoch", type=int, default=1)
+    parser.add_argument("--warmup_epochs", type=int, default=0)
     parser.add_argument("--uaa_steps", type=int, default=1)
     parser.add_argument("--uaa_step_size", type=float, default=0.1)
     parser.add_argument("--uaa_beta", type=float, default=0.5)
