@@ -17,6 +17,10 @@ from utils.head import ArcFace
 from utils.metrics import compute_eer, tar_at_far
 
 
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
 def get_transforms(img_size, strong):
     ops = [transforms.Resize((img_size, img_size))]
     if strong:
@@ -24,7 +28,7 @@ def get_transforms(img_size, strong):
     ops += [
         transforms.Grayscale(num_output_channels=3),
         transforms.ToTensor(),
-        transforms.Normalize([0.5] * 3, [0.5] * 3),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ]
     return transforms.Compose(ops)
 
@@ -69,7 +73,14 @@ def make_loader(args, list_path, modality=None, strong=False):
 
 
 def make_encoder(modality, args):
-    return build_encoder(modality, input_channel=3, input_size=args.input_size, embedding_size=args.embedding_size)
+    pretrained_path = args.palm_pretrained if modality == "palm" else args.vein_pretrained
+    return build_encoder(
+        modality,
+        input_channel=3,
+        input_size=args.input_size,
+        embedding_size=args.embedding_size,
+        pretrained_path=pretrained_path,
+    )
 
 
 def pair_scores(feats, labels):
@@ -495,7 +506,7 @@ def train_joint(args):
             break
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser("Train palm/vein encoders")
     parser.add_argument("--modality", choices=["joint", "palm", "vein"], default="joint")
     parser.add_argument("--train_full_list", default="data_txt/polyu/train_full.txt")
@@ -507,6 +518,8 @@ def parse_args():
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--input_size", type=int, default=224)
     parser.add_argument("--embedding_size", type=int, default=256)
+    parser.add_argument("--palm_pretrained", default="pretrained/resnet50_imagenet1k_v2.pth")
+    parser.add_argument("--vein_pretrained", default="pretrained/convnextv2_tiny_22k_224_ema.pt")
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument("--wd", type=float, default=1e-4)
@@ -517,8 +530,8 @@ def parse_args():
     parser.add_argument("--lambda_align", type=float, default=1.0)
     parser.add_argument("--align_final", type=float, default=None)
     parser.add_argument("--lambda_joint", type=float, default=0.0)
-    parser.add_argument("--use_uaa", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--use_starmix", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use_uaa", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--use_starmix", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--starmix_start_epoch", type=int, default=50)
     parser.add_argument("--uaa_start_epoch", type=int, default=150)
     parser.add_argument("--align_start_epoch", type=int, default=50)
@@ -530,7 +543,7 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=100)
     parser.add_argument("--min_delta", type=float, default=0.001)
     parser.add_argument("--select_metric", choices=["eer", "tar_1e4", "tar_1e5"], default="eer")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main():
