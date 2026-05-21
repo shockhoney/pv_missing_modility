@@ -17,6 +17,11 @@ PROTOCOL_FILES = {
     "val_missing_fixed": "val_missing_fixed.txt",
     "test_missing_protocol": "test_missing_protocol.txt",
 }
+CLOSED_PROTOCOL_FILES = {
+    "closed_train_full": "closed_train_full.txt",
+    "closed_val_full": "closed_val_full.txt",
+    "closed_test_protocol": "closed_test_protocol.txt",
+}
 
 
 def _path(path: str) -> str:
@@ -154,6 +159,52 @@ def build_missing_protocols(
     }
 
 
+def build_closed_protocols(
+    root_dir: str,
+    output_dir: str = "data_txt",
+    seed: int = 42,
+    palm_dir_name: str = "Red",
+    vein_dir_name: str = "NIR",
+    train_per_class: int = 4,
+    val_per_class: int = 1,
+):
+    pairs = _collect_pairs(root_dir, palm_dir_name, vein_dir_name)
+    class_ids = sorted(pairs)
+    if not class_ids:
+        raise RuntimeError(f"No paired samples found under: {root_dir}")
+
+    min_samples = train_per_class + val_per_class + 1
+    rng = random.Random(seed)
+    train_pairs, val_pairs, test_pairs = {}, {}, {}
+    for class_id in class_ids:
+        samples = sorted(pairs[class_id])
+        if len(samples) < min_samples:
+            raise RuntimeError(f"Class {class_id} has {len(samples)} pairs; need at least {min_samples}")
+        rng.shuffle(samples)
+        train_end = train_per_class
+        val_end = train_end + val_per_class
+        train_pairs[class_id] = samples[:train_end]
+        val_pairs[class_id] = samples[train_end:val_end]
+        test_pairs[class_id] = samples[val_end:]
+
+    payload = {
+        "closed_train_full": _full_protocol(train_pairs, class_ids, "train"),
+        "closed_val_full": _full_protocol(val_pairs, class_ids, "val"),
+        "closed_test_protocol": _test_protocol(test_pairs, class_ids, seed + 13),
+    }
+    files = {key: os.path.join(output_dir, name) for key, name in CLOSED_PROTOCOL_FILES.items()}
+    for key, lines in payload.items():
+        _write(files[key], lines)
+
+    return {
+        "num_classes_total": len(class_ids),
+        "num_train_pairs": len(payload["closed_train_full"]),
+        "num_val_pairs": len(payload["closed_val_full"]),
+        "num_test_protocol_pairs": len(payload["closed_test_protocol"]),
+        "files": {key: _path(path) for key, path in files.items()},
+    }
+
+
 def _read_protocol(list_file: str, split_filter: Optional[str] = None):
     samples = []
     with open(_path(list_file), "r", encoding="utf-8") as handle:
@@ -223,6 +274,7 @@ class SingleModalityFromPairDataset:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Build missing-modality protocol files.")
+    parser.add_argument("--protocol", choices=["open", "closed"], default="closed")
     parser.add_argument("--root_dir", default="data")
     parser.add_argument("--output_dir", default="data_txt")
     parser.add_argument("--train_ratio", type=float, default=0.7)
@@ -230,12 +282,34 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--palm_dir_name", default="Red")
     parser.add_argument("--vein_dir_name", default="NIR")
+    parser.add_argument("--train_per_class", type=int, default=4)
+    parser.add_argument("--val_per_class", type=int, default=1)
     return parser.parse_args()
 
 
 def main():
-    summary = build_missing_protocols(**vars(parse_args()))
-    print("Missing-modality protocols generated.")
+    args = parse_args()
+    if args.protocol == "open":
+        summary = build_missing_protocols(
+            args.root_dir,
+            args.output_dir,
+            args.train_ratio,
+            args.val_ratio,
+            args.seed,
+            args.palm_dir_name,
+            args.vein_dir_name,
+        )
+    else:
+        summary = build_closed_protocols(
+            args.root_dir,
+            args.output_dir,
+            args.seed,
+            args.palm_dir_name,
+            args.vein_dir_name,
+            args.train_per_class,
+            args.val_per_class,
+        )
+    print(f"{args.protocol.capitalize()} protocols generated.")
     for key, value in summary.items():
         print(f"{key}: {value}")
 

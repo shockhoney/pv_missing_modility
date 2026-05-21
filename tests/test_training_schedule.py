@@ -35,11 +35,16 @@ class ScheduleAndFusionTest(unittest.TestCase):
     def test_default_args_train_palm_baseline_only(self):
         args = train_encoder.parse_args([])
         self.assertEqual(args.modality, "palm")
+        self.assertEqual(args.train_full_list, "data_txt/polyu/closed_train_full.txt")
+        self.assertEqual(args.val_full_list, "data_txt/polyu/closed_val_full.txt")
+        self.assertEqual(args.palm_pretrained, "pretrained/resnet18_imagenet1k_v1.pth")
+        self.assertEqual(args.vein_pretrained, "pretrained/resnet18_imagenet1k_v1.pth")
         self.assertEqual(train_encoder.parse_args(["--modality", "vein"]).modality, "vein")
 
     def test_test_encoder_defaults_to_single_modality(self):
         args = test_encoder.parse_args([])
         self.assertEqual(args.modality, "palm")
+        self.assertEqual(args.protocol_list, "data_txt/polyu/closed_test_protocol.txt")
         self.assertEqual(args.ckpt, "outputs/encoders/palm_best.pth")
 
         args = test_encoder.parse_args(["--modality", "vein"])
@@ -48,16 +53,17 @@ class ScheduleAndFusionTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             test_encoder.parse_args(["--modality", "joint"])
 
-    def test_resnet50_palm_encoder_output_shape(self):
+    def test_resnet18_palm_encoder_output_shape(self):
         encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
+        self.assertEqual(encoder.__class__.__name__, "ResNet18Encoder")
         encoder.eval()
         with torch.no_grad():
             out = encoder(torch.randn(2, 3, 64, 64))
         self.assertEqual(tuple(out.shape), (2, 16))
 
-    def test_convnextv2_tiny_vein_encoder_output_shape(self):
+    def test_resnet18_vein_encoder_output_shape(self):
         encoder = build_encoder("vein", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
-        self.assertEqual(encoder.__class__.__name__, "ConvNeXtV2TinyVeinEncoder")
+        self.assertEqual(encoder.__class__.__name__, "ResNet18Encoder")
         encoder.eval()
         with torch.no_grad():
             out = encoder(torch.randn(2, 3, 64, 64))
