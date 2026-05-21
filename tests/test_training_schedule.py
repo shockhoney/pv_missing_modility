@@ -1,3 +1,5 @@
+import contextlib
+import io
 import unittest
 import warnings
 
@@ -35,11 +37,16 @@ class ScheduleAndFusionTest(unittest.TestCase):
         self.assertEqual(args.modality, "palm")
         self.assertEqual(train_encoder.parse_args(["--modality", "vein"]).modality, "vein")
 
-    def test_weighted_fusion_is_normalized(self):
-        palm = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
-        vein = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
-        fused = test_encoder.weighted_fusion(palm, vein, 0.75)
-        np.testing.assert_allclose(np.linalg.norm(fused, axis=1), np.ones(2), rtol=1e-6)
+    def test_test_encoder_defaults_to_single_modality(self):
+        args = test_encoder.parse_args([])
+        self.assertEqual(args.modality, "palm")
+        self.assertEqual(args.ckpt, "outputs/encoders/palm_best.pth")
+
+        args = test_encoder.parse_args(["--modality", "vein"])
+        self.assertEqual(args.ckpt, "outputs/encoders/vein_best.pth")
+
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            test_encoder.parse_args(["--modality", "joint"])
 
     def test_resnet50_palm_encoder_output_shape(self):
         encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
