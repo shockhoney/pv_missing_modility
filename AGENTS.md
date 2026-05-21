@@ -4,11 +4,11 @@
 
 This repository trains and evaluates palmprint/palm-vein encoders for missing-modality recognition.
 
-- `train_encoder.py`: training entry point for `palm`, `vein`, or `joint` encoders.
+- `train_encoder.py`: training entry point for single-modality `palm` or `vein` encoders.
 - `test_encoder.py`: evaluation entry point for saved checkpoints.
-- `models/`: encoder backbones, including ResNet50 and ConvNeXt V2-Tiny.
+- `models/`: encoder backbone code, currently ResNet18 for both modalities.
 - `utils/`: datasets, augmentations, metrics, and ArcFace head code.
-- `tests/`: lightweight unit tests for schedules, fusion, augmentation, and encoder shapes.
+- `tests/`: lightweight unit tests for protocol generation, schedules, preprocessing, and encoder shapes.
 - `data/`, `data_txt/`, `pretrained/`, `outputs/`, and `runs/`: local data, generated protocols, weights, checkpoints, and logs. These are ignored by git.
 
 ## Build, Test, and Development Commands
@@ -22,7 +22,7 @@ pip install -r requirements.txt
 Generate protocol files:
 
 ```bash
-python utils/datasets_txt.py --root_dir data --output_dir data_txt/<dataset_name>
+python utils/datasets_txt.py --protocol closed --root_dir data/PolyU --output_dir data_txt/polyu
 ```
 
 Train single-modality baselines:
@@ -35,7 +35,8 @@ python train_encoder.py --modality vein
 Evaluate checkpoints:
 
 ```bash
-python test_encoder.py --protocol_list data_txt/polyu/test_missing_protocol.txt --palm_ckpt outputs/encoders/palm_best.pth --vein_ckpt outputs/encoders/vein_best.pth
+python test_encoder.py --modality palm --ckpt outputs/encoders/palm_best.pth
+python test_encoder.py --modality vein --ckpt outputs/encoders/vein_best.pth
 ```
 
 Run tests:
@@ -46,7 +47,7 @@ python -m unittest discover -s tests
 
 ## Coding Style & Naming Conventions
 
-Use Python with 4-space indentation and clear `snake_case` names. Keep changes localized and prefer existing helpers in `models/` and `utils/` over new abstractions. Follow the current argparse-based CLI style for new options. Name modality-specific files and checkpoints with explicit prefixes such as `palm_best.pth`, `vein_best.pth`, and `joint_best.pth`.
+Use Python with 4-space indentation and clear `snake_case` names. Keep changes localized and prefer existing helpers in `models/` and `utils/` over new abstractions. Follow the current argparse-based CLI style for new options. Name modality-specific files and checkpoints with explicit prefixes such as `palm_best.pth` and `vein_best.pth`.
 
 ## Testing Guidelines
 

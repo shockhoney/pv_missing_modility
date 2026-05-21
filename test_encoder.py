@@ -105,7 +105,7 @@ def evaluate_encoder(modality: str, ckpt_path: str, args, device):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser("Evaluate single-modality encoders")
-    parser.add_argument("--protocol_list", type=str, default="data_txt/polyu/test_missing_protocol.txt")
+    parser.add_argument("--protocol_list", type=str, default="data_txt/polyu/closed_test_protocol.txt")
     parser.add_argument("--modality", type=str, choices=["palm", "vein"], default="palm")
     parser.add_argument("--ckpt", type=str, default=None)
     parser.add_argument("--input_size", type=int, default=224)
