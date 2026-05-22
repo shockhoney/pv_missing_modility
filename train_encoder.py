@@ -2,17 +2,14 @@ import argparse
 import math
 import os
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models.backbones import build_encoder
-from utils.datasets_txt import SingleModalityFromPairDataset
+from utils.datasets_txt import SingleModalityFromPairDataset, infer_num_classes
 from utils.head import ArcFace
-from utils.metrics import compute_eer, tar_at_far
 from utils.preprocess import build_palm_transform, build_vein_transform
 
 
@@ -26,16 +23,6 @@ def get_device(name):
     else:
         print("[Info] using CPU")
     return device
-
-
-def infer_num_classes(list_path):
-    labels = set()
-    with open(list_path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            parts = line.strip().split()
-            if len(parts) >= 3:
-                labels.add(int(parts[2]))
-    return len(labels)
 
 
 def modality_transform(modality, img_size, train=False):
@@ -83,46 +70,21 @@ def set_lr(optimizer, lr):
         group["lr"] = lr
 
 
-def pair_scores(feats, labels):
-    sim = feats @ feats.T
-    i, j = np.triu_indices(labels.shape[0], k=1)
-    return sim[i, j].astype(np.float32), (labels[i] == labels[j]).astype(np.int32)
-
-
-def metrics_from_features(feats, labels):
-    feats = np.asarray(feats, dtype=np.float32)
-    labels = np.asarray(labels)
-    scores, pair_labels = pair_scores(feats, labels)
-    valid = np.isfinite(scores)
-    scores, pair_labels = scores[valid], pair_labels[valid]
-    if scores.size == 0 or np.unique(pair_labels).size < 2:
-        return {"eer": float("inf"), "tar_1e4": 0.0, "tar_1e5": 0.0}
-    tar_1e4 = tar_at_far(scores, pair_labels, 1e-4, is_similarity=True)
-    tar_1e5 = tar_at_far(scores, pair_labels, 1e-5, is_similarity=True)
-    return {
-        "eer": float(compute_eer(scores, pair_labels, is_similarity=True)),
-        "tar_1e4": float(tar_1e4["TAR"]),
-        "tar_1e5": float(tar_1e5["TAR"]),
-    }
-
-
 @torch.no_grad()
-def validate(encoder, loader, device, modality):
+def validate(encoder, classifier, loader, device, modality):
     encoder.eval()
-    feats, labels = [], []
+    classifier.eval()
+    correct = total = 0
     for images, y in tqdm(loader, desc=f"Validate {modality}", dynamic_ncols=True, leave=False):
-        emb = encoder(images.to(device, non_blocking=True))
-        feats.append(F.normalize(emb, dim=1).cpu().numpy())
-        labels.append(y.numpy())
-    return metrics_from_features(np.vstack(feats), np.concatenate(labels))
+        y = y.to(device, non_blocking=True)
+        logits = classifier(encoder(images.to(device, non_blocking=True)))
+        correct += (logits.argmax(1) == y).sum().item()
+        total += y.size(0)
+    return {"acc": correct / max(total, 1)}
 
 
-def metric_improved(current, best, metric, min_delta):
-    return current < best - min_delta if metric == "eer" else current > best + min_delta
-
-
-def initial_best(metric):
-    return float("inf") if metric == "eer" else -float("inf")
+def metric_improved(current, best, min_delta):
+    return current > best + min_delta
 
 
 def save_checkpoint(path, epoch, encoder, classifier, args, num_classes):
@@ -151,7 +113,7 @@ def train(args):
     params = list(encoder.parameters()) + list(head.parameters())
     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.wd)
     ce = nn.CrossEntropyLoss()
-    best, bad_epochs = initial_best(args.select_metric), 0
+    best, bad_epochs = -float("inf"), 0
     best_path = os.path.join(args.save_dir, f"{args.modality}_best.pth")
 
     for epoch in range(1, args.epochs + 1):
@@ -179,17 +141,16 @@ def train(args):
             loss_sum += loss.item() * batch_size
             correct += (logits.argmax(1) == labels).sum().item()
 
-        val = validate(encoder, val_loader, device, args.modality)
+        val = validate(encoder, head, val_loader, device, args.modality)
         print(
             f"[Epoch {epoch}] {args.modality} loss={loss_sum / max(total, 1):.4f} "
-            f"acc={correct / max(total, 1):.4f} val_eer={val['eer'] * 100:.3f}% "
-            f"tar1e4={val['tar_1e4']:.4f} tar1e5={val['tar_1e5']:.4f} lr={lr:.6g}"
+            f"acc={correct / max(total, 1):.4f} val_acc={val['acc']:.4f} lr={lr:.6g}"
         )
 
-        if metric_improved(val[args.select_metric], best, args.select_metric, args.min_delta):
-            best, bad_epochs = val[args.select_metric], 0
+        if metric_improved(val["acc"], best, args.min_delta):
+            best, bad_epochs = val["acc"], 0
             save_checkpoint(best_path, epoch, encoder, head, args, num_classes)
-            print(f"[Info] saved {best_path} by {args.select_metric}")
+            print(f"[Info] saved {best_path} by val_acc")
         else:
             bad_epochs += 1
             if bad_epochs >= args.patience:
@@ -218,7 +179,6 @@ def parse_args(argv=None):
     parser.add_argument("--warmup_epochs", type=int, default=0)
     parser.add_argument("--patience", type=int, default=100)
     parser.add_argument("--min_delta", type=float, default=0.001)
-    parser.add_argument("--select_metric", choices=["eer", "tar_1e4", "tar_1e5"], default="tar_1e4")
     return parser.parse_args(argv)
 
 

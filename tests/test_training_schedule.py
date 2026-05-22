@@ -10,6 +10,7 @@ from torchvision import transforms
 
 import test_encoder
 import train_encoder
+from utils import datasets_txt
 from models.backbones import build_encoder
 from utils.preprocess import CLAHE, build_palm_transform, build_vein_transform
 
@@ -52,6 +53,23 @@ class ScheduleAndFusionTest(unittest.TestCase):
 
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             test_encoder.parse_args(["--modality", "joint"])
+
+    def test_protocol_generation_is_closed_set_only(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            datasets_txt.parse_args(["--protocol", "open"])
+
+    def test_recognition_rate_uses_closed_set_predictions(self):
+        logits = np.array([[0.1, 0.9], [0.7, 0.3], [0.8, 0.2]], dtype=np.float32)
+        labels = np.array([1, 0, 1], dtype=np.int64)
+        self.assertAlmostEqual(test_encoder.recognition_rate(logits, labels), 2 / 3)
+
+    def test_eval_metrics_reports_only_recognition_rate(self):
+        logits = np.array([[0.1, 0.9], [0.7, 0.3]], dtype=np.float32)
+        labels = np.array([1, 0], dtype=np.int64)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            test_encoder.eval_metrics(logits, labels, "closed")
+        self.assertEqual(output.getvalue(), "\n===== closed =====\nSamples: 2\nRecognition Rate: 100.00%\n")
 
     def test_resnet18_palm_encoder_output_shape(self):
         encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)

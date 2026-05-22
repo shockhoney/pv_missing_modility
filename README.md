@@ -5,9 +5,9 @@ This project trains palmprint and palm-vein encoders for missing-modality recogn
 - Palm encoder baseline: TorchVision ResNet18
 - Vein encoder baseline: TorchVision ResNet18
 - Training head: ArcFace
-- Test stage: normalized embedding with cosine similarity
+- Missing-modality model: MLP feature recovery + cross/channel attention fusion
 
-This stage trains only strong single-modality baselines. Joint alignment is not used.
+Train single-modality baselines first, then train the missing-modality recognizer from their checkpoints.
 
 
 ## Protocol
@@ -21,7 +21,7 @@ palm_path vein_path label palm_exists vein_exists split
 Generate protocol files from a dataset root that contains palm and vein subfolders:
 
 ```bash
-python utils/datasets_txt.py --protocol closed --root_dir data/PolyU --output_dir data_txt/polyu
+python utils/datasets_txt.py --root_dir data/PolyU --output_dir data_txt/polyu
 ```
 
 Use `--palm_dir_name` and `--vein_dir_name` when a dataset uses different subfolder names.
@@ -50,12 +50,21 @@ python train_encoder.py --modality palm
 python train_encoder.py --modality vein
 ```
 
+Missing-modality recognizer:
+
+```bash
+python train_missing_model.py
+```
+
 ## Test
 
 ```bash
 python test_encoder.py --modality palm --ckpt outputs/encoders/palm_best.pth
 python test_encoder.py --modality vein --ckpt outputs/encoders/vein_best.pth
+python test_missing_model.py --ckpt outputs/missing_model/best.pth
 ```
+
+Reports closed-set recognition rate.
 
 ## Main Files
 
@@ -63,3 +72,5 @@ python test_encoder.py --modality vein --ckpt outputs/encoders/vein_best.pth
 - `utils/datasets_txt.py`: protocol generation and datasets
 - `train_encoder.py`: encoder training
 - `test_encoder.py`: encoder evaluation
+- `train_missing_model.py`: missing-modality recognizer training
+- `test_missing_model.py`: missing-modality recognizer evaluation

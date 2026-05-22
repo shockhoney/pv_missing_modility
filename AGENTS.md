@@ -6,8 +6,10 @@ This repository trains and evaluates palmprint/palm-vein encoders for missing-mo
 
 - `train_encoder.py`: training entry point for single-modality `palm` or `vein` encoders.
 - `test_encoder.py`: evaluation entry point for saved checkpoints.
+- `train_missing_model.py`: training entry point for MLP feature recovery and attention fusion.
+- `test_missing_model.py`: evaluation entry point for the missing-modality recognizer.
 - `models/`: encoder backbone code, currently ResNet18 for both modalities.
-- `utils/`: datasets, augmentations, metrics, and ArcFace head code.
+- `utils/`: datasets, preprocessing, checkpoint, evaluation, and ArcFace head code.
 - `tests/`: lightweight unit tests for protocol generation, schedules, preprocessing, and encoder shapes.
 - `data/`, `data_txt/`, `pretrained/`, `outputs/`, and `runs/`: local data, generated protocols, weights, checkpoints, and logs. These are ignored by git.
 
@@ -22,7 +24,7 @@ pip install -r requirements.txt
 Generate protocol files:
 
 ```bash
-python utils/datasets_txt.py --protocol closed --root_dir data/PolyU --output_dir data_txt/polyu
+python utils/datasets_txt.py --root_dir data/PolyU --output_dir data_txt/polyu
 ```
 
 Train single-modality baselines:
@@ -30,6 +32,7 @@ Train single-modality baselines:
 ```bash
 python train_encoder.py --modality palm
 python train_encoder.py --modality vein
+python train_missing_model.py
 ```
 
 Evaluate checkpoints:
@@ -37,6 +40,7 @@ Evaluate checkpoints:
 ```bash
 python test_encoder.py --modality palm --ckpt outputs/encoders/palm_best.pth
 python test_encoder.py --modality vein --ckpt outputs/encoders/vein_best.pth
+python test_missing_model.py --ckpt outputs/missing_model/best.pth
 ```
 
 Run tests:

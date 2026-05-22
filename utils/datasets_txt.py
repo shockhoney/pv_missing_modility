@@ -11,12 +11,6 @@ from PIL import Image
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 NA_TOKEN = "NA"
-PROTOCOL_FILES = {
-    "train_full": "train_full.txt",
-    "val_full": "val_full.txt",
-    "val_missing_fixed": "val_missing_fixed.txt",
-    "test_missing_protocol": "test_missing_protocol.txt",
-}
 CLOSED_PROTOCOL_FILES = {
     "closed_train_full": "closed_train_full.txt",
     "closed_val_full": "closed_val_full.txt",
@@ -43,6 +37,16 @@ def _write(path: str, lines: List[str]) -> None:
         handle.writelines(lines)
 
 
+def infer_num_classes(list_path: str) -> int:
+    labels = set()
+    with open(_path(list_path), "r", encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                labels.add(int(parts[2]))
+    return len(labels)
+
+
 def _collect_pairs(root_dir: str, palm_dir_name: str, vein_dir_name: str) -> Dict[str, List[Tuple[str, str]]]:
     palm_root = _path(os.path.join(root_dir, palm_dir_name))
     vein_root = _path(os.path.join(root_dir, vein_dir_name))
@@ -65,20 +69,6 @@ def _collect_pairs(root_dir: str, palm_dir_name: str, vein_dir_name: str) -> Dic
     return pairs
 
 
-def _split_classes(class_ids: List[str], train_ratio: float, val_ratio: float, seed: int):
-    rng = random.Random(seed)
-    class_ids = list(class_ids)
-    rng.shuffle(class_ids)
-    n_train = max(1, int(len(class_ids) * train_ratio))
-    n_val = max(1, int(len(class_ids) * val_ratio))
-    if n_train + n_val >= len(class_ids):
-        n_val = max(1, len(class_ids) - n_train - 1)
-    train = sorted(class_ids[:n_train])
-    val = sorted(class_ids[n_train:n_train + n_val])
-    test = sorted(class_ids[n_train + n_val:]) or val
-    return train, val, test
-
-
 def _line(palm: str, vein: str, label: int, palm_exists: int, vein_exists: int, split: str) -> str:
     return f"{palm if palm_exists else NA_TOKEN} {vein if vein_exists else NA_TOKEN} {label} {palm_exists} {vein_exists} {split}\n"
 
@@ -90,18 +80,6 @@ def _full_protocol(pairs, class_ids, split):
         for class_id in class_ids
         for palm, vein in sorted(pairs[class_id])
     ]
-
-
-def _missing_protocol(pairs, class_ids, seed):
-    labels = {class_id: idx for idx, class_id in enumerate(class_ids)}
-    rng = random.Random(seed)
-    lines = []
-    for class_id in class_ids:
-        for idx, (palm, vein) in enumerate(sorted(pairs[class_id])):
-            palm_only = (idx + rng.randint(0, 1)) % 2 == 0
-            split = "palm_only" if palm_only else "vein_only"
-            lines.append(_line(palm, vein, labels[class_id], int(palm_only), int(not palm_only), split))
-    return lines
 
 
 def _test_protocol(pairs, class_ids, seed):
@@ -119,44 +97,6 @@ def _test_protocol(pairs, class_ids, seed):
                 _line(palm, vein, label, int(random_palm), int(not random_palm), "random_missing"),
             ]
     return lines
-
-
-def build_missing_protocols(
-    root_dir: str,
-    output_dir: str = "data_txt",
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    seed: int = 42,
-    palm_dir_name: str = "Red",
-    vein_dir_name: str = "NIR",
-):
-    pairs = _collect_pairs(root_dir, palm_dir_name, vein_dir_name)
-    class_ids = sorted(pairs)
-    if not class_ids:
-        raise RuntimeError(f"No paired samples found under: {root_dir}")
-
-    train_ids, val_ids, test_ids = _split_classes(class_ids, train_ratio, val_ratio, seed)
-    payload = {
-        "train_full": _full_protocol(pairs, train_ids, "train"),
-        "val_full": _full_protocol(pairs, val_ids, "val"),
-        "val_missing_fixed": _missing_protocol(pairs, val_ids, seed + 7),
-        "test_missing_protocol": _test_protocol(pairs, test_ids, seed + 13),
-    }
-    files = {key: os.path.join(output_dir, name) for key, name in PROTOCOL_FILES.items()}
-    for key, lines in payload.items():
-        _write(files[key], lines)
-
-    return {
-        "num_classes_total": len(class_ids),
-        "num_classes_train": len(train_ids),
-        "num_classes_val": len(val_ids),
-        "num_classes_test": len(test_ids),
-        "num_train_pairs": len(payload["train_full"]),
-        "num_val_pairs": len(payload["val_full"]),
-        "num_val_missing_pairs": len(payload["val_missing_fixed"]),
-        "num_test_protocol_pairs": len(payload["test_missing_protocol"]),
-        "files": {key: _path(path) for key, path in files.items()},
-    }
 
 
 def build_closed_protocols(
@@ -272,44 +212,30 @@ class SingleModalityFromPairDataset:
         return image, sample["label"]
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Build missing-modality protocol files.")
-    parser.add_argument("--protocol", choices=["open", "closed"], default="closed")
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Build closed-set missing-modality protocol files.")
     parser.add_argument("--root_dir", default="data")
     parser.add_argument("--output_dir", default="data_txt")
-    parser.add_argument("--train_ratio", type=float, default=0.7)
-    parser.add_argument("--val_ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--palm_dir_name", default="Red")
     parser.add_argument("--vein_dir_name", default="NIR")
     parser.add_argument("--train_per_class", type=int, default=4)
     parser.add_argument("--val_per_class", type=int, default=1)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main():
     args = parse_args()
-    if args.protocol == "open":
-        summary = build_missing_protocols(
-            args.root_dir,
-            args.output_dir,
-            args.train_ratio,
-            args.val_ratio,
-            args.seed,
-            args.palm_dir_name,
-            args.vein_dir_name,
-        )
-    else:
-        summary = build_closed_protocols(
-            args.root_dir,
-            args.output_dir,
-            args.seed,
-            args.palm_dir_name,
-            args.vein_dir_name,
-            args.train_per_class,
-            args.val_per_class,
-        )
-    print(f"{args.protocol.capitalize()} protocols generated.")
+    summary = build_closed_protocols(
+        args.root_dir,
+        args.output_dir,
+        args.seed,
+        args.palm_dir_name,
+        args.vein_dir_name,
+        args.train_per_class,
+        args.val_per_class,
+    )
+    print("Closed protocols generated.")
     for key, value in summary.items():
         print(f"{key}: {value}")
 

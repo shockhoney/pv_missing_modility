@@ -12,18 +12,17 @@
 4. 在完整模态、单模态缺失、随机缺失场景下进行验证。
 
 训练阶段分类头统一采用 **ArcFace**。  
-测试阶段去掉分类头，只使用 embedding 做 cosine similarity。
+测试阶段保留分类头，使用 ArcFace 做闭集识别。
 
 ## 2. 数据协议
 
-继续使用当前模态缺失协议，不重新划分数据。
+使用闭集协议，训练、验证、测试共享同一批身份，按每类样本划分。
 
 | 文件 | 用途 |
 |---|---|
-| `polyu_train_full.txt` | 训练阶段使用的完整双模态样本 |
-| `polyu_val_full.txt` | 完整模态验证 |
-| `polyu_val_missing_fixed.txt` | 固定缺失模态验证 |
-| `polyu_test_missing_protocol.txt` | 最终测试 |
+| `closed_train_full.txt` | 训练阶段使用的完整双模态样本 |
+| `closed_val_full.txt` | 闭集验证 |
+| `closed_test_protocol.txt` | 最终闭集测试 |
 
 协议格式：
 
@@ -222,7 +221,7 @@ z_final = Select(z_real, z_fuse)
 
 ## 8. Step 6：最终测试
 
-测试时不使用 ArcFace 分类头，只使用最终 embedding 做 cosine similarity。
+测试时使用 ArcFace 分类头做闭集识别。
 
 测试场景：
 
@@ -236,22 +235,17 @@ z_final = Select(z_real, z_fuse)
 评价指标：
 
 ```text
-AUC
-EER
-TAR@FAR=1e-3
-TAR@FAR=1e-4
-TAR@FAR=1e-5
-ROC / DET
+Recognition Rate (%)
 ```
 
 ## 9. 结果记录表
 
-| 模型 | 场景 | AUC | EER | TAR@1e-3 | TAR@1e-4 | TAR@1e-5 |
-|---|---|---:|---:|---:|---:|---:|
-| Palm Encoder | palm_only |  |  |  |  |  |
-| Vein Encoder | vein_only |  |  |  |  |  |
-| Full Fusion Baseline | full |  |  |  |  |  |
-| Hetero-MMRNet | full |  |  |  |  |  |
-| Hetero-MMRNet | palm_only |  |  |  |  |  |
-| Hetero-MMRNet | vein_only |  |  |  |  |  |
-| Hetero-MMRNet | random_missing |  |  |  |  |  |
+| 模型 | 场景 | Recognition Rate (%) |
+|---|---|---:|
+| Palm Encoder | palm_only |  |
+| Vein Encoder | vein_only |  |
+| Full Fusion Baseline | full |  |
+| Hetero-MMRNet | full |  |
+| Hetero-MMRNet | palm_only |  |
+| Hetero-MMRNet | vein_only |  |
+| Hetero-MMRNet | random_missing |  |
