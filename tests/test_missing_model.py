@@ -5,10 +5,11 @@ import torch.nn as nn
 
 from models.missing_model import (
     CrossChannelFusion,
-    FeatureRestorer,
+    CrossModalTransformation,
     MissingModalityRecognizer,
+    SharedSpecificProjector,
     consistency_loss,
-    recovery_loss,
+    transformation_loss,
 )
 from utils.evaluation import recognition_rate
 
@@ -23,10 +24,16 @@ class TinyEncoder(nn.Module):
 
 
 class MissingModelTest(unittest.TestCase):
-    def test_feature_restorer_keeps_embedding_shape(self):
-        restorer = FeatureRestorer(dim=256, hidden=512)
-        out = restorer(torch.randn(2, 256))
-        self.assertEqual(tuple(out.shape), (2, 256))
+    def test_shared_specific_projector_splits_embedding(self):
+        projector = SharedSpecificProjector(dim=256)
+        shared, specific = projector(torch.randn(2, 256))
+        self.assertEqual(tuple(shared.shape), (2, 128))
+        self.assertEqual(tuple(specific.shape), (2, 128))
+
+    def test_cross_modal_transformation_keeps_specific_shape(self):
+        cmft = CrossModalTransformation(dim=128, hidden=512)
+        out = cmft(torch.randn(2, 128))
+        self.assertEqual(tuple(out.shape), (2, 128))
 
     def test_cross_channel_fusion_outputs_embedding(self):
         fusion = CrossChannelFusion(dim=256, heads=4, reduction=4)
@@ -42,12 +49,14 @@ class MissingModelTest(unittest.TestCase):
             output = model(palm, vein, labels=labels, scenario=scenario)
             self.assertEqual(tuple(output["logits"].shape), (2, 5))
             self.assertEqual(tuple(output["z"].shape), (2, 256))
+            self.assertEqual(tuple(output["hat_palm_specific"].shape), (2, 128))
+            self.assertEqual(tuple(output["hat_vein_specific"].shape), (2, 128))
 
     def test_losses_are_finite_scalars(self):
         source = torch.randn(2, 256)
         target = torch.randn(2, 256)
-        self.assertEqual(recovery_loss(source, target).dim(), 0)
-        self.assertTrue(torch.isfinite(recovery_loss(source, target)))
+        self.assertEqual(transformation_loss(source, target).dim(), 0)
+        self.assertTrue(torch.isfinite(transformation_loss(source, target)))
         self.assertEqual(consistency_loss(source, target).dim(), 0)
         self.assertTrue(torch.isfinite(consistency_loss(source, target)))
 

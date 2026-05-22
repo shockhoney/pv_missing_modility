@@ -6,7 +6,7 @@ This repository trains and evaluates palmprint/palm-vein encoders for missing-mo
 
 - `train_encoder.py`: training entry point for single-modality `palm` or `vein` encoders.
 - `test_encoder.py`: evaluation entry point for saved checkpoints.
-- `train_missing_model.py`: training entry point for MLP feature recovery and attention fusion.
+- `train_missing_model.py`: training entry point for SSFD-style cross-modal transformation and attention fusion.
 - `test_missing_model.py`: evaluation entry point for the missing-modality recognizer.
 - `models/`: encoder backbone code, currently ResNet18 for both modalities.
 - `utils/`: datasets, preprocessing, checkpoint, evaluation, and ArcFace head code.

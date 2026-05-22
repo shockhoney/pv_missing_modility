@@ -5,7 +5,7 @@ This project trains palmprint and palm-vein encoders for missing-modality recogn
 - Palm encoder baseline: TorchVision ResNet18
 - Vein encoder baseline: TorchVision ResNet18
 - Training head: ArcFace
-- Missing-modality model: MLP feature recovery + cross/channel attention fusion
+- Missing-modality model: SSFD-style cross-modal transformation + cross/channel attention fusion
 
 Train single-modality baselines first, then train the missing-modality recognizer from their checkpoints.
 
