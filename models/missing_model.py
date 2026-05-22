@@ -103,15 +103,15 @@ class MissingModalityRecognizer(nn.Module):
             palm_exists = mask[:, 0:1]
             vein_exists = mask[:, 1:2]
             return torch.where(palm_exists, f_palm, hat_palm), torch.where(vein_exists, f_vein, hat_vein)
-        if scenario == "full":
+        if scenario == "complete":
             return f_palm, f_vein
-        if scenario == "palm_only":
-            return f_palm, hat_vein
-        if scenario == "vein_only":
+        if scenario == "palmprint_missing":
             return hat_palm, f_vein
+        if scenario == "palmvein_missing":
+            return f_palm, hat_vein
         raise ValueError(f"Unsupported scenario: {scenario}")
 
-    def forward(self, palm, vein, labels=None, scenario="full", mask=None):
+    def forward(self, palm, vein, labels=None, scenario="complete", mask=None):
         f_palm, f_vein = self._encode(palm, vein)
         hat_vein = self.p2v(f_palm)
         hat_palm = self.v2p(f_vein)

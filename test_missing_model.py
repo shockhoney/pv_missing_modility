@@ -11,7 +11,7 @@ from utils.datasets_txt import MissingPairTxtDataset
 from utils.preprocess import build_palm_transform, build_vein_transform
 
 
-SPLITS = ("full", "palm_only", "vein_only", "random_missing")
+SPLITS = ("complete", "palmprint_missing", "palmvein_missing")
 
 
 def build_model(ckpt, device):
@@ -81,12 +81,12 @@ def evaluate(args):
         if loader is None:
             continue
         acc, total = evaluate_split(model, loader, split_name, device)
-        print(f"{split_name}: Samples={total}, Recognition Rate={acc * 100:.2f}%")
+        print(f"{split_name}: Samples={total}, Recognition Rate (%): {acc * 100:.2f}")
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser("Evaluate missing-modality recognizer")
-    parser.add_argument("--protocol_list", default="data_txt/polyu/closed_test_protocol.txt")
+    parser.add_argument("--protocol_list", default="data_txt/cumt/ssfd_test_protocol.txt")
     parser.add_argument("--ckpt", default="outputs/missing_model/best.pth")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)

@@ -70,23 +70,6 @@ def set_lr(optimizer, lr):
         group["lr"] = lr
 
 
-@torch.no_grad()
-def validate(encoder, classifier, loader, device, modality):
-    encoder.eval()
-    classifier.eval()
-    correct = total = 0
-    for images, y in tqdm(loader, desc=f"Validate {modality}", dynamic_ncols=True, leave=False):
-        y = y.to(device, non_blocking=True)
-        logits = classifier(encoder(images.to(device, non_blocking=True)))
-        correct += (logits.argmax(1) == y).sum().item()
-        total += y.size(0)
-    return {"acc": correct / max(total, 1)}
-
-
-def metric_improved(current, best, min_delta):
-    return current > best + min_delta
-
-
 def save_checkpoint(path, epoch, encoder, classifier, args, num_classes):
     torch.save(
         {
@@ -104,16 +87,15 @@ def save_checkpoint(path, epoch, encoder, classifier, args, num_classes):
 def train(args):
     os.makedirs(args.save_dir, exist_ok=True)
     device = get_device(args.device)
-    num_classes = infer_num_classes(args.train_full_list)
-    train_loader = make_loader(args, args.train_full_list, train=True)
-    val_loader = make_loader(args, args.val_full_list)
+    num_classes = infer_num_classes(args.train_list)
+    train_loader = make_loader(args, args.train_list, train=True)
 
     encoder = make_encoder(args).to(device)
     head = ArcFace(args.embedding_size, num_classes, args.arcface_s, args.arcface_m).to(device)
     params = list(encoder.parameters()) + list(head.parameters())
     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.wd)
     ce = nn.CrossEntropyLoss()
-    best, bad_epochs = -float("inf"), 0
+    best = float("inf")
     best_path = os.path.join(args.save_dir, f"{args.modality}_best.pth")
 
     for epoch in range(1, args.epochs + 1):
@@ -141,27 +123,22 @@ def train(args):
             loss_sum += loss.item() * batch_size
             correct += (logits.argmax(1) == labels).sum().item()
 
-        val = validate(encoder, head, val_loader, device, args.modality)
+        train_loss = loss_sum / max(total, 1)
         print(
-            f"[Epoch {epoch}] {args.modality} loss={loss_sum / max(total, 1):.4f} "
-            f"acc={correct / max(total, 1):.4f} val_acc={val['acc']:.4f} lr={lr:.6g}"
+            f"[Epoch {epoch}] {args.modality} loss={train_loss:.4f} "
+            f"acc={correct / max(total, 1):.4f} lr={lr:.6g}"
         )
 
-        if metric_improved(val["acc"], best, args.min_delta):
-            best, bad_epochs = val["acc"], 0
+        if train_loss < best:
+            best = train_loss
             save_checkpoint(best_path, epoch, encoder, head, args, num_classes)
-            print(f"[Info] saved {best_path} by val_acc")
-        else:
-            bad_epochs += 1
-            if bad_epochs >= args.patience:
-                break
+            print(f"[Info] saved {best_path} by train_loss")
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser("Train palm/vein baseline encoder")
     parser.add_argument("--modality", choices=["palm", "vein"], default="palm")
-    parser.add_argument("--train_full_list", default="data_txt/polyu/closed_train_full.txt")
-    parser.add_argument("--val_full_list", default="data_txt/polyu/closed_val_full.txt")
+    parser.add_argument("--train_list", default="data_txt/cumt/ssfd_train_full.txt")
     parser.add_argument("--save_dir", default="outputs/encoders")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -177,8 +154,6 @@ def parse_args(argv=None):
     parser.add_argument("--arcface_s", type=float, default=32.0)
     parser.add_argument("--arcface_m", type=float, default=0.25)
     parser.add_argument("--warmup_epochs", type=int, default=0)
-    parser.add_argument("--patience", type=int, default=100)
-    parser.add_argument("--min_delta", type=float, default=0.001)
     return parser.parse_args(argv)
 
 

@@ -24,7 +24,7 @@ pip install -r requirements.txt
 Generate protocol files:
 
 ```bash
-python utils/datasets_txt.py --root_dir data/PolyU --output_dir data_txt/polyu
+python utils/datasets_txt.py --dataset cumt --root_dir data/CUMT --output_dir data_txt/cumt
 ```
 
 Train single-modality baselines:

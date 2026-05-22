@@ -69,12 +69,12 @@ def eval_metrics(logits: np.ndarray, labels: np.ndarray, name: str):
     print(f"Samples: {len(labels)}")
     logits = torch.as_tensor(logits)
     labels = torch.as_tensor(labels)
-    print(f"Recognition Rate: {recognition_rate(logits, labels) * 100:.2f}%")
+    print(f"Recognition Rate (%): {recognition_rate(logits, labels) * 100:.2f}")
 
 
 def evaluate_encoder(modality: str, ckpt_path: str, args, device):
     encoder, classifier = load_model(ckpt_path, modality, args.input_size, args.encoder_dim, device)
-    split_names = ["full", "palm_only" if modality == "palm" else "vein_only", "random_missing"]
+    split_names = ["complete", "palmvein_missing" if modality == "palm" else "palmprint_missing"]
     for split_name in split_names:
         loader = build_loader(args.protocol_list, modality, split_name, args.input_size, args.batch_size, args.num_workers)
         if loader is None:
@@ -85,7 +85,7 @@ def evaluate_encoder(modality: str, ckpt_path: str, args, device):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser("Evaluate single-modality encoders")
-    parser.add_argument("--protocol_list", type=str, default="data_txt/polyu/closed_test_protocol.txt")
+    parser.add_argument("--protocol_list", type=str, default="data_txt/cumt/ssfd_test_protocol.txt")
     parser.add_argument("--modality", type=str, choices=["palm", "vein"], default="palm")
     parser.add_argument("--ckpt", type=str, default=None)
     parser.add_argument("--input_size", type=int, default=224)

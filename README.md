@@ -18,21 +18,22 @@ Protocol format:
 palm_path vein_path label palm_exists vein_exists split
 ```
 
-Generate protocol files from a dataset root that contains palm and vein subfolders:
+Generate SSFD-Net style protocol files:
 
 ```bash
-python utils/datasets_txt.py --root_dir data/PolyU --output_dir data_txt/polyu
+python utils/datasets_txt.py --dataset casia --root_dir data/CASIA --output_dir data_txt/casia
+python utils/datasets_txt.py --dataset cumt --root_dir data/CUMT --output_dir data_txt/cumt
+python utils/datasets_txt.py --dataset tongji --root_dir data/tongji --output_dir data_txt/tongji
 ```
-
-Use `--palm_dir_name` and `--vein_dir_name` when a dataset uses different subfolder names.
 
 Generated files:
 
 ```text
-data_txt/<dataset_name>/closed_train_full.txt
-data_txt/<dataset_name>/closed_val_full.txt
-data_txt/<dataset_name>/closed_test_protocol.txt
+data_txt/<dataset_name>/ssfd_train_full.txt
+data_txt/<dataset_name>/ssfd_test_protocol.txt
 ```
+
+The test protocol contains `complete`, `palmprint_missing`, and `palmvein_missing`.
 
 ## Train
 
@@ -55,6 +56,8 @@ Missing-modality recognizer:
 ```bash
 python train_missing_model.py
 ```
+
+Training saves `best.pth` by lowest training loss.
 
 ## Test
 

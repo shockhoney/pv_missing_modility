@@ -38,7 +38,7 @@ class MissingModelTest(unittest.TestCase):
         palm = torch.randn(2, 3, 8, 8)
         vein = torch.randn(2, 3, 8, 8)
         labels = torch.tensor([0, 1])
-        for scenario in ("full", "palm_only", "vein_only"):
+        for scenario in ("complete", "palmprint_missing", "palmvein_missing"):
             output = model(palm, vein, labels=labels, scenario=scenario)
             self.assertEqual(tuple(output["logits"].shape), (2, 5))
             self.assertEqual(tuple(output["z"].shape), (2, 256))

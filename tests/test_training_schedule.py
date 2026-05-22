@@ -36,8 +36,7 @@ class ScheduleAndFusionTest(unittest.TestCase):
     def test_default_args_train_palm_baseline_only(self):
         args = train_encoder.parse_args([])
         self.assertEqual(args.modality, "palm")
-        self.assertEqual(args.train_full_list, "data_txt/polyu/closed_train_full.txt")
-        self.assertEqual(args.val_full_list, "data_txt/polyu/closed_val_full.txt")
+        self.assertEqual(args.train_list, "data_txt/cumt/ssfd_train_full.txt")
         self.assertEqual(args.palm_pretrained, "pretrained/resnet18_imagenet1k_v1.pth")
         self.assertEqual(args.vein_pretrained, "pretrained/resnet18_imagenet1k_v1.pth")
         self.assertEqual(train_encoder.parse_args(["--modality", "vein"]).modality, "vein")
@@ -45,7 +44,7 @@ class ScheduleAndFusionTest(unittest.TestCase):
     def test_test_encoder_defaults_to_single_modality(self):
         args = test_encoder.parse_args([])
         self.assertEqual(args.modality, "palm")
-        self.assertEqual(args.protocol_list, "data_txt/polyu/closed_test_protocol.txt")
+        self.assertEqual(args.protocol_list, "data_txt/cumt/ssfd_test_protocol.txt")
         self.assertEqual(args.ckpt, "outputs/encoders/palm_best.pth")
 
         args = test_encoder.parse_args(["--modality", "vein"])
@@ -56,7 +55,7 @@ class ScheduleAndFusionTest(unittest.TestCase):
 
     def test_protocol_generation_is_closed_set_only(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            datasets_txt.parse_args(["--protocol", "open"])
+            datasets_txt.parse_args(["--dataset", "generic"])
 
     def test_recognition_rate_uses_closed_set_predictions(self):
         logits = np.array([[0.1, 0.9], [0.7, 0.3], [0.8, 0.2]], dtype=np.float32)
@@ -69,7 +68,7 @@ class ScheduleAndFusionTest(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             test_encoder.eval_metrics(logits, labels, "closed")
-        self.assertEqual(output.getvalue(), "\n===== closed =====\nSamples: 2\nRecognition Rate: 100.00%\n")
+        self.assertEqual(output.getvalue(), "\n===== closed =====\nSamples: 2\nRecognition Rate (%): 100.00\n")
 
     def test_resnet18_palm_encoder_output_shape(self):
         encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
