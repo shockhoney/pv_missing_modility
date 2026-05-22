@@ -7,7 +7,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models.missing_model import MissingModalityRecognizer, consistency_loss, transformation_loss
+from models.missing_model import MissingModalityRecognizer, consistency_loss, disentangle_loss, transformation_loss
 from utils.checkpoint import load_encoder_from_checkpoint
 from utils.datasets_txt import MissingPairTxtDataset, infer_num_classes
 from utils.evaluation import recognition_rate
@@ -71,23 +71,31 @@ def batch_losses(model, palm, vein, labels, ce, args):
         transformation_loss(outputs["complete"]["hat_vein_specific"], outputs["complete"]["vein_specific"])
         + transformation_loss(outputs["complete"]["hat_palm_specific"], outputs["complete"]["palm_specific"])
     )
+    tri_loss = disentangle_loss(
+        outputs["complete"]["palm_shared"],
+        outputs["complete"]["palm_specific"],
+        outputs["complete"]["vein_shared"],
+        outputs["complete"]["vein_specific"],
+        args.triplet_margin,
+    )
     cons_loss = 0.5 * (
         consistency_loss(outputs["palmprint_missing"]["z"], outputs["complete"]["z"])
         + consistency_loss(outputs["palmvein_missing"]["z"], outputs["complete"]["z"])
     )
-    loss = cls_loss + args.lambda_trans * trans_loss + args.lambda_cons * cons_loss
-    return loss, cls_loss, trans_loss, cons_loss, outputs
+    loss = cls_loss + args.lambda_tri * tri_loss + args.lambda_trans * trans_loss + args.lambda_cons * cons_loss
+    return loss, cls_loss, tri_loss, trans_loss, cons_loss, outputs
 
 
 def train_epoch(model, loader, optimizer, ce, device, args):
     model.train()
-    sums = {"loss": 0.0, "cls": 0.0, "trans": 0.0, "cons": 0.0, "acc": 0.0}
+    sums = {"loss": 0.0, "cls": 0.0, "tri": 0.0, "trans": 0.0, "cons": 0.0}
+    sums.update({f"acc_{scenario}": 0.0 for scenario in SCENARIOS})
     total = 0
     for palm, vein, labels, _ in tqdm(loader, desc="Train missing", dynamic_ncols=True):
         palm = palm.to(device, non_blocking=True)
         vein = vein.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        loss, cls_loss, trans_loss, cons_loss, outputs = batch_losses(model, palm, vein, labels, ce, args)
+        loss, cls_loss, tri_loss, trans_loss, cons_loss, outputs = batch_losses(model, palm, vein, labels, ce, args)
         if not torch.isfinite(loss):
             continue
         optimizer.zero_grad(set_to_none=True)
@@ -99,9 +107,11 @@ def train_epoch(model, loader, optimizer, ce, device, args):
         total += batch_size
         sums["loss"] += loss.item() * batch_size
         sums["cls"] += cls_loss.item() * batch_size
+        sums["tri"] += tri_loss.item() * batch_size
         sums["trans"] += trans_loss.item() * batch_size
         sums["cons"] += cons_loss.item() * batch_size
-        sums["acc"] += recognition_rate(outputs["complete"]["logits"], labels) * batch_size
+        for scenario in SCENARIOS:
+            sums[f"acc_{scenario}"] += recognition_rate(outputs[scenario]["logits"], labels) * batch_size
     return {key: value / max(total, 1) for key, value in sums.items()}
 
 
@@ -141,8 +151,9 @@ def train(args):
         train_stats = train_epoch(model, train_loader, optimizer, ce, device, args)
         print(
             f"[Epoch {epoch}] loss={train_stats['loss']:.4f} cls={train_stats['cls']:.4f} "
-            f"trans={train_stats['trans']:.4f} cons={train_stats['cons']:.4f} "
-            f"train_acc={train_stats['acc']:.4f} lr={lr:.6g}"
+            f"tri={train_stats['tri']:.4f} trans={train_stats['trans']:.4f} cons={train_stats['cons']:.4f} "
+            f"acc_c={train_stats['acc_complete']:.4f} acc_pm={train_stats['acc_palmprint_missing']:.4f} "
+            f"acc_vm={train_stats['acc_palmvein_missing']:.4f} lr={lr:.6g}"
         )
         if train_stats["loss"] < best:
             best = train_stats["loss"]
@@ -165,8 +176,10 @@ def parse_args(argv=None):
     parser.add_argument("--cmft_hidden", type=int, default=2048)
     parser.add_argument("--attn_heads", type=int, default=4)
     parser.add_argument("--channel_reduction", type=int, default=4)
-    parser.add_argument("--lambda_trans", type=float, default=1.0)
-    parser.add_argument("--lambda_cons", type=float, default=0.5)
+    parser.add_argument("--lambda_tri", type=float, default=0.3)
+    parser.add_argument("--lambda_trans", type=float, default=0.3)
+    parser.add_argument("--lambda_cons", type=float, default=0.3)
+    parser.add_argument("--triplet_margin", type=float, default=0.3)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument("--wd", type=float, default=1e-4)

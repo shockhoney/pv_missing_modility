@@ -94,6 +94,16 @@ def transformation_loss(pred, target):
     return F.mse_loss(pred, target.detach())
 
 
+def disentangle_loss(palm_shared, palm_specific, vein_shared, vein_specific, margin=0.3):
+    shared_dist = F.pairwise_distance(palm_shared, vein_shared, p=2).pow(2)
+    palm_dist = F.pairwise_distance(palm_shared, palm_specific, p=2).pow(2)
+    vein_dist = F.pairwise_distance(vein_shared, vein_specific, p=2).pow(2)
+    triplet = F.relu(shared_dist - palm_dist + margin).mean()
+    triplet = triplet + F.relu(shared_dist - vein_dist + margin).mean()
+    shared = 1.0 - F.cosine_similarity(palm_shared, vein_shared, dim=1).mean()
+    return triplet + shared
+
+
 def consistency_loss(pred, target):
     return (1.0 - F.cosine_similarity(pred, target.detach(), dim=1)).mean()
 

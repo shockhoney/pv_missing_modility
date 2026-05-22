@@ -10,6 +10,7 @@ from torchvision import transforms
 
 import test_encoder
 import train_encoder
+import train_missing_model
 from utils import datasets_txt
 from models.backbones import build_encoder
 from utils.preprocess import CLAHE, build_palm_transform, build_vein_transform
@@ -52,6 +53,15 @@ class ScheduleAndFusionTest(unittest.TestCase):
 
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             test_encoder.parse_args(["--modality", "joint"])
+
+    def test_missing_model_defaults_use_ssfd_loss_weights(self):
+        args = train_missing_model.parse_args([])
+        self.assertEqual(args.train_list, "data_txt/cumt/ssfd_train_full.txt")
+        self.assertEqual(args.cmft_hidden, 2048)
+        self.assertEqual(args.lambda_tri, 0.3)
+        self.assertEqual(args.lambda_trans, 0.3)
+        self.assertEqual(args.lambda_cons, 0.3)
+        self.assertEqual(args.triplet_margin, 0.3)
 
     def test_protocol_generation_is_closed_set_only(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

@@ -9,6 +9,7 @@ from models.missing_model import (
     MissingModalityRecognizer,
     SharedSpecificProjector,
     consistency_loss,
+    disentangle_loss,
     transformation_loss,
 )
 from utils.evaluation import recognition_rate
@@ -59,6 +60,8 @@ class MissingModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(transformation_loss(source, target)))
         self.assertEqual(consistency_loss(source, target).dim(), 0)
         self.assertTrue(torch.isfinite(consistency_loss(source, target)))
+        self.assertEqual(disentangle_loss(source, target, source, target).dim(), 0)
+        self.assertTrue(torch.isfinite(disentangle_loss(source, target, source, target)))
 
     def test_recognition_rate_uses_closed_set_predictions(self):
         logits = torch.tensor([[0.1, 0.9], [0.7, 0.3], [0.8, 0.2]])
