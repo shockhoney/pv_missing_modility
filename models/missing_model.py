@@ -102,7 +102,7 @@ class CrossChannelFusion(nn.Module):
 
 
 def transformation_loss(pred, target):
-    return F.mse_loss(F.normalize(pred, dim=1), F.normalize(target.detach(), dim=1))
+    return (1.0 - F.cosine_similarity(pred, target.detach(), dim=1)).mean()
 
 
 def shared_alignment_loss(palm_shared, vein_shared):

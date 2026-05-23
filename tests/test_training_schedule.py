@@ -62,6 +62,9 @@ class ScheduleAndFusionTest(unittest.TestCase):
         self.assertEqual(args.lambda_trans, 0.3)
         self.assertEqual(args.lambda_orth, 0.05)
         self.assertEqual(args.lambda_cons, 0.0)
+        self.assertEqual(args.lr, 1e-3)
+        self.assertEqual(args.encoder_lr, 1e-5)
+        self.assertEqual(args.warmup_epochs, 5)
         self.assertFalse(args.freeze_encoders)
 
     def test_protocol_generation_is_closed_set_only(self):

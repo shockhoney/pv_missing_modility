@@ -55,19 +55,27 @@ def set_lr(optimizer, args, epoch):
 
 
 def make_optimizer(model, args):
-    encoder_params = [
-        p
-        for encoder in (model.palm_encoder, model.vein_encoder)
-        for p in encoder.parameters()
-        if p.requires_grad
-    ]
-    encoder_ids = {id(p) for p in encoder_params}
+    encoder_params = []
+    encoder_head_params = []
+    for encoder in (model.palm_encoder, model.vein_encoder):
+        head_ids = {
+            id(param)
+            for name in ("shared_head", "specific_head")
+            if hasattr(encoder, name)
+            for param in getattr(encoder, name).parameters()
+        }
+        encoder_head_params.extend(p for p in encoder.parameters() if p.requires_grad and id(p) in head_ids)
+        encoder_params.extend(p for p in encoder.parameters() if p.requires_grad and id(p) not in head_ids)
+
+    encoder_ids = {id(p) for p in encoder_params + encoder_head_params}
     other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in encoder_ids]
     groups = []
     if encoder_params:
-        groups.append({"params": encoder_params, "base_lr": args.encoder_lr})
+        groups.append({"params": encoder_params, "base_lr": args.encoder_lr, "lr": args.encoder_lr})
+    if encoder_head_params:
+        groups.append({"params": encoder_head_params, "base_lr": args.lr, "lr": args.lr})
     if other_params:
-        groups.append({"params": other_params, "base_lr": args.lr})
+        groups.append({"params": other_params, "base_lr": args.lr, "lr": args.lr})
     return torch.optim.SGD(groups, momentum=0.9, weight_decay=args.wd)
 
 
@@ -215,13 +223,13 @@ def parse_args(argv=None):
     parser.add_argument("--lambda_trans", type=float, default=0.3)
     parser.add_argument("--lambda_orth", type=float, default=0.05)
     parser.add_argument("--lambda_cons", type=float, default=0.0)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--encoder_lr", type=float, default=1e-5)
     parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument("--wd", type=float, default=1e-4)
     parser.add_argument("--arcface_s", type=float, default=32.0)
     parser.add_argument("--arcface_m", type=float, default=0.25)
-    parser.add_argument("--warmup_epochs", type=int, default=0)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
     parser.add_argument("--freeze_encoders", action="store_true")
     parser.add_argument("--train_encoders", action="store_false", dest="freeze_encoders", help=argparse.SUPPRESS)
     return parser.parse_args(argv)

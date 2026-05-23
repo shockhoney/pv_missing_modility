@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -14,6 +15,7 @@ from models.missing_model import (
 )
 from models.backbones import build_encoder
 from utils.evaluation import recognition_rate
+import train_missing_model
 
 
 class TinyEncoder(nn.Module):
@@ -42,6 +44,11 @@ class MissingModelTest(unittest.TestCase):
             shared, specific = encoder.forward_parts(torch.randn(2, 3, 64, 64))
         self.assertEqual(tuple(shared.shape), (2, 128))
         self.assertEqual(tuple(specific.shape), (2, 128))
+
+    def test_shared_specific_heads_use_legacy_embedding(self):
+        encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=256, pretrained_path=None)
+        self.assertEqual(encoder.shared_head[0].in_features, 256)
+        self.assertEqual(encoder.specific_head[0].in_features, 256)
 
     def test_available_guided_fusion_preserves_available_feature_at_init(self):
         fusion = AvailableGuidedFusion(dim=256, reduction=4)
@@ -85,6 +92,20 @@ class MissingModelTest(unittest.TestCase):
         self.assertEqual(consistency_loss(source, target).dim(), 0)
         self.assertTrue(torch.isfinite(consistency_loss(source, target)))
         self.assertEqual(shared_specific_loss(source[:, :128], target[:, :128], source[:, 128:], target[:, 128:]).dim(), 0)
+
+    def test_transformation_loss_uses_cosine_scale(self):
+        source = torch.randn(2, 128)
+        self.assertLess(transformation_loss(source, source).item(), 1e-6)
+        self.assertGreater(transformation_loss(source, -source).item(), 1.9)
+
+    def test_new_encoder_heads_use_main_learning_rate(self):
+        model = MissingModalityRecognizer(TinyEncoder(), TinyEncoder(), num_classes=5, dim=256)
+        model.palm_encoder.shared_head = nn.Linear(1, 1)
+        args = SimpleNamespace(lr=1e-3, encoder_lr=1e-5, wd=1e-4)
+        optimizer = train_missing_model.make_optimizer(model, args)
+        head_param_id = id(model.palm_encoder.shared_head.weight)
+        head_group = next(group for group in optimizer.param_groups if any(id(param) == head_param_id for param in group["params"]))
+        self.assertEqual(head_group["base_lr"], args.lr)
 
     def test_recognition_rate_uses_closed_set_predictions(self):
         logits = torch.tensor([[0.1, 0.9], [0.7, 0.3], [0.8, 0.2]])

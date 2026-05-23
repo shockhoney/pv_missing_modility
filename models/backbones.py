@@ -95,8 +95,10 @@ class ResNet18Encoder(nn.Module):
         )
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.bn = nn.BatchNorm1d(embedding_size)
-        self.shared_head = nn.Sequential(nn.Linear(512, self.part_dim, bias=False), nn.BatchNorm1d(self.part_dim))
-        self.specific_head = nn.Sequential(nn.Linear(512, self.part_dim, bias=False), nn.BatchNorm1d(self.part_dim))
+        self.shared_head = nn.Sequential(nn.Linear(embedding_size, self.part_dim, bias=False), nn.BatchNorm1d(self.part_dim))
+        self.specific_head = nn.Sequential(
+            nn.Linear(embedding_size, self.part_dim, bias=False), nn.BatchNorm1d(self.part_dim)
+        )
         self.out_dim = embedding_size
         self.local_dim = embedding_size
 
@@ -115,8 +117,8 @@ class ResNet18Encoder(nn.Module):
         return self.project(self._backbone_features(x))
 
     def forward_parts(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        pooled = self.global_pool(self._backbone_features(x)).flatten(1)
-        return self.shared_head(pooled), self.specific_head(pooled)
+        embedding = self.bn(self.global_pool(self.forward_features(x)).flatten(1))
+        return self.shared_head(embedding), self.specific_head(embedding)
 
     def forward(self, x: torch.Tensor, return_spatial: bool = False) -> torch.Tensor:
         feat_map = self.forward_features(x)
