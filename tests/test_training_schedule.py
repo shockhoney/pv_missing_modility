@@ -13,7 +13,7 @@ import train_encoder
 import train_missing_model
 from utils import datasets_txt
 from models.backbones import build_encoder
-from utils.preprocess import CLAHE, build_palm_transform, build_vein_transform
+from utils.preprocess import CLAHE, VeinIntensityJitter, build_palm_transform, build_vein_transform
 
 
 class ScheduleAndFusionTest(unittest.TestCase):
@@ -24,12 +24,14 @@ class ScheduleAndFusionTest(unittest.TestCase):
         self.assertIn(transforms.RandomAffine, palm_ops)
         self.assertIn(transforms.ColorJitter, palm_ops)
         self.assertIn(CLAHE, vein_ops)
+        self.assertIn(VeinIntensityJitter, vein_ops)
         self.assertIn(transforms.RandomAffine, vein_ops)
         self.assertNotIn(transforms.ColorJitter, vein_ops)
         vein_affine = next(op for op in build_vein_transform(224, train=True).transforms if isinstance(op, transforms.RandomAffine))
         self.assertEqual(vein_affine.degrees, [-5.0, 5.0])
         self.assertEqual(vein_affine.translate, (0.03, 0.03))
         self.assertEqual(vein_affine.scale, (0.95, 1.05))
+        self.assertNotIn(VeinIntensityJitter, [type(op) for op in build_vein_transform(224, train=False).transforms])
 
     def test_modality_transforms_keep_three_channels(self):
         image = Image.fromarray(np.full((16, 16), 128, dtype=np.uint8))
