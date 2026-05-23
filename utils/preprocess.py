@@ -53,5 +53,5 @@ def build_palm_transform(img_size, train=False):
 def build_vein_transform(img_size, train=False):
     ops = [transforms.Grayscale(3), transforms.Resize((img_size, img_size)), CLAHE()]
     if train:
-        ops.append(transforms.RandomAffine(degrees=3, translate=(0.015, 0.015), scale=(0.99, 1.01)))
+        ops.append(transforms.RandomAffine(degrees=5, translate=(0.03, 0.03), scale=(0.95, 1.05)))
     return transforms.Compose(ops + [transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])

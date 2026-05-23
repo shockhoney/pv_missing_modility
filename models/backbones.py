@@ -70,6 +70,22 @@ def _load_pretrained(module: nn.Module, path: str | os.PathLike[str] | None, ski
     module.load_state_dict(state, strict=False)
 
 
+class SEBlock(nn.Module):
+    def __init__(self, channels: int = 512, reduction: int = 16):
+        super().__init__()
+        hidden = max(channels // reduction, 16)
+        self.net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.net(x)
+
+
 class ResNet18Encoder(nn.Module):
     def __init__(
         self,
@@ -77,6 +93,7 @@ class ResNet18Encoder(nn.Module):
         input_size: int = 224,
         embedding_size: int = 256,
         pretrained_path: str | os.PathLike[str] | None = None,
+        use_se: bool = False,
     ):
         super().__init__()
         if embedding_size % 2 != 0:
@@ -88,6 +105,7 @@ class ResNet18Encoder(nn.Module):
             self.backbone.conv1 = nn.Conv2d(input_channel, 64, kernel_size=7, stride=2, padding=3, bias=False)
         _load_pretrained(self.backbone, pretrained_path, skip_prefixes=("fc.",))
         self.backbone.fc = nn.Identity()
+        self.se = SEBlock(512) if use_se else nn.Identity()
         self.project = nn.Sequential(
             nn.Conv2d(512, embedding_size, kernel_size=1, bias=False),
             nn.BatchNorm2d(embedding_size),
@@ -111,7 +129,7 @@ class ResNet18Encoder(nn.Module):
         x = model.layer1(x)
         x = model.layer2(x)
         x = model.layer3(x)
-        return model.layer4(x)
+        return self.se(model.layer4(x))
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         return self.project(self._backbone_features(x))
@@ -138,5 +156,5 @@ def build_encoder(
 ) -> nn.Module:
     name = modality.strip().lower()
     if name in {"palm", "vein"}:
-        return ResNet18Encoder(input_channel, input_size, embedding_size, pretrained_path, **kwargs)
+        return ResNet18Encoder(input_channel, input_size, embedding_size, pretrained_path, use_se=name == "vein", **kwargs)
     raise ValueError(f"Unsupported modality: {modality}")

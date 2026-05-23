@@ -26,6 +26,10 @@ class ScheduleAndFusionTest(unittest.TestCase):
         self.assertIn(CLAHE, vein_ops)
         self.assertIn(transforms.RandomAffine, vein_ops)
         self.assertNotIn(transforms.ColorJitter, vein_ops)
+        vein_affine = next(op for op in build_vein_transform(224, train=True).transforms if isinstance(op, transforms.RandomAffine))
+        self.assertEqual(vein_affine.degrees, [-5.0, 5.0])
+        self.assertEqual(vein_affine.translate, (0.03, 0.03))
+        self.assertEqual(vein_affine.scale, (0.95, 1.05))
 
     def test_modality_transforms_keep_three_channels(self):
         image = Image.fromarray(np.full((16, 16), 128, dtype=np.uint8))
@@ -41,6 +45,17 @@ class ScheduleAndFusionTest(unittest.TestCase):
         self.assertEqual(args.palm_pretrained, "pretrained/resnet18_imagenet1k_v1.pth")
         self.assertEqual(args.vein_pretrained, "pretrained/resnet18_imagenet1k_v1.pth")
         self.assertEqual(train_encoder.parse_args(["--modality", "vein"]).modality, "vein")
+
+    def test_vein_training_uses_vein_defaults(self):
+        args = train_encoder.parse_args(["--modality", "vein"])
+        self.assertEqual(args.epochs, 300)
+        self.assertEqual(args.lr, 3e-3)
+        self.assertEqual(args.wd, 5e-4)
+        self.assertEqual(args.arcface_m, 0.15)
+        self.assertEqual(args.warmup_epochs, 5)
+
+        args = train_encoder.parse_args(["--modality", "vein", "--lr", "1e-3"])
+        self.assertEqual(args.lr, 1e-3)
 
     def test_test_encoder_defaults_to_single_modality(self):
         args = test_encoder.parse_args([])
@@ -95,10 +110,15 @@ class ScheduleAndFusionTest(unittest.TestCase):
     def test_resnet18_vein_encoder_output_shape(self):
         encoder = build_encoder("vein", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
         self.assertEqual(encoder.__class__.__name__, "ResNet18Encoder")
+        self.assertEqual(encoder.se.__class__.__name__, "SEBlock")
         encoder.eval()
         with torch.no_grad():
             out = encoder(torch.randn(2, 3, 64, 64))
         self.assertEqual(tuple(out.shape), (2, 16))
+
+    def test_resnet18_palm_encoder_does_not_use_se(self):
+        encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
+        self.assertEqual(encoder.se.__class__.__name__, "Identity")
 
 
 if __name__ == "__main__":

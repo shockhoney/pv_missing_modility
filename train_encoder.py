@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import sys
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,15 @@ from models.backbones import build_encoder
 from utils.datasets_txt import SingleModalityFromPairDataset, infer_num_classes
 from utils.head import ArcFace
 from utils.preprocess import build_palm_transform, build_vein_transform
+
+
+VEIN_DEFAULTS = {
+    "epochs": 300,
+    "lr": 3e-3,
+    "wd": 5e-4,
+    "arcface_m": 0.15,
+    "warmup_epochs": 5,
+}
 
 
 def get_device(name):
@@ -136,6 +146,7 @@ def train(args):
 
 
 def parse_args(argv=None):
+    tokens = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser("Train palm/vein baseline encoder")
     parser.add_argument("--modality", choices=["palm", "vein"], default="palm")
     parser.add_argument("--train_list", default="data_txt/cumt/ssfd_train_full.txt")
@@ -154,7 +165,13 @@ def parse_args(argv=None):
     parser.add_argument("--arcface_s", type=float, default=32.0)
     parser.add_argument("--arcface_m", type=float, default=0.25)
     parser.add_argument("--warmup_epochs", type=int, default=0)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.modality == "vein":
+        for name, value in VEIN_DEFAULTS.items():
+            option = f"--{name}"
+            if not any(token == option or token.startswith(f"{option}=") for token in tokens):
+                setattr(args, name, value)
+    return args
 
 
 def main():
