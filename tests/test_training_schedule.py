@@ -53,9 +53,21 @@ class ScheduleAndFusionTest(unittest.TestCase):
         self.assertEqual(args.wd, 5e-4)
         self.assertEqual(args.arcface_m, 0.15)
         self.assertEqual(args.warmup_epochs, 5)
+        self.assertEqual(args.backbone_lr, 3e-4)
+        self.assertEqual(args.label_smoothing, 0.05)
 
         args = train_encoder.parse_args(["--modality", "vein", "--lr", "1e-3"])
         self.assertEqual(args.lr, 1e-3)
+        args = train_encoder.parse_args(["--modality", "vein", "--backbone_lr", "1e-4"])
+        self.assertEqual(args.backbone_lr, 1e-4)
+
+    def test_vein_optimizer_uses_lower_backbone_lr(self):
+        args = train_encoder.parse_args(["--modality", "vein"])
+        encoder = train_encoder.make_encoder(args)
+        head = train_encoder.ArcFace(args.embedding_size, 2)
+        optimizer = train_encoder.make_optimizer(encoder, head, args)
+        self.assertEqual(optimizer.param_groups[0]["lr"], args.backbone_lr)
+        self.assertEqual(optimizer.param_groups[1]["lr"], args.lr)
 
     def test_test_encoder_defaults_to_single_modality(self):
         args = test_encoder.parse_args([])

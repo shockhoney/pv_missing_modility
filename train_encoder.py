@@ -17,9 +17,11 @@ from utils.preprocess import build_palm_transform, build_vein_transform
 VEIN_DEFAULTS = {
     "epochs": 300,
     "lr": 3e-3,
+    "backbone_lr": 3e-4,
     "wd": 5e-4,
     "arcface_m": 0.15,
     "warmup_epochs": 5,
+    "label_smoothing": 0.05,
 }
 
 
@@ -77,7 +79,30 @@ def epoch_lr(args, epoch):
 
 def set_lr(optimizer, lr):
     for group in optimizer.param_groups:
-        group["lr"] = lr
+        scale = group.get("lr_scale", 1.0)
+        group["lr"] = lr * scale
+
+
+def make_optimizer(encoder, head, args):
+    if args.backbone_lr is None:
+        return torch.optim.SGD(
+            list(encoder.parameters()) + list(head.parameters()),
+            lr=args.lr,
+            momentum=0.9,
+            weight_decay=args.wd,
+        )
+
+    backbone_params = list(encoder.backbone.parameters())
+    backbone_ids = {id(param) for param in backbone_params}
+    other_params = [param for param in encoder.parameters() if id(param) not in backbone_ids]
+    return torch.optim.SGD(
+        [
+            {"params": backbone_params, "lr": args.backbone_lr, "lr_scale": args.backbone_lr / args.lr},
+            {"params": other_params + list(head.parameters()), "lr": args.lr},
+        ],
+        momentum=0.9,
+        weight_decay=args.wd,
+    )
 
 
 def save_checkpoint(path, epoch, encoder, classifier, args, num_classes):
@@ -102,9 +127,9 @@ def train(args):
 
     encoder = make_encoder(args).to(device)
     head = ArcFace(args.embedding_size, num_classes, args.arcface_s, args.arcface_m).to(device)
-    params = list(encoder.parameters()) + list(head.parameters())
-    optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.wd)
-    ce = nn.CrossEntropyLoss()
+    optimizer = make_optimizer(encoder, head, args)
+    params = [param for group in optimizer.param_groups for param in group["params"]]
+    ce = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     best = float("inf")
     best_path = os.path.join(args.save_dir, f"{args.modality}_best.pth")
 
@@ -160,10 +185,12 @@ def parse_args(argv=None):
     parser.add_argument("--palm_pretrained", default="pretrained/resnet18_imagenet1k_v1.pth")
     parser.add_argument("--vein_pretrained", default="pretrained/resnet18_imagenet1k_v1.pth")
     parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--backbone_lr", type=float, default=None)
     parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument("--wd", type=float, default=1e-4)
     parser.add_argument("--arcface_s", type=float, default=32.0)
     parser.add_argument("--arcface_m", type=float, default=0.25)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument("--warmup_epochs", type=int, default=0)
     args = parser.parse_args(argv)
     if args.modality == "vein":
