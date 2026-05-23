@@ -111,6 +111,22 @@ class ScheduleAndFusionTest(unittest.TestCase):
             test_encoder.eval_metrics(logits, labels, "closed")
         self.assertEqual(output.getvalue(), "\n===== closed =====\nSamples: 2\nRecognition Rate (%): 100.00\n")
 
+    def test_error_summary_detects_class_concentration(self):
+        labels = np.array([1, 1, 1, 2, 3], dtype=np.int64)
+        preds = np.array([0, 0, 2, 0, 0], dtype=np.int64)
+        rows, summary = test_encoder.error_analysis(preds, labels, [{} for _ in labels], "vein")
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(summary["num_error_classes"], 3)
+        self.assertEqual(summary["top_error_label"], 1)
+        self.assertEqual(summary["top_error_count"], 3)
+        self.assertTrue(summary["is_concentrated"])
+
+    def test_error_summary_detects_scattered_errors(self):
+        labels = np.array([1, 2, 3, 4], dtype=np.int64)
+        preds = np.array([0, 0, 0, 0], dtype=np.int64)
+        _, summary = test_encoder.error_analysis(preds, labels, [{} for _ in labels], "vein")
+        self.assertFalse(summary["is_concentrated"])
+
     def test_resnet18_palm_encoder_output_shape(self):
         encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
         self.assertEqual(encoder.__class__.__name__, "ResNet18Encoder")

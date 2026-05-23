@@ -1,4 +1,7 @@
 import argparse
+import csv
+import os
+from collections import Counter
 
 import numpy as np
 import torch
@@ -72,6 +75,58 @@ def eval_metrics(logits: np.ndarray, labels: np.ndarray, name: str):
     print(f"Recognition Rate (%): {recognition_rate(logits, labels) * 100:.2f}")
 
 
+def error_analysis(preds: np.ndarray, labels: np.ndarray, samples, modality: str):
+    rows = []
+    counts = Counter()
+    path_key = f"{modality}_path"
+    for idx, (pred, label) in enumerate(zip(preds.tolist(), labels.tolist())):
+        if pred == label:
+            continue
+        sample = samples[idx] if idx < len(samples) else {}
+        counts[label] += 1
+        rows.append(
+            {
+                "index": idx,
+                "path": sample.get(path_key, ""),
+                "true_label": label,
+                "pred_label": pred,
+            }
+        )
+
+    total = len(rows)
+    top_label, top_count = counts.most_common(1)[0] if counts else (-1, 0)
+    summary = {
+        "num_errors": total,
+        "num_error_classes": len(counts),
+        "top_error_label": top_label,
+        "top_error_count": top_count,
+        "top_error_ratio": top_count / max(total, 1),
+        "is_concentrated": top_count >= 3 or (top_count >= 2 and top_count / max(total, 1) >= 0.2),
+        "class_counts": counts,
+    }
+    return rows, summary
+
+
+def write_error_csv(path: str, rows):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["index", "path", "true_label", "pred_label"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_error_summary(summary, top_k: int):
+    print(
+        f"Errors: {summary['num_errors']}, Error classes: {summary['num_error_classes']}, "
+        f"Top class: {summary['top_error_label']} ({summary['top_error_count']}, "
+        f"{summary['top_error_ratio'] * 100:.2f}%)"
+    )
+    state = "concentrated" if summary["is_concentrated"] else "scattered"
+    print(f"Error distribution: {state}")
+    for label, count in summary["class_counts"].most_common(top_k):
+        print(f"  label {label}: {count}")
+
+
 def evaluate_encoder(modality: str, ckpt_path: str, args, device):
     encoder, classifier = load_model(ckpt_path, modality, args.input_size, args.encoder_dim, device)
     split_names = ["complete", "palmvein_missing" if modality == "palm" else "palmprint_missing"]
@@ -81,6 +136,12 @@ def evaluate_encoder(modality: str, ckpt_path: str, args, device):
             continue
         logits, labels = extract_logits(encoder, classifier, loader, modality, device)
         eval_metrics(logits, labels, f"{modality.capitalize()} Encoder - {split_name}")
+        if args.error_csv and split_name != "complete":
+            preds = logits.argmax(axis=1)
+            rows, summary = error_analysis(preds, labels, loader.dataset.samples, modality)
+            write_error_csv(args.error_csv, rows)
+            print_error_summary(summary, args.error_top_k)
+            print(f"Error CSV: {args.error_csv}")
 
 
 def parse_args(argv=None):
@@ -92,6 +153,8 @@ def parse_args(argv=None):
     parser.add_argument("--encoder_dim", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--error_csv", type=str, default=None)
+    parser.add_argument("--error_top_k", type=int, default=10)
     args = parser.parse_args(argv)
     if args.ckpt is None:
         args.ckpt = f"outputs/encoders/{args.modality}_best.pth"
