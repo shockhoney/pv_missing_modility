@@ -5,21 +5,8 @@ import torch.nn.functional as F
 from utils.head import ArcFace
 
 
-class SharedSpecificProjector(nn.Module):
-    def __init__(self, dim=256):
-        super().__init__()
-        if dim % 2 != 0:
-            raise ValueError("dim must be divisible by 2 for shared/specific split")
-        part_dim = dim // 2
-        self.shared = nn.Sequential(nn.Linear(dim, part_dim), nn.LayerNorm(part_dim))
-        self.specific = nn.Sequential(nn.Linear(dim, part_dim), nn.LayerNorm(part_dim))
-
-    def forward(self, x):
-        return self.shared(x), self.specific(x)
-
-
 class CrossModalTransformation(nn.Module):
-    def __init__(self, dim=128, hidden=2048):
+    def __init__(self, dim=128, hidden=1024):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(dim, hidden),
@@ -29,8 +16,8 @@ class CrossModalTransformation(nn.Module):
             nn.Linear(hidden, dim),
         )
 
-    def forward(self, specific):
-        return self.net(specific)
+    def forward(self, feature):
+        return self.net(feature)
 
 
 class CrossModalAttention(nn.Module):
@@ -77,31 +64,61 @@ class ChannelAttentionFusion(nn.Module):
         return weights[:, 0] * palm_feat + weights[:, 1] * vein_feat
 
 
+class AvailableGuidedFusion(nn.Module):
+    def __init__(self, dim=256, reduction=4):
+        super().__init__()
+        hidden = max(dim // reduction, 16)
+        self.delta = nn.Sequential(
+            nn.Linear(dim * 4, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, dim),
+        )
+        self.residual_scale = nn.Parameter(torch.zeros(1))
+
+    def forward(self, available_feat, restored_feat):
+        cue = torch.cat(
+            [available_feat, restored_feat, available_feat * restored_feat, (available_feat - restored_feat).abs()],
+            dim=1,
+        )
+        return F.normalize(available_feat + self.residual_scale * self.delta(cue), dim=1)
+
+
 class CrossChannelFusion(nn.Module):
     def __init__(self, dim=256, heads=4, reduction=4):
         super().__init__()
         self.cross_attention = CrossModalAttention(dim, heads)
         self.channel_attention = ChannelAttentionFusion(dim, reduction)
+        self.available_fusion = AvailableGuidedFusion(dim, reduction)
         self.project = nn.Linear(dim, dim)
 
-    def forward(self, palm_feat, vein_feat):
+    def forward(self, palm_feat, vein_feat, scenario="complete"):
+        if scenario == "palmprint_missing":
+            return self.available_fusion(vein_feat, palm_feat)
+        if scenario == "palmvein_missing":
+            return self.available_fusion(palm_feat, vein_feat)
         palm_feat, vein_feat = self.cross_attention(palm_feat, vein_feat)
         fused = self.channel_attention(palm_feat, vein_feat)
         return F.normalize(self.project(fused), dim=1)
 
 
 def transformation_loss(pred, target):
-    return F.mse_loss(pred, target.detach())
+    return F.mse_loss(F.normalize(pred, dim=1), F.normalize(target.detach(), dim=1))
 
 
-def disentangle_loss(palm_shared, palm_specific, vein_shared, vein_specific, margin=0.3):
-    shared_dist = F.pairwise_distance(palm_shared, vein_shared, p=2).pow(2)
-    palm_dist = F.pairwise_distance(palm_shared, palm_specific, p=2).pow(2)
-    vein_dist = F.pairwise_distance(vein_shared, vein_specific, p=2).pow(2)
-    triplet = F.relu(shared_dist - palm_dist + margin).mean()
-    triplet = triplet + F.relu(shared_dist - vein_dist + margin).mean()
-    shared = 1.0 - F.cosine_similarity(palm_shared, vein_shared, dim=1).mean()
-    return triplet + shared
+def shared_alignment_loss(palm_shared, vein_shared):
+    return (1.0 - F.cosine_similarity(palm_shared, vein_shared, dim=1)).mean()
+
+
+def orthogonality_loss(palm_shared, vein_shared, palm_specific, vein_specific):
+    palm_orth = F.cosine_similarity(palm_shared, palm_specific, dim=1).abs().mean()
+    vein_orth = F.cosine_similarity(vein_shared, vein_specific, dim=1).abs().mean()
+    return 0.5 * (palm_orth + vein_orth)
+
+
+def shared_specific_loss(palm_shared, vein_shared, palm_specific, vein_specific):
+    return shared_alignment_loss(palm_shared, vein_shared) + orthogonality_loss(
+        palm_shared, vein_shared, palm_specific, vein_specific
+    )
 
 
 def consistency_loss(pred, target):
@@ -115,21 +132,21 @@ class MissingModalityRecognizer(nn.Module):
         vein_encoder,
         num_classes,
         dim=256,
-        cmft_hidden=2048,
+        cmft_hidden=1024,
         heads=4,
         reduction=4,
         arcface_s=32.0,
         arcface_m=0.25,
-        freeze_encoders=True,
+        freeze_encoders=False,
     ):
         super().__init__()
+        if dim % 2 != 0:
+            raise ValueError("dim must be divisible by 2")
         self.palm_encoder = palm_encoder
         self.vein_encoder = vein_encoder
-        part_dim = dim // 2
-        self.palm_projector = SharedSpecificProjector(dim)
-        self.vein_projector = SharedSpecificProjector(dim)
-        self.p2v = CrossModalTransformation(part_dim, cmft_hidden)
-        self.v2p = CrossModalTransformation(part_dim, cmft_hidden)
+        self.part_dim = dim // 2
+        self.p2v = CrossModalTransformation(self.part_dim, cmft_hidden)
+        self.v2p = CrossModalTransformation(self.part_dim, cmft_hidden)
         self.fusion = CrossChannelFusion(dim, heads, reduction)
         self.classifier = ArcFace(dim, num_classes, arcface_s, arcface_m)
         self.freeze_encoders = freeze_encoders
@@ -149,14 +166,34 @@ class MissingModalityRecognizer(nn.Module):
             self.vein_encoder.eval()
         return self
 
+    def _encode_one(self, encoder, image):
+        if hasattr(encoder, "forward_parts"):
+            return encoder.forward_parts(image)
+        feature = encoder(image)
+        return feature[:, : self.part_dim], feature[:, self.part_dim :]
+
     def _encode(self, palm, vein):
         if self.freeze_encoders:
             with torch.no_grad():
-                return self.palm_encoder(palm), self.vein_encoder(vein)
-        return self.palm_encoder(palm), self.vein_encoder(vein)
+                return self._encode_one(self.palm_encoder, palm), self._encode_one(self.vein_encoder, vein)
+        return self._encode_one(self.palm_encoder, palm), self._encode_one(self.vein_encoder, vein)
 
     def _compose(self, shared, specific):
         return torch.cat([shared, specific], dim=1)
+
+    def _scenario_from_mask(self, mask, scenario):
+        if mask is None:
+            return scenario
+        mask = mask.bool()
+        palm_exists = mask[:, 0]
+        vein_exists = mask[:, 1]
+        if torch.all(palm_exists & vein_exists):
+            return "complete"
+        if torch.all(~palm_exists & vein_exists):
+            return "palmprint_missing"
+        if torch.all(palm_exists & ~vein_exists):
+            return "palmvein_missing"
+        return scenario
 
     def _select_features(self, feats, scenario, mask):
         if mask is not None:
@@ -176,9 +213,7 @@ class MissingModalityRecognizer(nn.Module):
         raise ValueError(f"Unsupported scenario: {scenario}")
 
     def forward(self, palm, vein, labels=None, scenario="complete", mask=None):
-        raw_palm, raw_vein = self._encode(palm, vein)
-        palm_shared, palm_specific = self.palm_projector(raw_palm)
-        vein_shared, vein_specific = self.vein_projector(raw_vein)
+        (palm_shared, palm_specific), (vein_shared, vein_specific) = self._encode(palm, vein)
         hat_vein_specific = self.p2v(palm_specific)
         hat_palm_specific = self.v2p(vein_specific)
         feats = {
@@ -188,13 +223,11 @@ class MissingModalityRecognizer(nn.Module):
             "hat_vein": self._compose(palm_shared, hat_vein_specific),
         }
         use_palm, use_vein = self._select_features(feats, scenario, mask)
-        z = self.fusion(use_palm, use_vein)
+        z = self.fusion(use_palm, use_vein, scenario=self._scenario_from_mask(mask, scenario))
         logits = self.classifier(z, labels) if labels is not None else self.classifier(z)
         return {
             "logits": logits,
             "z": z,
-            "raw_palm": raw_palm,
-            "raw_vein": raw_vein,
             "palm_shared": palm_shared,
             "palm_specific": palm_specific,
             "vein_shared": vein_shared,

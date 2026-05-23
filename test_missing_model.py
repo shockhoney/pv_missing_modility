@@ -26,7 +26,7 @@ def build_model(ckpt, device):
         vein_encoder,
         num_classes,
         dim=dim,
-        cmft_hidden=ckpt_args.get("cmft_hidden", 2048),
+        cmft_hidden=ckpt_args.get("cmft_hidden", 1024),
         heads=ckpt_args.get("attn_heads", 4),
         reduction=ckpt_args.get("channel_reduction", 4),
         arcface_s=ckpt_args.get("arcface_s", 32.0),

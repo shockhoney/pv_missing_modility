@@ -7,7 +7,13 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models.missing_model import MissingModalityRecognizer, consistency_loss, disentangle_loss, transformation_loss
+from models.missing_model import (
+    MissingModalityRecognizer,
+    consistency_loss,
+    orthogonality_loss,
+    shared_alignment_loss,
+    transformation_loss,
+)
 from utils.checkpoint import load_encoder_from_checkpoint
 from utils.datasets_txt import MissingPairTxtDataset, infer_num_classes
 from utils.evaluation import recognition_rate
@@ -33,18 +39,36 @@ def make_loader(list_path, args, train=False):
     )
 
 
-def epoch_lr(args, epoch):
+def epoch_lr(args, epoch, base_lr=None):
+    base_lr = args.lr if base_lr is None else base_lr
     if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
-        return args.lr * epoch / args.warmup_epochs
+        return base_lr * epoch / args.warmup_epochs
     span = max(1, args.epochs - args.warmup_epochs)
     step = max(0, epoch - args.warmup_epochs)
     scale = 0.5 * (1.0 + math.cos(math.pi * min(step, span) / span))
-    return args.min_lr + (args.lr - args.min_lr) * scale
+    return args.min_lr + (base_lr - args.min_lr) * scale
 
 
-def set_lr(optimizer, lr):
+def set_lr(optimizer, args, epoch):
     for group in optimizer.param_groups:
-        group["lr"] = lr
+        group["lr"] = epoch_lr(args, epoch, group.get("base_lr", args.lr))
+
+
+def make_optimizer(model, args):
+    encoder_params = [
+        p
+        for encoder in (model.palm_encoder, model.vein_encoder)
+        for p in encoder.parameters()
+        if p.requires_grad
+    ]
+    encoder_ids = {id(p) for p in encoder_params}
+    other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in encoder_ids]
+    groups = []
+    if encoder_params:
+        groups.append({"params": encoder_params, "base_lr": args.encoder_lr})
+    if other_params:
+        groups.append({"params": other_params, "base_lr": args.lr})
+    return torch.optim.SGD(groups, momentum=0.9, weight_decay=args.wd)
 
 
 def make_model(args, num_classes, device):
@@ -60,7 +84,7 @@ def make_model(args, num_classes, device):
         reduction=args.channel_reduction,
         arcface_s=args.arcface_s,
         arcface_m=args.arcface_m,
-        freeze_encoders=not args.train_encoders,
+        freeze_encoders=args.freeze_encoders,
     ).to(device)
 
 
@@ -71,31 +95,42 @@ def batch_losses(model, palm, vein, labels, ce, args):
         transformation_loss(outputs["complete"]["hat_vein_specific"], outputs["complete"]["vein_specific"])
         + transformation_loss(outputs["complete"]["hat_palm_specific"], outputs["complete"]["palm_specific"])
     )
-    tri_loss = disentangle_loss(
+    shared_loss = shared_alignment_loss(
         outputs["complete"]["palm_shared"],
-        outputs["complete"]["palm_specific"],
         outputs["complete"]["vein_shared"],
+    )
+    orth_loss = orthogonality_loss(
+        outputs["complete"]["palm_shared"],
+        outputs["complete"]["vein_shared"],
+        outputs["complete"]["palm_specific"],
         outputs["complete"]["vein_specific"],
-        args.triplet_margin,
     )
     cons_loss = 0.5 * (
         consistency_loss(outputs["palmprint_missing"]["z"], outputs["complete"]["z"])
         + consistency_loss(outputs["palmvein_missing"]["z"], outputs["complete"]["z"])
     )
-    loss = cls_loss + args.lambda_tri * tri_loss + args.lambda_trans * trans_loss + args.lambda_cons * cons_loss
-    return loss, cls_loss, tri_loss, trans_loss, cons_loss, outputs
+    loss = (
+        cls_loss
+        + args.lambda_shared * shared_loss
+        + args.lambda_trans * trans_loss
+        + args.lambda_orth * orth_loss
+        + args.lambda_cons * cons_loss
+    )
+    return loss, cls_loss, shared_loss, trans_loss, orth_loss, cons_loss, outputs
 
 
 def train_epoch(model, loader, optimizer, ce, device, args):
     model.train()
-    sums = {"loss": 0.0, "cls": 0.0, "tri": 0.0, "trans": 0.0, "cons": 0.0}
+    sums = {"loss": 0.0, "cls": 0.0, "shared": 0.0, "trans": 0.0, "orth": 0.0, "cons": 0.0}
     sums.update({f"acc_{scenario}": 0.0 for scenario in SCENARIOS})
     total = 0
     for palm, vein, labels, _ in tqdm(loader, desc="Train missing", dynamic_ncols=True):
         palm = palm.to(device, non_blocking=True)
         vein = vein.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        loss, cls_loss, tri_loss, trans_loss, cons_loss, outputs = batch_losses(model, palm, vein, labels, ce, args)
+        loss, cls_loss, shared_loss, trans_loss, orth_loss, cons_loss, outputs = batch_losses(
+            model, palm, vein, labels, ce, args
+        )
         if not torch.isfinite(loss):
             continue
         optimizer.zero_grad(set_to_none=True)
@@ -107,8 +142,9 @@ def train_epoch(model, loader, optimizer, ce, device, args):
         total += batch_size
         sums["loss"] += loss.item() * batch_size
         sums["cls"] += cls_loss.item() * batch_size
-        sums["tri"] += tri_loss.item() * batch_size
+        sums["shared"] += shared_loss.item() * batch_size
         sums["trans"] += trans_loss.item() * batch_size
+        sums["orth"] += orth_loss.item() * batch_size
         sums["cons"] += cons_loss.item() * batch_size
         for scenario in SCENARIOS:
             sums[f"acc_{scenario}"] += recognition_rate(outputs[scenario]["logits"], labels) * batch_size
@@ -140,20 +176,19 @@ def train(args):
     num_classes = infer_num_classes(args.train_list)
     train_loader = make_loader(args.train_list, args, train=True)
     model = make_model(args, num_classes, device)
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.wd)
+    optimizer = make_optimizer(model, args)
     ce = nn.CrossEntropyLoss()
     best = float("inf")
 
     for epoch in range(1, args.epochs + 1):
-        lr = epoch_lr(args, epoch)
-        set_lr(optimizer, lr)
+        set_lr(optimizer, args, epoch)
         train_stats = train_epoch(model, train_loader, optimizer, ce, device, args)
         print(
             f"[Epoch {epoch}] loss={train_stats['loss']:.4f} cls={train_stats['cls']:.4f} "
-            f"tri={train_stats['tri']:.4f} trans={train_stats['trans']:.4f} cons={train_stats['cons']:.4f} "
+            f"shared={train_stats['shared']:.4f} trans={train_stats['trans']:.4f} "
+            f"orth={train_stats['orth']:.4f} cons={train_stats['cons']:.4f} "
             f"acc_c={train_stats['acc_complete']:.4f} acc_pm={train_stats['acc_palmprint_missing']:.4f} "
-            f"acc_vm={train_stats['acc_palmvein_missing']:.4f} lr={lr:.6g}"
+            f"acc_vm={train_stats['acc_palmvein_missing']:.4f} lr={optimizer.param_groups[-1]['lr']:.6g}"
         )
         if train_stats["loss"] < best:
             best = train_stats["loss"]
@@ -173,20 +208,22 @@ def parse_args(argv=None):
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--input_size", type=int, default=224)
     parser.add_argument("--embedding_size", type=int, default=256)
-    parser.add_argument("--cmft_hidden", type=int, default=2048)
+    parser.add_argument("--cmft_hidden", type=int, default=1024)
     parser.add_argument("--attn_heads", type=int, default=4)
     parser.add_argument("--channel_reduction", type=int, default=4)
-    parser.add_argument("--lambda_tri", type=float, default=0.3)
+    parser.add_argument("--lambda_shared", type=float, default=0.2)
     parser.add_argument("--lambda_trans", type=float, default=0.3)
-    parser.add_argument("--lambda_cons", type=float, default=0.3)
-    parser.add_argument("--triplet_margin", type=float, default=0.3)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lambda_orth", type=float, default=0.05)
+    parser.add_argument("--lambda_cons", type=float, default=0.0)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--encoder_lr", type=float, default=1e-5)
     parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument("--wd", type=float, default=1e-4)
     parser.add_argument("--arcface_s", type=float, default=32.0)
     parser.add_argument("--arcface_m", type=float, default=0.25)
     parser.add_argument("--warmup_epochs", type=int, default=0)
-    parser.add_argument("--train_encoders", action="store_true")
+    parser.add_argument("--freeze_encoders", action="store_true")
+    parser.add_argument("--train_encoders", action="store_false", dest="freeze_encoders", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 

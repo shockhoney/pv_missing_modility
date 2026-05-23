@@ -79,7 +79,10 @@ class ResNet18Encoder(nn.Module):
         pretrained_path: str | os.PathLike[str] | None = None,
     ):
         super().__init__()
+        if embedding_size % 2 != 0:
+            raise ValueError("embedding_size must be divisible by 2")
         self.input_size = input_size
+        self.part_dim = embedding_size // 2
         self.backbone = resnet18(weights=None)
         if input_channel != 3:
             self.backbone.conv1 = nn.Conv2d(input_channel, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -92,6 +95,8 @@ class ResNet18Encoder(nn.Module):
         )
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.bn = nn.BatchNorm1d(embedding_size)
+        self.shared_head = nn.Sequential(nn.Linear(512, self.part_dim, bias=False), nn.BatchNorm1d(self.part_dim))
+        self.specific_head = nn.Sequential(nn.Linear(512, self.part_dim, bias=False), nn.BatchNorm1d(self.part_dim))
         self.out_dim = embedding_size
         self.local_dim = embedding_size
 
@@ -108,6 +113,10 @@ class ResNet18Encoder(nn.Module):
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         return self.project(self._backbone_features(x))
+
+    def forward_parts(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pooled = self.global_pool(self._backbone_features(x)).flatten(1)
+        return self.shared_head(pooled), self.specific_head(pooled)
 
     def forward(self, x: torch.Tensor, return_spatial: bool = False) -> torch.Tensor:
         feat_map = self.forward_features(x)
