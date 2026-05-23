@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -14,6 +16,7 @@ from models.missing_model import (
     transformation_loss,
 )
 from models.backbones import build_encoder
+from utils.checkpoint import load_encoder_from_checkpoint
 from utils.evaluation import recognition_rate
 import train_missing_model
 
@@ -49,6 +52,35 @@ class MissingModelTest(unittest.TestCase):
         encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=256, pretrained_path=None)
         self.assertEqual(encoder.shared_head[0].in_features, 256)
         self.assertEqual(encoder.specific_head[0].in_features, 256)
+
+    def test_forward_parts_preserves_embedding_at_init(self):
+        encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
+        encoder.eval()
+        image = torch.randn(2, 3, 64, 64)
+        with torch.no_grad():
+            embedding = encoder(image)
+            shared, specific = encoder.forward_parts(image)
+        self.assertTrue(torch.allclose(torch.cat([shared, specific], dim=1), embedding, atol=1e-5))
+
+    def test_checkpoint_loader_keeps_identity_part_heads(self):
+        encoder = build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None)
+        state = encoder.state_dict()
+        state["shared_head.0.weight"] = torch.zeros_like(state["shared_head.0.weight"])
+        path = os.path.join(tempfile.gettempdir(), "pv_identity_head_test.pth")
+        torch.save({"encoder": state}, path)
+        loaded = load_encoder_from_checkpoint(path, "palm", 64, 16, "cpu")
+        self.assertTrue(torch.allclose(loaded.shared_head[0].weight[:, :8], torch.eye(8)))
+
+    def test_missing_model_freezes_backbone_but_trains_part_heads(self):
+        model = MissingModalityRecognizer(
+            build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None),
+            build_encoder("vein", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None),
+            num_classes=5,
+            dim=16,
+        )
+        self.assertFalse(next(model.palm_encoder.backbone.parameters()).requires_grad)
+        self.assertTrue(next(model.palm_encoder.shared_head.parameters()).requires_grad)
+        self.assertTrue(next(model.vein_encoder.specific_head.parameters()).requires_grad)
 
     def test_available_guided_fusion_preserves_available_feature_at_init(self):
         fusion = AvailableGuidedFusion(dim=256, reduction=4)
@@ -111,6 +143,17 @@ class MissingModelTest(unittest.TestCase):
         logits = torch.tensor([[0.1, 0.9], [0.7, 0.3], [0.8, 0.2]])
         labels = torch.tensor([1, 0, 1])
         self.assertAlmostEqual(recognition_rate(logits, labels), 2 / 3)
+
+    def test_missing_training_returns_anchor_and_available_losses(self):
+        model = MissingModalityRecognizer(TinyEncoder(), TinyEncoder(), num_classes=5, dim=256)
+        args = SimpleNamespace(lambda_shared=0.2, lambda_trans=0.3, lambda_orth=0.05, lambda_cons=0.0, lambda_anchor=1.0, lambda_avail=0.5)
+        palm = torch.randn(2, 3, 8, 8)
+        vein = torch.randn(2, 3, 8, 8)
+        labels = torch.tensor([0, 1])
+        losses = train_missing_model.batch_losses(model, palm, vein, labels, nn.CrossEntropyLoss(), args)
+        self.assertEqual(len(losses), 9)
+        self.assertTrue(torch.isfinite(losses[5]))
+        self.assertTrue(torch.isfinite(losses[6]))
 
 
 if __name__ == "__main__":

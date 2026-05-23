@@ -13,6 +13,8 @@ def safe_torch_load(path, device):
 def load_encoder_from_checkpoint(ckpt_path, modality, input_size, embedding_size, device):
     ckpt = safe_torch_load(ckpt_path, device)
     encoder = build_encoder(modality, input_channel=3, input_size=input_size, embedding_size=embedding_size).to(device)
-    encoder.load_state_dict(ckpt.get("encoder", ckpt.get("model", ckpt)), strict=False)
+    state = ckpt.get("encoder", ckpt.get("model", ckpt))
+    state = {key: value for key, value in state.items() if not key.startswith(("shared_head.", "specific_head."))}
+    encoder.load_state_dict(state, strict=False)
     encoder.eval()
     return encoder

@@ -138,6 +138,7 @@ class MissingModalityRecognizer(nn.Module):
         arcface_s=32.0,
         arcface_m=0.25,
         freeze_encoders=False,
+        freeze_backbone=True,
     ):
         super().__init__()
         if dim % 2 != 0:
@@ -150,8 +151,11 @@ class MissingModalityRecognizer(nn.Module):
         self.fusion = CrossChannelFusion(dim, heads, reduction)
         self.classifier = ArcFace(dim, num_classes, arcface_s, arcface_m)
         self.freeze_encoders = freeze_encoders
+        self.freeze_backbone = freeze_backbone
         if freeze_encoders:
             self._freeze_encoders()
+        elif freeze_backbone:
+            self._freeze_encoder_backbones()
 
     def _freeze_encoders(self):
         for encoder in (self.palm_encoder, self.vein_encoder):
@@ -159,9 +163,19 @@ class MissingModalityRecognizer(nn.Module):
             for param in encoder.parameters():
                 param.requires_grad = False
 
+    def _freeze_encoder_backbones(self):
+        for encoder in (self.palm_encoder, self.vein_encoder):
+            encoder.eval()
+            for param in encoder.parameters():
+                param.requires_grad = False
+            for name in ("shared_head", "specific_head"):
+                if hasattr(encoder, name):
+                    for param in getattr(encoder, name).parameters():
+                        param.requires_grad = True
+
     def train(self, mode=True):
         super().train(mode)
-        if self.freeze_encoders:
+        if self.freeze_encoders or self.freeze_backbone:
             self.palm_encoder.eval()
             self.vein_encoder.eval()
         return self

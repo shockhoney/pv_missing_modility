@@ -113,12 +113,18 @@ class ResNet18Encoder(nn.Module):
         )
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.bn = nn.BatchNorm1d(embedding_size)
-        self.shared_head = nn.Sequential(nn.Linear(embedding_size, self.part_dim, bias=False), nn.BatchNorm1d(self.part_dim))
-        self.specific_head = nn.Sequential(
-            nn.Linear(embedding_size, self.part_dim, bias=False), nn.BatchNorm1d(self.part_dim)
-        )
+        self.shared_head = nn.Sequential(nn.Linear(embedding_size, self.part_dim, bias=False))
+        self.specific_head = nn.Sequential(nn.Linear(embedding_size, self.part_dim, bias=False))
+        self._init_part_heads()
         self.out_dim = embedding_size
         self.local_dim = embedding_size
+
+    def _init_part_heads(self):
+        with torch.no_grad():
+            self.shared_head[0].weight.zero_()
+            self.specific_head[0].weight.zero_()
+            self.shared_head[0].weight[:, : self.part_dim].copy_(torch.eye(self.part_dim))
+            self.specific_head[0].weight[:, self.part_dim :].copy_(torch.eye(self.part_dim))
 
     def _backbone_features(self, x: torch.Tensor) -> torch.Tensor:
         model = self.backbone

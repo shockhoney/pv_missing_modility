@@ -93,6 +93,7 @@ def make_model(args, num_classes, device):
         arcface_s=args.arcface_s,
         arcface_m=args.arcface_m,
         freeze_encoders=args.freeze_encoders,
+        freeze_backbone=args.freeze_backbone,
     ).to(device)
 
 
@@ -117,26 +118,36 @@ def batch_losses(model, palm, vein, labels, ce, args):
         consistency_loss(outputs["palmprint_missing"]["z"], outputs["complete"]["z"])
         + consistency_loss(outputs["palmvein_missing"]["z"], outputs["complete"]["z"])
     )
+    anchor_loss = 0.5 * (
+        ce(model.classifier(outputs["complete"]["f_palm"], labels), labels)
+        + ce(model.classifier(outputs["complete"]["f_vein"], labels), labels)
+    )
+    avail_loss = 0.5 * (
+        consistency_loss(outputs["palmprint_missing"]["z"], outputs["complete"]["f_vein"])
+        + consistency_loss(outputs["palmvein_missing"]["z"], outputs["complete"]["f_palm"])
+    )
     loss = (
         cls_loss
+        + args.lambda_anchor * anchor_loss
         + args.lambda_shared * shared_loss
         + args.lambda_trans * trans_loss
         + args.lambda_orth * orth_loss
         + args.lambda_cons * cons_loss
+        + args.lambda_avail * avail_loss
     )
-    return loss, cls_loss, shared_loss, trans_loss, orth_loss, cons_loss, outputs
+    return loss, cls_loss, shared_loss, trans_loss, orth_loss, cons_loss, anchor_loss, avail_loss, outputs
 
 
 def train_epoch(model, loader, optimizer, ce, device, args):
     model.train()
-    sums = {"loss": 0.0, "cls": 0.0, "shared": 0.0, "trans": 0.0, "orth": 0.0, "cons": 0.0}
+    sums = {"loss": 0.0, "cls": 0.0, "shared": 0.0, "trans": 0.0, "orth": 0.0, "cons": 0.0, "anchor": 0.0, "avail": 0.0}
     sums.update({f"acc_{scenario}": 0.0 for scenario in SCENARIOS})
     total = 0
     for palm, vein, labels, _ in tqdm(loader, desc="Train missing", dynamic_ncols=True):
         palm = palm.to(device, non_blocking=True)
         vein = vein.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        loss, cls_loss, shared_loss, trans_loss, orth_loss, cons_loss, outputs = batch_losses(
+        loss, cls_loss, shared_loss, trans_loss, orth_loss, cons_loss, anchor_loss, avail_loss, outputs = batch_losses(
             model, palm, vein, labels, ce, args
         )
         if not torch.isfinite(loss):
@@ -154,6 +165,8 @@ def train_epoch(model, loader, optimizer, ce, device, args):
         sums["trans"] += trans_loss.item() * batch_size
         sums["orth"] += orth_loss.item() * batch_size
         sums["cons"] += cons_loss.item() * batch_size
+        sums["anchor"] += anchor_loss.item() * batch_size
+        sums["avail"] += avail_loss.item() * batch_size
         for scenario in SCENARIOS:
             sums[f"acc_{scenario}"] += recognition_rate(outputs[scenario]["logits"], labels) * batch_size
     return {key: value / max(total, 1) for key, value in sums.items()}
@@ -195,6 +208,7 @@ def train(args):
             f"[Epoch {epoch}] loss={train_stats['loss']:.4f} cls={train_stats['cls']:.4f} "
             f"shared={train_stats['shared']:.4f} trans={train_stats['trans']:.4f} "
             f"orth={train_stats['orth']:.4f} cons={train_stats['cons']:.4f} "
+            f"anchor={train_stats['anchor']:.4f} avail={train_stats['avail']:.4f} "
             f"acc_c={train_stats['acc_complete']:.4f} acc_pm={train_stats['acc_palmprint_missing']:.4f} "
             f"acc_vm={train_stats['acc_palmvein_missing']:.4f} lr={optimizer.param_groups[-1]['lr']:.6g}"
         )
@@ -223,6 +237,8 @@ def parse_args(argv=None):
     parser.add_argument("--lambda_trans", type=float, default=0.3)
     parser.add_argument("--lambda_orth", type=float, default=0.05)
     parser.add_argument("--lambda_cons", type=float, default=0.0)
+    parser.add_argument("--lambda_anchor", type=float, default=1.0)
+    parser.add_argument("--lambda_avail", type=float, default=0.5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--encoder_lr", type=float, default=1e-5)
     parser.add_argument("--min_lr", type=float, default=0.0)
@@ -230,6 +246,8 @@ def parse_args(argv=None):
     parser.add_argument("--arcface_s", type=float, default=32.0)
     parser.add_argument("--arcface_m", type=float, default=0.25)
     parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.set_defaults(freeze_backbone=True)
+    parser.add_argument("--train_backbone", action="store_false", dest="freeze_backbone")
     parser.add_argument("--freeze_encoders", action="store_true")
     parser.add_argument("--train_encoders", action="store_false", dest="freeze_encoders", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
