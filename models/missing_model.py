@@ -139,23 +139,39 @@ class MissingModalityRecognizer(nn.Module):
         arcface_m=0.25,
         freeze_encoders=False,
         freeze_backbone=True,
+        palm_teacher=None,
+        vein_teacher=None,
+        gate_init=-8.0,
     ):
         super().__init__()
         if dim % 2 != 0:
             raise ValueError("dim must be divisible by 2")
         self.palm_encoder = palm_encoder
         self.vein_encoder = vein_encoder
+        self.palm_teacher = palm_teacher
+        self.vein_teacher = vein_teacher
         self.part_dim = dim // 2
         self.p2v = CrossModalTransformation(self.part_dim, cmft_hidden)
         self.v2p = CrossModalTransformation(self.part_dim, cmft_hidden)
         self.fusion = CrossChannelFusion(dim, heads, reduction)
         self.classifier = ArcFace(dim, num_classes, arcface_s, arcface_m)
+        self.palm_missing_gate = nn.Parameter(torch.tensor(float(gate_init)))
+        self.vein_missing_gate = nn.Parameter(torch.tensor(float(gate_init)))
         self.freeze_encoders = freeze_encoders
         self.freeze_backbone = freeze_backbone
+        self._freeze_teachers()
         if freeze_encoders:
             self._freeze_encoders()
         elif freeze_backbone:
             self._freeze_encoder_backbones()
+
+    def _freeze_teachers(self):
+        for teacher in (self.palm_teacher, self.vein_teacher):
+            if teacher is None:
+                continue
+            teacher.eval()
+            for param in teacher.parameters():
+                param.requires_grad = False
 
     def _freeze_encoders(self):
         for encoder in (self.palm_encoder, self.vein_encoder):
@@ -178,6 +194,10 @@ class MissingModalityRecognizer(nn.Module):
         if self.freeze_encoders or self.freeze_backbone:
             self.palm_encoder.eval()
             self.vein_encoder.eval()
+        if self.palm_teacher is not None:
+            self.palm_teacher.eval()
+        if self.vein_teacher is not None:
+            self.vein_teacher.eval()
         return self
 
     def _encode_one(self, encoder, image):
@@ -226,6 +246,30 @@ class MissingModalityRecognizer(nn.Module):
             return feats["f_palm"], feats["hat_vein"]
         raise ValueError(f"Unsupported scenario: {scenario}")
 
+    def _teacher_logits(self, teacher, feature, labels):
+        with torch.no_grad():
+            raw_logits = teacher(feature)
+            logits = teacher(feature, labels) if labels is not None else raw_logits
+        return logits, raw_logits
+
+    def _missing_logits(self, scenario, feats, fusion_logits, fusion_logits_raw, labels):
+        if scenario == "palmprint_missing" and self.vein_teacher is not None:
+            teacher_logits, teacher_logits_raw = self._teacher_logits(self.vein_teacher, feats["f_vein"], labels)
+            alpha = torch.sigmoid(self.palm_missing_gate)
+        elif scenario == "palmvein_missing" and self.palm_teacher is not None:
+            teacher_logits, teacher_logits_raw = self._teacher_logits(self.palm_teacher, feats["f_palm"], labels)
+            alpha = torch.sigmoid(self.vein_missing_gate)
+        else:
+            return fusion_logits, {"fusion_logits": fusion_logits}
+
+        return (1.0 - alpha) * teacher_logits + alpha * fusion_logits, {
+            "fusion_logits": fusion_logits,
+            "fusion_logits_raw": fusion_logits_raw,
+            "teacher_logits": teacher_logits,
+            "teacher_logits_raw": teacher_logits_raw,
+            "gate_alpha": alpha,
+        }
+
     def forward(self, palm, vein, labels=None, scenario="complete", mask=None):
         (palm_shared, palm_specific), (vein_shared, vein_specific) = self._encode(palm, vein)
         hat_vein_specific = self.p2v(palm_specific)
@@ -237,11 +281,15 @@ class MissingModalityRecognizer(nn.Module):
             "hat_vein": self._compose(palm_shared, hat_vein_specific),
         }
         use_palm, use_vein = self._select_features(feats, scenario, mask)
-        z = self.fusion(use_palm, use_vein, scenario=self._scenario_from_mask(mask, scenario))
-        logits = self.classifier(z, labels) if labels is not None else self.classifier(z)
+        scenario = self._scenario_from_mask(mask, scenario)
+        z = self.fusion(use_palm, use_vein, scenario=scenario)
+        fusion_logits = self.classifier(z, labels) if labels is not None else self.classifier(z)
+        fusion_logits_raw = fusion_logits if labels is None else self.classifier(z)
+        logits, logit_outputs = self._missing_logits(scenario, feats, fusion_logits, fusion_logits_raw, labels)
         return {
             "logits": logits,
             "z": z,
+            **logit_outputs,
             "palm_shared": palm_shared,
             "palm_specific": palm_specific,
             "vein_shared": vein_shared,

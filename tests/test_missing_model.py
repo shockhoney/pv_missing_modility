@@ -82,6 +82,26 @@ class MissingModelTest(unittest.TestCase):
         self.assertTrue(next(model.palm_encoder.shared_head.parameters()).requires_grad)
         self.assertTrue(next(model.vein_encoder.specific_head.parameters()).requires_grad)
 
+    def test_missing_model_can_use_teacher_logits_for_missing_case(self):
+        palm_teacher = train_missing_model.ArcFace(256, 5)
+        vein_teacher = train_missing_model.ArcFace(256, 5)
+        model = MissingModalityRecognizer(
+            TinyEncoder(),
+            TinyEncoder(),
+            num_classes=5,
+            dim=256,
+            palm_teacher=palm_teacher,
+            vein_teacher=vein_teacher,
+        )
+        palm = torch.randn(2, 3, 8, 8)
+        vein = torch.randn(2, 3, 8, 8)
+        output = model(palm, vein, scenario="palmprint_missing")
+        self.assertIn("teacher_logits", output)
+        self.assertIn("fusion_logits", output)
+        self.assertLess(output["gate_alpha"].item(), 0.01)
+        self.assertTrue(torch.allclose(output["logits"], output["teacher_logits"], atol=1e-1))
+        self.assertFalse(next(model.vein_teacher.parameters()).requires_grad)
+
     def test_available_guided_fusion_preserves_available_feature_at_init(self):
         fusion = AvailableGuidedFusion(dim=256, reduction=4)
         available = torch.randn(2, 256)
@@ -146,14 +166,15 @@ class MissingModelTest(unittest.TestCase):
 
     def test_missing_training_returns_anchor_and_available_losses(self):
         model = MissingModalityRecognizer(TinyEncoder(), TinyEncoder(), num_classes=5, dim=256)
-        args = SimpleNamespace(lambda_shared=0.2, lambda_trans=0.3, lambda_orth=0.05, lambda_cons=0.0, lambda_anchor=1.0, lambda_avail=0.5)
+        args = SimpleNamespace(lambda_shared=0.2, lambda_trans=0.3, lambda_orth=0.05, lambda_cons=0.0, lambda_anchor=1.0, lambda_avail=0.5, lambda_distill=1.0)
         palm = torch.randn(2, 3, 8, 8)
         vein = torch.randn(2, 3, 8, 8)
         labels = torch.tensor([0, 1])
         losses = train_missing_model.batch_losses(model, palm, vein, labels, nn.CrossEntropyLoss(), args)
-        self.assertEqual(len(losses), 9)
+        self.assertEqual(len(losses), 10)
         self.assertTrue(torch.isfinite(losses[5]))
         self.assertTrue(torch.isfinite(losses[6]))
+        self.assertTrue(torch.isfinite(losses[8]))
 
 
 if __name__ == "__main__":

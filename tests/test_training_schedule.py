@@ -83,21 +83,22 @@ class ScheduleAndFusionTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             test_encoder.parse_args(["--modality", "joint"])
 
-    def test_missing_model_defaults_use_ssfd_loss_weights(self):
+    def test_missing_model_defaults_use_availability_guarantee_weights(self):
         args = train_missing_model.parse_args([])
         self.assertEqual(args.train_list, "data_txt/cumt/ssfd_train_full.txt")
         self.assertEqual(args.cmft_hidden, 1024)
-        self.assertEqual(args.lambda_shared, 0.2)
-        self.assertEqual(args.lambda_trans, 0.3)
-        self.assertEqual(args.lambda_orth, 0.05)
+        self.assertEqual(args.lambda_shared, 0.05)
+        self.assertEqual(args.lambda_trans, 0.1)
+        self.assertEqual(args.lambda_orth, 0.0)
         self.assertEqual(args.lambda_cons, 0.0)
         self.assertEqual(args.lr, 1e-3)
         self.assertEqual(args.encoder_lr, 1e-5)
         self.assertEqual(args.warmup_epochs, 5)
         self.assertEqual(args.lambda_anchor, 1.0)
-        self.assertEqual(args.lambda_avail, 0.5)
+        self.assertEqual(args.lambda_avail, 1.0)
+        self.assertEqual(args.lambda_distill, 1.0)
         self.assertTrue(args.freeze_backbone)
-        self.assertFalse(args.freeze_encoders)
+        self.assertTrue(args.freeze_encoders)
 
     def test_protocol_generation_is_closed_set_only(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

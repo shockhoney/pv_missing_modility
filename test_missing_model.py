@@ -8,6 +8,7 @@ from models.backbones import build_encoder
 from models.missing_model import MissingModalityRecognizer
 from utils.checkpoint import safe_torch_load
 from utils.datasets_txt import MissingPairTxtDataset
+from utils.head import ArcFace
 from utils.preprocess import build_palm_transform, build_vein_transform
 
 
@@ -19,8 +20,25 @@ def build_model(ckpt, device):
     dim = ckpt_args.get("embedding_size", 256)
     input_size = ckpt_args.get("input_size", 224)
     num_classes = ckpt["num_classes"]
+    state = ckpt["model"]
     palm_encoder = build_encoder("palm", input_channel=3, input_size=input_size, embedding_size=dim).to(device)
     vein_encoder = build_encoder("vein", input_channel=3, input_size=input_size, embedding_size=dim).to(device)
+    palm_teacher = None
+    vein_teacher = None
+    if any(key.startswith("palm_teacher.") for key in state):
+        palm_teacher = ArcFace(
+            dim,
+            num_classes,
+            ckpt_args.get("palm_teacher_s", ckpt_args.get("arcface_s", 32.0)),
+            ckpt_args.get("palm_teacher_m", ckpt_args.get("arcface_m", 0.25)),
+        ).to(device)
+    if any(key.startswith("vein_teacher.") for key in state):
+        vein_teacher = ArcFace(
+            dim,
+            num_classes,
+            ckpt_args.get("vein_teacher_s", ckpt_args.get("arcface_s", 32.0)),
+            ckpt_args.get("vein_teacher_m", ckpt_args.get("arcface_m", 0.25)),
+        ).to(device)
     model = MissingModalityRecognizer(
         palm_encoder,
         vein_encoder,
@@ -31,8 +49,14 @@ def build_model(ckpt, device):
         reduction=ckpt_args.get("channel_reduction", 4),
         arcface_s=ckpt_args.get("arcface_s", 32.0),
         arcface_m=ckpt_args.get("arcface_m", 0.25),
+        palm_teacher=palm_teacher,
+        vein_teacher=vein_teacher,
+        gate_init=ckpt_args.get("missing_gate_init", -8.0),
     ).to(device)
-    model.load_state_dict(ckpt["model"])
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    allowed_missing = {"palm_missing_gate", "vein_missing_gate"}
+    if unexpected or any(key not in allowed_missing for key in missing):
+        raise RuntimeError(f"Invalid missing-model checkpoint. Missing={missing}, unexpected={unexpected}")
     model.eval()
     return model, input_size
 
