@@ -12,12 +12,12 @@ from models.missing_model import (
     CrossModalTransformation,
     MissingModalityRecognizer,
     consistency_loss,
-    shared_specific_loss,
     transformation_loss,
 )
 from models.backbones import build_encoder
 from utils.checkpoint import load_encoder_from_checkpoint
 from utils.evaluation import recognition_rate
+from utils.head import ArcFace
 import train_missing_model
 
 
@@ -71,7 +71,7 @@ class MissingModelTest(unittest.TestCase):
         loaded = load_encoder_from_checkpoint(path, "palm", 64, 16, "cpu")
         self.assertTrue(torch.allclose(loaded.shared_head[0].weight[:, :8], torch.eye(8)))
 
-    def test_missing_model_freezes_backbone_but_trains_part_heads(self):
+    def test_missing_model_freezes_encoders(self):
         model = MissingModalityRecognizer(
             build_encoder("palm", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None),
             build_encoder("vein", input_channel=3, input_size=64, embedding_size=16, pretrained_path=None),
@@ -79,12 +79,12 @@ class MissingModelTest(unittest.TestCase):
             dim=16,
         )
         self.assertFalse(next(model.palm_encoder.backbone.parameters()).requires_grad)
-        self.assertTrue(next(model.palm_encoder.shared_head.parameters()).requires_grad)
-        self.assertTrue(next(model.vein_encoder.specific_head.parameters()).requires_grad)
+        self.assertFalse(next(model.palm_encoder.shared_head.parameters()).requires_grad)
+        self.assertFalse(next(model.vein_encoder.specific_head.parameters()).requires_grad)
 
     def test_missing_model_can_use_teacher_logits_for_missing_case(self):
-        palm_teacher = train_missing_model.ArcFace(256, 5)
-        vein_teacher = train_missing_model.ArcFace(256, 5)
+        palm_teacher = ArcFace(256, 5)
+        vein_teacher = ArcFace(256, 5)
         model = MissingModalityRecognizer(
             TinyEncoder(),
             TinyEncoder(),
@@ -143,21 +143,19 @@ class MissingModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(transformation_loss(source, target)))
         self.assertEqual(consistency_loss(source, target).dim(), 0)
         self.assertTrue(torch.isfinite(consistency_loss(source, target)))
-        self.assertEqual(shared_specific_loss(source[:, :128], target[:, :128], source[:, 128:], target[:, 128:]).dim(), 0)
 
     def test_transformation_loss_uses_cosine_scale(self):
         source = torch.randn(2, 128)
         self.assertLess(transformation_loss(source, source).item(), 1e-6)
         self.assertGreater(transformation_loss(source, -source).item(), 1.9)
 
-    def test_new_encoder_heads_use_main_learning_rate(self):
+    def test_optimizer_skips_frozen_encoder_params(self):
         model = MissingModalityRecognizer(TinyEncoder(), TinyEncoder(), num_classes=5, dim=256)
-        model.palm_encoder.shared_head = nn.Linear(1, 1)
-        args = SimpleNamespace(lr=1e-3, encoder_lr=1e-5, wd=1e-4)
+        args = SimpleNamespace(lr=1e-3, wd=1e-4)
         optimizer = train_missing_model.make_optimizer(model, args)
-        head_param_id = id(model.palm_encoder.shared_head.weight)
-        head_group = next(group for group in optimizer.param_groups if any(id(param) == head_param_id for param in group["params"]))
-        self.assertEqual(head_group["base_lr"], args.lr)
+        optimized_ids = {id(param) for group in optimizer.param_groups for param in group["params"]}
+        encoder_ids = {id(param) for param in model.palm_encoder.parameters()}
+        self.assertFalse(optimized_ids & encoder_ids)
 
     def test_recognition_rate_uses_closed_set_predictions(self):
         logits = torch.tensor([[0.1, 0.9], [0.7, 0.3], [0.8, 0.2]])
@@ -166,15 +164,21 @@ class MissingModelTest(unittest.TestCase):
 
     def test_missing_training_returns_anchor_and_available_losses(self):
         model = MissingModalityRecognizer(TinyEncoder(), TinyEncoder(), num_classes=5, dim=256)
-        args = SimpleNamespace(lambda_shared=0.2, lambda_trans=0.3, lambda_orth=0.05, lambda_cons=0.0, lambda_anchor=1.0, lambda_avail=0.5, lambda_distill=1.0)
+        args = SimpleNamespace(
+            lambda_shared=0.05,
+            lambda_trans=0.1,
+            lambda_anchor=1.0,
+            lambda_avail=1.0,
+            lambda_distill=1.0,
+        )
         palm = torch.randn(2, 3, 8, 8)
         vein = torch.randn(2, 3, 8, 8)
         labels = torch.tensor([0, 1])
         losses = train_missing_model.batch_losses(model, palm, vein, labels, nn.CrossEntropyLoss(), args)
-        self.assertEqual(len(losses), 10)
+        self.assertEqual(len(losses), 8)
+        self.assertTrue(torch.isfinite(losses[4]))
         self.assertTrue(torch.isfinite(losses[5]))
         self.assertTrue(torch.isfinite(losses[6]))
-        self.assertTrue(torch.isfinite(losses[8]))
 
 
 if __name__ == "__main__":

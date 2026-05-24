@@ -1,14 +1,21 @@
 # Hetero-MMRNet
 
-This project trains palmprint and palm-vein encoders for missing-modality recognition.
+This project trains palmprint and palm-vein encoders, then uses them as fixed teachers for missing-modality recognition.
 
-- Palm encoder baseline: TorchVision ResNet18
-- Vein encoder baseline: TorchVision ResNet18
-- Training head: ArcFace
-- Missing-modality model: SSFD-style cross-modal transformation + cross/channel attention fusion
+## Research Route
 
-Train single-modality baselines first, then train the missing-modality recognizer from their checkpoints.
+The current main route is intentionally simple:
 
+1. Train a palm encoder with its ArcFace head.
+2. Train a vein encoder with its ArcFace head.
+3. Freeze both single-modality systems.
+4. Train the missing-modality model with:
+   - cross-modal feature recovery,
+   - available-guided fusion,
+   - logit-level gated ensemble,
+   - distillation to the available single-modality teacher.
+
+The missing model does not fine-tune encoders by default. This keeps the available-modality baseline stable.
 
 ## Protocol
 
@@ -18,12 +25,10 @@ Protocol format:
 palm_path vein_path label palm_exists vein_exists split
 ```
 
-Generate SSFD-Net style protocol files:
+Generate protocol files:
 
 ```bash
-python utils/datasets_txt.py --dataset casia --root_dir data/CASIA --output_dir data_txt/casia
 python utils/datasets_txt.py --dataset cumt --root_dir data/CUMT --output_dir data_txt/cumt
-python utils/datasets_txt.py --dataset tongji --root_dir data/tongji --output_dir data_txt/tongji
 ```
 
 Generated files:
@@ -37,27 +42,25 @@ The test protocol contains `complete`, `palmprint_missing`, and `palmvein_missin
 
 ## Train
 
-Download pretrained weights first:
+Download ResNet18 pretrained weights first:
 
 ```powershell
 New-Item -ItemType Directory -Force pretrained
 Invoke-WebRequest -Uri "https://download.pytorch.org/models/resnet18-f37072fd.pth" -OutFile "pretrained/resnet18_imagenet1k_v1.pth"
 ```
 
-Single-modality baselines:
+Train single-modality baselines:
 
 ```bash
 python train_encoder.py --modality palm
 python train_encoder.py --modality vein
 ```
 
-Missing-modality recognizer:
+Train the missing-modality recognizer:
 
 ```bash
 python train_missing_model.py
 ```
-
-Training saves `best.pth` by lowest training loss.
 
 ## Test
 
@@ -67,13 +70,27 @@ python test_encoder.py --modality vein --ckpt outputs/encoders/vein_best.pth
 python test_missing_model.py --ckpt outputs/missing_model/best.pth
 ```
 
-Reports closed-set recognition rate.
+Run unit tests:
 
-## Main Files
+```bash
+python -m unittest discover -s tests
+```
 
-- `models/backbones.py`: ResNet18 encoder
-- `utils/datasets_txt.py`: protocol generation and datasets
-- `train_encoder.py`: encoder training
-- `test_encoder.py`: encoder evaluation
-- `train_missing_model.py`: missing-modality recognizer training
-- `test_missing_model.py`: missing-modality recognizer evaluation
+## File Map
+
+| File | Role |
+| --- | --- |
+| `train_encoder.py` | Trains one single-modality encoder and ArcFace head. |
+| `test_encoder.py` | Evaluates a saved palm or vein baseline checkpoint. |
+| `train_missing_model.py` | Trains the missing-modality recognizer from frozen palm/vein checkpoints. |
+| `test_missing_model.py` | Evaluates the missing-modality recognizer on all protocol splits. |
+| `models/backbones.py` | Defines the ResNet18 encoder and identity shared/specific split heads. |
+| `models/missing_model.py` | Defines CMFT, fusion, gated teacher ensemble, and missing-model losses. |
+| `utils/datasets_txt.py` | Generates protocols and loads paired or single-modality samples. |
+| `utils/preprocess.py` | Defines palm and vein image transforms. |
+| `utils/head.py` | Defines the ArcFace classification head. |
+| `utils/checkpoint.py` | Loads encoders and ArcFace heads from checkpoints. |
+| `utils/evaluation.py` | Computes closed-set recognition rate. |
+| `tests/` | Unit tests for protocol generation, transforms, schedules, shapes, and losses. |
+
+Local data, generated protocols, pretrained weights, checkpoints, and logs stay under ignored directories such as `data/`, `data_txt/`, `pretrained/`, `outputs/`, and `runs/`.

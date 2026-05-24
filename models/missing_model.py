@@ -97,8 +97,7 @@ class CrossChannelFusion(nn.Module):
         if scenario == "palmvein_missing":
             return self.available_fusion(palm_feat, vein_feat)
         palm_feat, vein_feat = self.cross_attention(palm_feat, vein_feat)
-        fused = self.channel_attention(palm_feat, vein_feat)
-        return F.normalize(self.project(fused), dim=1)
+        return F.normalize(self.project(self.channel_attention(palm_feat, vein_feat)), dim=1)
 
 
 def transformation_loss(pred, target):
@@ -107,18 +106,6 @@ def transformation_loss(pred, target):
 
 def shared_alignment_loss(palm_shared, vein_shared):
     return (1.0 - F.cosine_similarity(palm_shared, vein_shared, dim=1)).mean()
-
-
-def orthogonality_loss(palm_shared, vein_shared, palm_specific, vein_specific):
-    palm_orth = F.cosine_similarity(palm_shared, palm_specific, dim=1).abs().mean()
-    vein_orth = F.cosine_similarity(vein_shared, vein_specific, dim=1).abs().mean()
-    return 0.5 * (palm_orth + vein_orth)
-
-
-def shared_specific_loss(palm_shared, vein_shared, palm_specific, vein_specific):
-    return shared_alignment_loss(palm_shared, vein_shared) + orthogonality_loss(
-        palm_shared, vein_shared, palm_specific, vein_specific
-    )
 
 
 def consistency_loss(pred, target):
@@ -137,8 +124,6 @@ class MissingModalityRecognizer(nn.Module):
         reduction=4,
         arcface_s=32.0,
         arcface_m=0.25,
-        freeze_encoders=False,
-        freeze_backbone=True,
         palm_teacher=None,
         vein_teacher=None,
         gate_init=-8.0,
@@ -146,58 +131,36 @@ class MissingModalityRecognizer(nn.Module):
         super().__init__()
         if dim % 2 != 0:
             raise ValueError("dim must be divisible by 2")
+
         self.palm_encoder = palm_encoder
         self.vein_encoder = vein_encoder
         self.palm_teacher = palm_teacher
         self.vein_teacher = vein_teacher
         self.part_dim = dim // 2
+
         self.p2v = CrossModalTransformation(self.part_dim, cmft_hidden)
         self.v2p = CrossModalTransformation(self.part_dim, cmft_hidden)
         self.fusion = CrossChannelFusion(dim, heads, reduction)
         self.classifier = ArcFace(dim, num_classes, arcface_s, arcface_m)
         self.palm_missing_gate = nn.Parameter(torch.tensor(float(gate_init)))
         self.vein_missing_gate = nn.Parameter(torch.tensor(float(gate_init)))
-        self.freeze_encoders = freeze_encoders
-        self.freeze_backbone = freeze_backbone
-        self._freeze_teachers()
-        if freeze_encoders:
-            self._freeze_encoders()
-        elif freeze_backbone:
-            self._freeze_encoder_backbones()
 
-    def _freeze_teachers(self):
-        for teacher in (self.palm_teacher, self.vein_teacher):
-            if teacher is None:
-                continue
-            teacher.eval()
-            for param in teacher.parameters():
-                param.requires_grad = False
+        for module in (self.palm_encoder, self.vein_encoder, self.palm_teacher, self.vein_teacher):
+            self._freeze(module)
 
-    def _freeze_encoders(self):
-        for encoder in (self.palm_encoder, self.vein_encoder):
-            encoder.eval()
-            for param in encoder.parameters():
-                param.requires_grad = False
-
-    def _freeze_encoder_backbones(self):
-        for encoder in (self.palm_encoder, self.vein_encoder):
-            encoder.eval()
-            for param in encoder.parameters():
-                param.requires_grad = False
-            for name in ("shared_head", "specific_head"):
-                if hasattr(encoder, name):
-                    for param in getattr(encoder, name).parameters():
-                        param.requires_grad = True
+    @staticmethod
+    def _freeze(module):
+        if module is None:
+            return
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
 
     def train(self, mode=True):
         super().train(mode)
-        if self.freeze_encoders or self.freeze_backbone:
-            self.palm_encoder.eval()
-            self.vein_encoder.eval()
-        if self.palm_teacher is not None:
-            self.palm_teacher.eval()
-        if self.vein_teacher is not None:
-            self.vein_teacher.eval()
+        for module in (self.palm_encoder, self.vein_encoder, self.palm_teacher, self.vein_teacher):
+            if module is not None:
+                module.eval()
         return self
 
     def _encode_one(self, encoder, image):
@@ -207,10 +170,8 @@ class MissingModalityRecognizer(nn.Module):
         return feature[:, : self.part_dim], feature[:, self.part_dim :]
 
     def _encode(self, palm, vein):
-        if self.freeze_encoders:
-            with torch.no_grad():
-                return self._encode_one(self.palm_encoder, palm), self._encode_one(self.vein_encoder, vein)
-        return self._encode_one(self.palm_encoder, palm), self._encode_one(self.vein_encoder, vein)
+        with torch.no_grad():
+            return self._encode_one(self.palm_encoder, palm), self._encode_one(self.vein_encoder, vein)
 
     def _compose(self, shared, specific):
         return torch.cat([shared, specific], dim=1)
@@ -280,8 +241,9 @@ class MissingModalityRecognizer(nn.Module):
             "hat_palm": self._compose(vein_shared, hat_palm_specific),
             "hat_vein": self._compose(palm_shared, hat_vein_specific),
         }
-        use_palm, use_vein = self._select_features(feats, scenario, mask)
+
         scenario = self._scenario_from_mask(mask, scenario)
+        use_palm, use_vein = self._select_features(feats, scenario, mask)
         z = self.fusion(use_palm, use_vein, scenario=scenario)
         fusion_logits = self.classifier(z, labels) if labels is not None else self.classifier(z)
         fusion_logits_raw = fusion_logits if labels is None else self.classifier(z)

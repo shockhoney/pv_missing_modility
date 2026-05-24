@@ -53,6 +53,11 @@ def build_model(ckpt, device):
         vein_teacher=vein_teacher,
         gate_init=ckpt_args.get("missing_gate_init", -8.0),
     ).to(device)
+    state = {
+        key: value
+        for key, value in state.items()
+        if not key.startswith(("palm_teacher_encoder.", "vein_teacher_encoder."))
+    }
     missing, unexpected = model.load_state_dict(state, strict=False)
     allowed_missing = {"palm_missing_gate", "vein_missing_gate"}
     if unexpected or any(key not in allowed_missing for key in missing):

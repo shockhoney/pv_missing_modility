@@ -11,14 +11,12 @@ from tqdm import tqdm
 from models.missing_model import (
     MissingModalityRecognizer,
     consistency_loss,
-    orthogonality_loss,
     shared_alignment_loss,
     transformation_loss,
 )
 from utils.checkpoint import load_arcface_from_checkpoint, load_encoder_from_checkpoint
 from utils.datasets_txt import MissingPairTxtDataset, infer_num_classes
 from utils.evaluation import recognition_rate
-from utils.head import ArcFace
 from utils.preprocess import build_palm_transform, build_vein_transform
 
 
@@ -41,44 +39,23 @@ def make_loader(list_path, args, train=False):
     )
 
 
-def epoch_lr(args, epoch, base_lr=None):
-    base_lr = args.lr if base_lr is None else base_lr
+def epoch_lr(args, epoch):
     if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
-        return base_lr * epoch / args.warmup_epochs
+        return args.lr * epoch / args.warmup_epochs
     span = max(1, args.epochs - args.warmup_epochs)
     step = max(0, epoch - args.warmup_epochs)
     scale = 0.5 * (1.0 + math.cos(math.pi * min(step, span) / span))
-    return args.min_lr + (base_lr - args.min_lr) * scale
+    return args.min_lr + (args.lr - args.min_lr) * scale
 
 
-def set_lr(optimizer, args, epoch):
+def set_lr(optimizer, lr):
     for group in optimizer.param_groups:
-        group["lr"] = epoch_lr(args, epoch, group.get("base_lr", args.lr))
+        group["lr"] = lr
 
 
 def make_optimizer(model, args):
-    encoder_params = []
-    encoder_head_params = []
-    for encoder in (model.palm_encoder, model.vein_encoder):
-        head_ids = {
-            id(param)
-            for name in ("shared_head", "specific_head")
-            if hasattr(encoder, name)
-            for param in getattr(encoder, name).parameters()
-        }
-        encoder_head_params.extend(p for p in encoder.parameters() if p.requires_grad and id(p) in head_ids)
-        encoder_params.extend(p for p in encoder.parameters() if p.requires_grad and id(p) not in head_ids)
-
-    encoder_ids = {id(p) for p in encoder_params + encoder_head_params}
-    other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in encoder_ids]
-    groups = []
-    if encoder_params:
-        groups.append({"params": encoder_params, "base_lr": args.encoder_lr, "lr": args.encoder_lr})
-    if encoder_head_params:
-        groups.append({"params": encoder_head_params, "base_lr": args.lr, "lr": args.lr})
-    if other_params:
-        groups.append({"params": other_params, "base_lr": args.lr, "lr": args.lr})
-    return torch.optim.SGD(groups, momentum=0.9, weight_decay=args.wd)
+    params = [param for param in model.parameters() if param.requires_grad]
+    return torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.wd)
 
 
 def make_model(args, num_classes, device):
@@ -88,6 +65,7 @@ def make_model(args, num_classes, device):
     vein_teacher = load_arcface_from_checkpoint(args.vein_ckpt, args.embedding_size, device)
     if palm_teacher.out_features != num_classes or vein_teacher.out_features != num_classes:
         raise ValueError("Teacher classifier class count does not match train_list")
+
     args.palm_teacher_s, args.palm_teacher_m = palm_teacher.s, palm_teacher.m
     args.vein_teacher_s, args.vein_teacher_m = vein_teacher.s, vein_teacher.m
     return MissingModalityRecognizer(
@@ -100,8 +78,6 @@ def make_model(args, num_classes, device):
         reduction=args.channel_reduction,
         arcface_s=args.arcface_s,
         arcface_m=args.arcface_m,
-        freeze_encoders=args.freeze_encoders,
-        freeze_backbone=args.freeze_backbone,
         palm_teacher=palm_teacher,
         vein_teacher=vein_teacher,
         gate_init=args.missing_gate_init,
@@ -129,20 +105,7 @@ def batch_losses(model, palm, vein, labels, ce, args):
         transformation_loss(outputs["complete"]["hat_vein_specific"], outputs["complete"]["vein_specific"])
         + transformation_loss(outputs["complete"]["hat_palm_specific"], outputs["complete"]["palm_specific"])
     )
-    shared_loss = shared_alignment_loss(
-        outputs["complete"]["palm_shared"],
-        outputs["complete"]["vein_shared"],
-    )
-    orth_loss = orthogonality_loss(
-        outputs["complete"]["palm_shared"],
-        outputs["complete"]["vein_shared"],
-        outputs["complete"]["palm_specific"],
-        outputs["complete"]["vein_specific"],
-    )
-    cons_loss = 0.5 * (
-        consistency_loss(outputs["palmprint_missing"]["z"], outputs["complete"]["z"])
-        + consistency_loss(outputs["palmvein_missing"]["z"], outputs["complete"]["z"])
-    )
+    shared_loss = shared_alignment_loss(outputs["complete"]["palm_shared"], outputs["complete"]["vein_shared"])
     anchor_loss = 0.5 * (
         ce(model.classifier(outputs["complete"]["f_palm"], labels), labels)
         + ce(model.classifier(outputs["complete"]["f_vein"], labels), labels)
@@ -160,49 +123,28 @@ def batch_losses(model, palm, vein, labels, ce, args):
         + args.lambda_anchor * anchor_loss
         + args.lambda_shared * shared_loss
         + args.lambda_trans * trans_loss
-        + args.lambda_orth * orth_loss
-        + args.lambda_cons * cons_loss
         + args.lambda_avail * avail_loss
         + args.lambda_distill * distill_loss
     )
-    return loss, cls_loss, shared_loss, trans_loss, orth_loss, cons_loss, anchor_loss, avail_loss, distill_loss, outputs
+    return loss, cls_loss, shared_loss, trans_loss, anchor_loss, avail_loss, distill_loss, outputs
 
 
 def train_epoch(model, loader, optimizer, ce, device, args):
     model.train()
-    sums = {
-        "loss": 0.0,
-        "cls": 0.0,
-        "shared": 0.0,
-        "trans": 0.0,
-        "orth": 0.0,
-        "cons": 0.0,
-        "anchor": 0.0,
-        "avail": 0.0,
-        "distill": 0.0,
-    }
+    sums = {"loss": 0.0, "cls": 0.0, "shared": 0.0, "trans": 0.0, "anchor": 0.0, "avail": 0.0, "distill": 0.0}
     sums.update({f"acc_{scenario}": 0.0 for scenario in SCENARIOS})
     total = 0
+
     for palm, vein, labels, _ in tqdm(loader, desc="Train missing", dynamic_ncols=True):
         palm = palm.to(device, non_blocking=True)
         vein = vein.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        (
-            loss,
-            cls_loss,
-            shared_loss,
-            trans_loss,
-            orth_loss,
-            cons_loss,
-            anchor_loss,
-            avail_loss,
-            distill_loss,
-            outputs,
-        ) = batch_losses(
+        loss, cls_loss, shared_loss, trans_loss, anchor_loss, avail_loss, distill_loss, outputs = batch_losses(
             model, palm, vein, labels, ce, args
         )
         if not torch.isfinite(loss):
             continue
+
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 5.0)
@@ -214,8 +156,6 @@ def train_epoch(model, loader, optimizer, ce, device, args):
         sums["cls"] += cls_loss.item() * batch_size
         sums["shared"] += shared_loss.item() * batch_size
         sums["trans"] += trans_loss.item() * batch_size
-        sums["orth"] += orth_loss.item() * batch_size
-        sums["cons"] += cons_loss.item() * batch_size
         sums["anchor"] += anchor_loss.item() * batch_size
         sums["avail"] += avail_loss.item() * batch_size
         sums["distill"] += distill_loss.item() * batch_size
@@ -254,19 +194,18 @@ def train(args):
     best = float("inf")
 
     for epoch in range(1, args.epochs + 1):
-        set_lr(optimizer, args, epoch)
-        train_stats = train_epoch(model, train_loader, optimizer, ce, device, args)
+        lr = epoch_lr(args, epoch)
+        set_lr(optimizer, lr)
+        stats = train_epoch(model, train_loader, optimizer, ce, device, args)
         print(
-            f"[Epoch {epoch}] loss={train_stats['loss']:.4f} cls={train_stats['cls']:.4f} "
-            f"shared={train_stats['shared']:.4f} trans={train_stats['trans']:.4f} "
-            f"orth={train_stats['orth']:.4f} cons={train_stats['cons']:.4f} "
-            f"anchor={train_stats['anchor']:.4f} avail={train_stats['avail']:.4f} "
-            f"distill={train_stats['distill']:.4f} "
-            f"acc_c={train_stats['acc_complete']:.4f} acc_pm={train_stats['acc_palmprint_missing']:.4f} "
-            f"acc_vm={train_stats['acc_palmvein_missing']:.4f} lr={optimizer.param_groups[-1]['lr']:.6g}"
+            f"[Epoch {epoch}] loss={stats['loss']:.4f} cls={stats['cls']:.4f} "
+            f"shared={stats['shared']:.4f} trans={stats['trans']:.4f} "
+            f"anchor={stats['anchor']:.4f} avail={stats['avail']:.4f} distill={stats['distill']:.4f} "
+            f"acc_c={stats['acc_complete']:.4f} acc_pm={stats['acc_palmprint_missing']:.4f} "
+            f"acc_vm={stats['acc_palmvein_missing']:.4f} lr={lr:.6g}"
         )
-        if train_stats["loss"] < best:
-            best = train_stats["loss"]
+        if stats["loss"] < best:
+            best = stats["loss"]
             save_checkpoint(args.save_path, epoch, model, args, num_classes, best)
             print(f"[Info] saved {args.save_path} by train_loss")
 
@@ -288,24 +227,16 @@ def parse_args(argv=None):
     parser.add_argument("--channel_reduction", type=int, default=4)
     parser.add_argument("--lambda_shared", type=float, default=0.05)
     parser.add_argument("--lambda_trans", type=float, default=0.1)
-    parser.add_argument("--lambda_orth", type=float, default=0.0)
-    parser.add_argument("--lambda_cons", type=float, default=0.0)
     parser.add_argument("--lambda_anchor", type=float, default=1.0)
     parser.add_argument("--lambda_avail", type=float, default=1.0)
     parser.add_argument("--lambda_distill", type=float, default=1.0)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--encoder_lr", type=float, default=1e-5)
     parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument("--wd", type=float, default=1e-4)
     parser.add_argument("--arcface_s", type=float, default=32.0)
     parser.add_argument("--arcface_m", type=float, default=0.25)
     parser.add_argument("--missing_gate_init", type=float, default=-8.0)
     parser.add_argument("--warmup_epochs", type=int, default=5)
-    parser.set_defaults(freeze_backbone=True)
-    parser.add_argument("--train_backbone", action="store_false", dest="freeze_backbone")
-    parser.set_defaults(freeze_encoders=True)
-    parser.add_argument("--freeze_encoders", action="store_true")
-    parser.add_argument("--train_encoders", action="store_false", dest="freeze_encoders", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
