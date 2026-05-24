@@ -1,8 +1,6 @@
 import argparse
 import os
-import random
-from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -11,16 +9,19 @@ from PIL import Image
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 NA_TOKEN = "NA"
-PROTOCOL_FILES = {
-    "train_full": "train_full.txt",
-    "val_full": "val_full.txt",
-    "val_missing_fixed": "val_missing_fixed.txt",
-    "test_missing_protocol": "test_missing_protocol.txt",
+SSFD_PROTOCOL_FILES = {
+    "ssfd_train_full": "ssfd_train_full.txt",
+    "ssfd_test_protocol": "ssfd_test_protocol.txt",
 }
-CLOSED_PROTOCOL_FILES = {
-    "closed_train_full": "closed_train_full.txt",
-    "closed_val_full": "closed_val_full.txt",
-    "closed_test_protocol": "closed_test_protocol.txt",
+SSFD_DATASETS = {
+    "casia": {"palm_dir": "vi", "vein_dir": "ir", "train_count": 3, "test_count": 3},
+    "cumt": {"palm_dir": "palmprint", "vein_dir": "palmvein", "train_count": 5, "test_count": 5},
+    "tongji": {
+        "palm_train_dir": "palm_session1",
+        "vein_train_dir": "vein_session1",
+        "palm_test_dir": "palm_session2",
+        "vein_test_dir": "vein_session2",
+    },
 }
 
 
@@ -36,6 +37,17 @@ def _images(path: str) -> List[str]:
     return sorted(name for name in os.listdir(path) if name.lower().endswith(IMAGE_EXTS))
 
 
+def _sort_key(value: str):
+    return (0, int(value)) if value.isdigit() else (1, value)
+
+
+def _sample_key(name: str) -> str:
+    stem = os.path.splitext(name)[0]
+    if stem.endswith("_roi"):
+        stem = stem[:-4]
+    return stem.split("_")[-1]
+
+
 def _write(path: str, lines: List[str]) -> None:
     path = _path(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -43,7 +55,23 @@ def _write(path: str, lines: List[str]) -> None:
         handle.writelines(lines)
 
 
-def _collect_pairs(root_dir: str, palm_dir_name: str, vein_dir_name: str) -> Dict[str, List[Tuple[str, str]]]:
+def infer_num_classes(list_path: str) -> int:
+    labels = set()
+    with open(_path(list_path), "r", encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                labels.add(int(parts[2]))
+    return len(labels)
+
+
+def _paired_samples(palm_dir: str, vein_dir: str) -> List[Tuple[str, str]]:
+    palm = {_sample_key(name): os.path.join(palm_dir, name) for name in _images(palm_dir)}
+    vein = {_sample_key(name): os.path.join(vein_dir, name) for name in _images(vein_dir)}
+    return [(_rel(palm[key]), _rel(vein[key])) for key in sorted(palm.keys() & vein.keys(), key=_sort_key)]
+
+
+def _collect_split_dirs(root_dir: str, palm_dir_name: str, vein_dir_name: str, train_count: int, test_count: int):
     palm_root = _path(os.path.join(root_dir, palm_dir_name))
     vein_root = _path(os.path.join(root_dir, vein_dir_name))
     if not os.path.isdir(palm_root):
@@ -51,32 +79,58 @@ def _collect_pairs(root_dir: str, palm_dir_name: str, vein_dir_name: str) -> Dic
     if not os.path.isdir(vein_root):
         raise FileNotFoundError(f"Vein directory not found: {vein_root}")
 
-    pairs = defaultdict(list)
-    for subject in sorted(os.listdir(palm_root)):
-        palm_dir = os.path.join(palm_root, subject)
-        vein_dir = os.path.join(vein_root, subject)
+    pairs = {}
+    for class_id in sorted(set(os.listdir(palm_root)) & set(os.listdir(vein_root))):
+        palm_dir = os.path.join(palm_root, class_id)
+        vein_dir = os.path.join(vein_root, class_id)
         if not os.path.isdir(palm_dir) or not os.path.isdir(vein_dir):
             continue
-        for name in _images(palm_dir):
-            vein_path = os.path.join(vein_dir, name)
-            if os.path.isfile(vein_path):
-                class_id = f"{subject}_{name.split('_')[0]}"
-                pairs[class_id].append((_rel(os.path.join(palm_dir, name)), _rel(vein_path)))
+        samples = _paired_samples(palm_dir, vein_dir)
+        needed = train_count + test_count
+        if len(samples) < needed:
+            raise RuntimeError(f"Class {class_id} has {len(samples)} paired samples; need at least {needed}")
+        pairs[class_id] = {"train": samples[:train_count], "test": samples[train_count:needed]}
     return pairs
 
 
-def _split_classes(class_ids: List[str], train_ratio: float, val_ratio: float, seed: int):
-    rng = random.Random(seed)
-    class_ids = list(class_ids)
-    rng.shuffle(class_ids)
-    n_train = max(1, int(len(class_ids) * train_ratio))
-    n_val = max(1, int(len(class_ids) * val_ratio))
-    if n_train + n_val >= len(class_ids):
-        n_val = max(1, len(class_ids) - n_train - 1)
-    train = sorted(class_ids[:n_train])
-    val = sorted(class_ids[n_train:n_train + n_val])
-    test = sorted(class_ids[n_train + n_val:]) or val
-    return train, val, test
+def _collect_tongji_pairs(root_dir: str):
+    root = _path(root_dir)
+    dirs = SSFD_DATASETS["tongji"]
+    pairs = {}
+    class_sets = []
+    for key in ("palm_train_dir", "vein_train_dir", "palm_test_dir", "vein_test_dir"):
+        path = os.path.join(root, dirs[key])
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"Tongji directory not found: {path}")
+        class_sets.append(set(os.listdir(path)))
+
+    for class_id in sorted(set.intersection(*class_sets)):
+        train = _paired_samples(
+            os.path.join(root, dirs["palm_train_dir"], class_id),
+            os.path.join(root, dirs["vein_train_dir"], class_id),
+        )
+        test = _paired_samples(
+            os.path.join(root, dirs["palm_test_dir"], class_id),
+            os.path.join(root, dirs["vein_test_dir"], class_id),
+        )
+        if len(train) < 10 or len(test) < 10:
+            raise RuntimeError(f"Class {class_id} has {len(train)} train and {len(test)} test pairs; need 10 each")
+        pairs[class_id] = {"train": train[:10], "test": test[:10]}
+    return pairs
+
+
+def _collect_ssfd_pairs(root_dir: str, dataset: str):
+    name = dataset.lower()
+    if name == "tongji":
+        return _collect_tongji_pairs(root_dir)
+    config = SSFD_DATASETS[name]
+    return _collect_split_dirs(
+        root_dir,
+        config["palm_dir"],
+        config["vein_dir"],
+        config["train_count"],
+        config["test_count"],
+    )
 
 
 def _line(palm: str, vein: str, label: int, palm_exists: int, vein_exists: int, split: str) -> str:
@@ -92,115 +146,41 @@ def _full_protocol(pairs, class_ids, split):
     ]
 
 
-def _missing_protocol(pairs, class_ids, seed):
+def _ssfd_test_protocol(pairs, class_ids):
     labels = {class_id: idx for idx, class_id in enumerate(class_ids)}
-    rng = random.Random(seed)
-    lines = []
-    for class_id in class_ids:
-        for idx, (palm, vein) in enumerate(sorted(pairs[class_id])):
-            palm_only = (idx + rng.randint(0, 1)) % 2 == 0
-            split = "palm_only" if palm_only else "vein_only"
-            lines.append(_line(palm, vein, labels[class_id], int(palm_only), int(not palm_only), split))
-    return lines
-
-
-def _test_protocol(pairs, class_ids, seed):
-    labels = {class_id: idx for idx, class_id in enumerate(class_ids)}
-    rng = random.Random(seed)
     lines = []
     for class_id in class_ids:
         for palm, vein in sorted(pairs[class_id]):
             label = labels[class_id]
-            random_palm = rng.random() < 0.5
             lines += [
-                _line(palm, vein, label, 1, 1, "full"),
-                _line(palm, vein, label, 1, 0, "palm_only"),
-                _line(palm, vein, label, 0, 1, "vein_only"),
-                _line(palm, vein, label, int(random_palm), int(not random_palm), "random_missing"),
+                _line(palm, vein, label, 1, 1, "complete"),
+                _line(palm, vein, label, 0, 1, "palmprint_missing"),
+                _line(palm, vein, label, 1, 0, "palmvein_missing"),
             ]
     return lines
 
 
-def build_missing_protocols(
-    root_dir: str,
-    output_dir: str = "data_txt",
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    seed: int = 42,
-    palm_dir_name: str = "Red",
-    vein_dir_name: str = "NIR",
-):
-    pairs = _collect_pairs(root_dir, palm_dir_name, vein_dir_name)
+def build_ssfd_protocols(root_dir: str, output_dir: str = "data_txt", dataset: str = "cumt"):
+    pairs = _collect_ssfd_pairs(root_dir, dataset)
     class_ids = sorted(pairs)
     if not class_ids:
         raise RuntimeError(f"No paired samples found under: {root_dir}")
 
-    train_ids, val_ids, test_ids = _split_classes(class_ids, train_ratio, val_ratio, seed)
+    train_pairs = {class_id: pairs[class_id]["train"] for class_id in class_ids}
+    test_pairs = {class_id: pairs[class_id]["test"] for class_id in class_ids}
     payload = {
-        "train_full": _full_protocol(pairs, train_ids, "train"),
-        "val_full": _full_protocol(pairs, val_ids, "val"),
-        "val_missing_fixed": _missing_protocol(pairs, val_ids, seed + 7),
-        "test_missing_protocol": _test_protocol(pairs, test_ids, seed + 13),
+        "ssfd_train_full": _full_protocol(train_pairs, class_ids, "train"),
+        "ssfd_test_protocol": _ssfd_test_protocol(test_pairs, class_ids),
     }
-    files = {key: os.path.join(output_dir, name) for key, name in PROTOCOL_FILES.items()}
+    files = {key: os.path.join(output_dir, name) for key, name in SSFD_PROTOCOL_FILES.items()}
     for key, lines in payload.items():
         _write(files[key], lines)
 
     return {
+        "dataset": dataset.lower(),
         "num_classes_total": len(class_ids),
-        "num_classes_train": len(train_ids),
-        "num_classes_val": len(val_ids),
-        "num_classes_test": len(test_ids),
-        "num_train_pairs": len(payload["train_full"]),
-        "num_val_pairs": len(payload["val_full"]),
-        "num_val_missing_pairs": len(payload["val_missing_fixed"]),
-        "num_test_protocol_pairs": len(payload["test_missing_protocol"]),
-        "files": {key: _path(path) for key, path in files.items()},
-    }
-
-
-def build_closed_protocols(
-    root_dir: str,
-    output_dir: str = "data_txt",
-    seed: int = 42,
-    palm_dir_name: str = "Red",
-    vein_dir_name: str = "NIR",
-    train_per_class: int = 4,
-    val_per_class: int = 1,
-):
-    pairs = _collect_pairs(root_dir, palm_dir_name, vein_dir_name)
-    class_ids = sorted(pairs)
-    if not class_ids:
-        raise RuntimeError(f"No paired samples found under: {root_dir}")
-
-    min_samples = train_per_class + val_per_class + 1
-    rng = random.Random(seed)
-    train_pairs, val_pairs, test_pairs = {}, {}, {}
-    for class_id in class_ids:
-        samples = sorted(pairs[class_id])
-        if len(samples) < min_samples:
-            raise RuntimeError(f"Class {class_id} has {len(samples)} pairs; need at least {min_samples}")
-        rng.shuffle(samples)
-        train_end = train_per_class
-        val_end = train_end + val_per_class
-        train_pairs[class_id] = samples[:train_end]
-        val_pairs[class_id] = samples[train_end:val_end]
-        test_pairs[class_id] = samples[val_end:]
-
-    payload = {
-        "closed_train_full": _full_protocol(train_pairs, class_ids, "train"),
-        "closed_val_full": _full_protocol(val_pairs, class_ids, "val"),
-        "closed_test_protocol": _test_protocol(test_pairs, class_ids, seed + 13),
-    }
-    files = {key: os.path.join(output_dir, name) for key, name in CLOSED_PROTOCOL_FILES.items()}
-    for key, lines in payload.items():
-        _write(files[key], lines)
-
-    return {
-        "num_classes_total": len(class_ids),
-        "num_train_pairs": len(payload["closed_train_full"]),
-        "num_val_pairs": len(payload["closed_val_full"]),
-        "num_test_protocol_pairs": len(payload["closed_test_protocol"]),
+        "num_train_pairs": len(payload["ssfd_train_full"]),
+        "num_test_protocol_pairs": len(payload["ssfd_test_protocol"]),
         "files": {key: _path(path) for key, path in files.items()},
     }
 
@@ -272,44 +252,18 @@ class SingleModalityFromPairDataset:
         return image, sample["label"]
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Build missing-modality protocol files.")
-    parser.add_argument("--protocol", choices=["open", "closed"], default="closed")
-    parser.add_argument("--root_dir", default="data")
-    parser.add_argument("--output_dir", default="data_txt")
-    parser.add_argument("--train_ratio", type=float, default=0.7)
-    parser.add_argument("--val_ratio", type=float, default=0.15)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--palm_dir_name", default="Red")
-    parser.add_argument("--vein_dir_name", default="NIR")
-    parser.add_argument("--train_per_class", type=int, default=4)
-    parser.add_argument("--val_per_class", type=int, default=1)
-    return parser.parse_args()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Build SSFD-Net closed-set missing-modality protocol files.")
+    parser.add_argument("--dataset", choices=["casia", "cumt", "tongji"], default="cumt")
+    parser.add_argument("--root_dir", default="data/CUMT")
+    parser.add_argument("--output_dir", default="data_txt/cumt")
+    return parser.parse_args(argv)
 
 
 def main():
     args = parse_args()
-    if args.protocol == "open":
-        summary = build_missing_protocols(
-            args.root_dir,
-            args.output_dir,
-            args.train_ratio,
-            args.val_ratio,
-            args.seed,
-            args.palm_dir_name,
-            args.vein_dir_name,
-        )
-    else:
-        summary = build_closed_protocols(
-            args.root_dir,
-            args.output_dir,
-            args.seed,
-            args.palm_dir_name,
-            args.vein_dir_name,
-            args.train_per_class,
-            args.val_per_class,
-        )
-    print(f"{args.protocol.capitalize()} protocols generated.")
+    summary = build_ssfd_protocols(args.root_dir, args.output_dir, args.dataset)
+    print(f"SSFD-style {args.dataset.upper()} protocols generated.")
     for key, value in summary.items():
         print(f"{key}: {value}")
 

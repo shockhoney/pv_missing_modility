@@ -1,3 +1,5 @@
+import random
+
 import numpy as np
 from PIL import Image
 from torchvision import transforms
@@ -40,6 +42,24 @@ class CLAHE:
         return out.astype(np.uint8)
 
 
+class VeinIntensityJitter:
+    def __init__(self, brightness=(0.75, 1.25), contrast=(0.8, 1.2), gamma=(0.8, 1.25), p=0.8):
+        self.brightness = brightness
+        self.contrast = contrast
+        self.gamma = gamma
+        self.p = p
+
+    def __call__(self, image):
+        if random.random() > self.p:
+            return image
+        arr = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+        arr = np.clip(arr * random.uniform(*self.brightness), 0.0, 1.0)
+        mean = arr.mean()
+        arr = np.clip((arr - mean) * random.uniform(*self.contrast) + mean, 0.0, 1.0)
+        arr = np.power(arr, random.uniform(*self.gamma))
+        return Image.fromarray((arr * 255).astype(np.uint8)).convert("RGB")
+
+
 def build_palm_transform(img_size, train=False):
     ops = [transforms.Grayscale(3), transforms.Resize((img_size, img_size))]
     if train:
@@ -53,5 +73,8 @@ def build_palm_transform(img_size, train=False):
 def build_vein_transform(img_size, train=False):
     ops = [transforms.Grayscale(3), transforms.Resize((img_size, img_size)), CLAHE()]
     if train:
-        ops.append(transforms.RandomAffine(degrees=3, translate=(0.015, 0.015), scale=(0.99, 1.01)))
+        ops += [
+            VeinIntensityJitter(),
+            transforms.RandomAffine(degrees=5, translate=(0.03, 0.03), scale=(0.95, 1.05)),
+        ]
     return transforms.Compose(ops + [transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])

@@ -1,19 +1,28 @@
 import argparse
 import math
 import os
+import sys
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models.backbones import build_encoder
-from utils.datasets_txt import SingleModalityFromPairDataset
+from utils.datasets_txt import SingleModalityFromPairDataset, infer_num_classes
 from utils.head import ArcFace
-from utils.metrics import compute_eer, tar_at_far
 from utils.preprocess import build_palm_transform, build_vein_transform
+
+
+VEIN_DEFAULTS = {
+    "epochs": 300,
+    "lr": 3e-3,
+    "backbone_lr": 3e-4,
+    "wd": 5e-4,
+    "arcface_m": 0.15,
+    "warmup_epochs": 5,
+    "label_smoothing": 0.05,
+}
 
 
 def get_device(name):
@@ -26,16 +35,6 @@ def get_device(name):
     else:
         print("[Info] using CPU")
     return device
-
-
-def infer_num_classes(list_path):
-    labels = set()
-    with open(list_path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            parts = line.strip().split()
-            if len(parts) >= 3:
-                labels.add(int(parts[2]))
-    return len(labels)
 
 
 def modality_transform(modality, img_size, train=False):
@@ -80,49 +79,30 @@ def epoch_lr(args, epoch):
 
 def set_lr(optimizer, lr):
     for group in optimizer.param_groups:
-        group["lr"] = lr
+        scale = group.get("lr_scale", 1.0)
+        group["lr"] = lr * scale
 
 
-def pair_scores(feats, labels):
-    sim = feats @ feats.T
-    i, j = np.triu_indices(labels.shape[0], k=1)
-    return sim[i, j].astype(np.float32), (labels[i] == labels[j]).astype(np.int32)
+def make_optimizer(encoder, head, args):
+    if args.backbone_lr is None:
+        return torch.optim.SGD(
+            list(encoder.parameters()) + list(head.parameters()),
+            lr=args.lr,
+            momentum=0.9,
+            weight_decay=args.wd,
+        )
 
-
-def metrics_from_features(feats, labels):
-    feats = np.asarray(feats, dtype=np.float32)
-    labels = np.asarray(labels)
-    scores, pair_labels = pair_scores(feats, labels)
-    valid = np.isfinite(scores)
-    scores, pair_labels = scores[valid], pair_labels[valid]
-    if scores.size == 0 or np.unique(pair_labels).size < 2:
-        return {"eer": float("inf"), "tar_1e4": 0.0, "tar_1e5": 0.0}
-    tar_1e4 = tar_at_far(scores, pair_labels, 1e-4, is_similarity=True)
-    tar_1e5 = tar_at_far(scores, pair_labels, 1e-5, is_similarity=True)
-    return {
-        "eer": float(compute_eer(scores, pair_labels, is_similarity=True)),
-        "tar_1e4": float(tar_1e4["TAR"]),
-        "tar_1e5": float(tar_1e5["TAR"]),
-    }
-
-
-@torch.no_grad()
-def validate(encoder, loader, device, modality):
-    encoder.eval()
-    feats, labels = [], []
-    for images, y in tqdm(loader, desc=f"Validate {modality}", dynamic_ncols=True, leave=False):
-        emb = encoder(images.to(device, non_blocking=True))
-        feats.append(F.normalize(emb, dim=1).cpu().numpy())
-        labels.append(y.numpy())
-    return metrics_from_features(np.vstack(feats), np.concatenate(labels))
-
-
-def metric_improved(current, best, metric, min_delta):
-    return current < best - min_delta if metric == "eer" else current > best + min_delta
-
-
-def initial_best(metric):
-    return float("inf") if metric == "eer" else -float("inf")
+    backbone_params = list(encoder.backbone.parameters())
+    backbone_ids = {id(param) for param in backbone_params}
+    other_params = [param for param in encoder.parameters() if id(param) not in backbone_ids]
+    return torch.optim.SGD(
+        [
+            {"params": backbone_params, "lr": args.backbone_lr, "lr_scale": args.backbone_lr / args.lr},
+            {"params": other_params + list(head.parameters()), "lr": args.lr},
+        ],
+        momentum=0.9,
+        weight_decay=args.wd,
+    )
 
 
 def save_checkpoint(path, epoch, encoder, classifier, args, num_classes):
@@ -142,16 +122,15 @@ def save_checkpoint(path, epoch, encoder, classifier, args, num_classes):
 def train(args):
     os.makedirs(args.save_dir, exist_ok=True)
     device = get_device(args.device)
-    num_classes = infer_num_classes(args.train_full_list)
-    train_loader = make_loader(args, args.train_full_list, train=True)
-    val_loader = make_loader(args, args.val_full_list)
+    num_classes = infer_num_classes(args.train_list)
+    train_loader = make_loader(args, args.train_list, train=True)
 
     encoder = make_encoder(args).to(device)
     head = ArcFace(args.embedding_size, num_classes, args.arcface_s, args.arcface_m).to(device)
-    params = list(encoder.parameters()) + list(head.parameters())
-    optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.wd)
-    ce = nn.CrossEntropyLoss()
-    best, bad_epochs = initial_best(args.select_metric), 0
+    optimizer = make_optimizer(encoder, head, args)
+    params = [param for group in optimizer.param_groups for param in group["params"]]
+    ce = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    best = float("inf")
     best_path = os.path.join(args.save_dir, f"{args.modality}_best.pth")
 
     for epoch in range(1, args.epochs + 1):
@@ -179,28 +158,23 @@ def train(args):
             loss_sum += loss.item() * batch_size
             correct += (logits.argmax(1) == labels).sum().item()
 
-        val = validate(encoder, val_loader, device, args.modality)
+        train_loss = loss_sum / max(total, 1)
         print(
-            f"[Epoch {epoch}] {args.modality} loss={loss_sum / max(total, 1):.4f} "
-            f"acc={correct / max(total, 1):.4f} val_eer={val['eer'] * 100:.3f}% "
-            f"tar1e4={val['tar_1e4']:.4f} tar1e5={val['tar_1e5']:.4f} lr={lr:.6g}"
+            f"[Epoch {epoch}] {args.modality} loss={train_loss:.4f} "
+            f"acc={correct / max(total, 1):.4f} lr={lr:.6g}"
         )
 
-        if metric_improved(val[args.select_metric], best, args.select_metric, args.min_delta):
-            best, bad_epochs = val[args.select_metric], 0
+        if train_loss < best:
+            best = train_loss
             save_checkpoint(best_path, epoch, encoder, head, args, num_classes)
-            print(f"[Info] saved {best_path} by {args.select_metric}")
-        else:
-            bad_epochs += 1
-            if bad_epochs >= args.patience:
-                break
+            print(f"[Info] saved {best_path} by train_loss")
 
 
 def parse_args(argv=None):
+    tokens = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser("Train palm/vein baseline encoder")
     parser.add_argument("--modality", choices=["palm", "vein"], default="palm")
-    parser.add_argument("--train_full_list", default="data_txt/polyu/closed_train_full.txt")
-    parser.add_argument("--val_full_list", default="data_txt/polyu/closed_val_full.txt")
+    parser.add_argument("--train_list", default="data_txt/cumt/ssfd_train_full.txt")
     parser.add_argument("--save_dir", default="outputs/encoders")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -211,15 +185,20 @@ def parse_args(argv=None):
     parser.add_argument("--palm_pretrained", default="pretrained/resnet18_imagenet1k_v1.pth")
     parser.add_argument("--vein_pretrained", default="pretrained/resnet18_imagenet1k_v1.pth")
     parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--backbone_lr", type=float, default=None)
     parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument("--wd", type=float, default=1e-4)
     parser.add_argument("--arcface_s", type=float, default=32.0)
     parser.add_argument("--arcface_m", type=float, default=0.25)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument("--warmup_epochs", type=int, default=0)
-    parser.add_argument("--patience", type=int, default=100)
-    parser.add_argument("--min_delta", type=float, default=0.001)
-    parser.add_argument("--select_metric", choices=["eer", "tar_1e4", "tar_1e5"], default="tar_1e4")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.modality == "vein":
+        for name, value in VEIN_DEFAULTS.items():
+            option = f"--{name}"
+            if not any(token == option or token.startswith(f"{option}=") for token in tokens):
+                setattr(args, name, value)
+    return args
 
 
 def main():

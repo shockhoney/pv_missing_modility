@@ -5,9 +5,9 @@ This project trains palmprint and palm-vein encoders for missing-modality recogn
 - Palm encoder baseline: TorchVision ResNet18
 - Vein encoder baseline: TorchVision ResNet18
 - Training head: ArcFace
-- Test stage: normalized embedding with cosine similarity
+- Missing-modality model: SSFD-style cross-modal transformation + cross/channel attention fusion
 
-This stage trains only strong single-modality baselines. Joint alignment is not used.
+Train single-modality baselines first, then train the missing-modality recognizer from their checkpoints.
 
 
 ## Protocol
@@ -18,21 +18,22 @@ Protocol format:
 palm_path vein_path label palm_exists vein_exists split
 ```
 
-Generate protocol files from a dataset root that contains palm and vein subfolders:
+Generate SSFD-Net style protocol files:
 
 ```bash
-python utils/datasets_txt.py --protocol closed --root_dir data/PolyU --output_dir data_txt/polyu
+python utils/datasets_txt.py --dataset casia --root_dir data/CASIA --output_dir data_txt/casia
+python utils/datasets_txt.py --dataset cumt --root_dir data/CUMT --output_dir data_txt/cumt
+python utils/datasets_txt.py --dataset tongji --root_dir data/tongji --output_dir data_txt/tongji
 ```
-
-Use `--palm_dir_name` and `--vein_dir_name` when a dataset uses different subfolder names.
 
 Generated files:
 
 ```text
-data_txt/<dataset_name>/closed_train_full.txt
-data_txt/<dataset_name>/closed_val_full.txt
-data_txt/<dataset_name>/closed_test_protocol.txt
+data_txt/<dataset_name>/ssfd_train_full.txt
+data_txt/<dataset_name>/ssfd_test_protocol.txt
 ```
+
+The test protocol contains `complete`, `palmprint_missing`, and `palmvein_missing`.
 
 ## Train
 
@@ -50,12 +51,23 @@ python train_encoder.py --modality palm
 python train_encoder.py --modality vein
 ```
 
+Missing-modality recognizer:
+
+```bash
+python train_missing_model.py
+```
+
+Training saves `best.pth` by lowest training loss.
+
 ## Test
 
 ```bash
 python test_encoder.py --modality palm --ckpt outputs/encoders/palm_best.pth
 python test_encoder.py --modality vein --ckpt outputs/encoders/vein_best.pth
+python test_missing_model.py --ckpt outputs/missing_model/best.pth
 ```
+
+Reports closed-set recognition rate.
 
 ## Main Files
 
@@ -63,3 +75,5 @@ python test_encoder.py --modality vein --ckpt outputs/encoders/vein_best.pth
 - `utils/datasets_txt.py`: protocol generation and datasets
 - `train_encoder.py`: encoder training
 - `test_encoder.py`: encoder evaluation
+- `train_missing_model.py`: missing-modality recognizer training
+- `test_missing_model.py`: missing-modality recognizer evaluation

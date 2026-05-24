@@ -5,6 +5,5 @@ torch==2.7.1+cu118
 torchvision==0.22.1+cu118
 numpy==2.0.2
 Pillow==11.3.0
-scikit-learn==1.6.1
 tensorboard==2.20.0
 tqdm==4.67.1
