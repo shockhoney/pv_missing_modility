@@ -39,12 +39,6 @@ def build_model(ckpt, device):
             ckpt_args.get("vein_teacher_s", ckpt_args.get("arcface_s", 32.0)),
             ckpt_args.get("vein_teacher_m", ckpt_args.get("arcface_m", 0.25)),
         ).to(device)
-    palm_teacher_encoder = None
-    vein_teacher_encoder = None
-    if any(key.startswith("palm_teacher_encoder.") for key in state):
-        palm_teacher_encoder = build_encoder("palm", input_channel=3, input_size=input_size, embedding_size=dim).to(device)
-    if any(key.startswith("vein_teacher_encoder.") for key in state):
-        vein_teacher_encoder = build_encoder("vein", input_channel=3, input_size=input_size, embedding_size=dim).to(device)
     model = MissingModalityRecognizer(
         palm_encoder,
         vein_encoder,
@@ -57,10 +51,13 @@ def build_model(ckpt, device):
         arcface_m=ckpt_args.get("arcface_m", 0.25),
         palm_teacher=palm_teacher,
         vein_teacher=vein_teacher,
-        palm_teacher_encoder=palm_teacher_encoder,
-        vein_teacher_encoder=vein_teacher_encoder,
         gate_init=ckpt_args.get("missing_gate_init", -8.0),
     ).to(device)
+    state = {
+        key: value
+        for key, value in state.items()
+        if not key.startswith(("palm_teacher_encoder.", "vein_teacher_encoder."))
+    }
     missing, unexpected = model.load_state_dict(state, strict=False)
     allowed_missing = {"palm_missing_gate", "vein_missing_gate"}
     if unexpected or any(key not in allowed_missing for key in missing):
