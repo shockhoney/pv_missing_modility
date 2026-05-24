@@ -102,6 +102,28 @@ class MissingModelTest(unittest.TestCase):
         self.assertTrue(torch.allclose(output["logits"], output["teacher_logits"], atol=1e-1))
         self.assertFalse(next(model.vein_teacher.parameters()).requires_grad)
 
+    def test_teacher_encoder_keeps_missing_baseline_independent(self):
+        palm_teacher = train_missing_model.ArcFace(256, 5)
+        vein_teacher = train_missing_model.ArcFace(256, 5)
+        vein_teacher_encoder = TinyEncoder()
+        model = MissingModalityRecognizer(
+            TinyEncoder(),
+            TinyEncoder(),
+            num_classes=5,
+            dim=256,
+            palm_teacher=palm_teacher,
+            vein_teacher=vein_teacher,
+            vein_teacher_encoder=vein_teacher_encoder,
+        )
+        palm = torch.randn(2, 3, 8, 8)
+        vein = torch.randn(2, 3, 8, 8)
+        before = model(palm, vein, scenario="palmprint_missing")["teacher_logits"]
+        with torch.no_grad():
+            for param in model.vein_encoder.parameters():
+                param.add_(10.0)
+        after = model(palm, vein, scenario="palmprint_missing")["teacher_logits"]
+        self.assertTrue(torch.allclose(before, after))
+
     def test_available_guided_fusion_preserves_available_feature_at_init(self):
         fusion = AvailableGuidedFusion(dim=256, reduction=4)
         available = torch.randn(2, 256)
@@ -175,6 +197,26 @@ class MissingModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(losses[5]))
         self.assertTrue(torch.isfinite(losses[6]))
         self.assertTrue(torch.isfinite(losses[8]))
+
+    def test_resume_allows_added_teacher_encoder_state(self):
+        model = MissingModalityRecognizer(
+            TinyEncoder(),
+            TinyEncoder(),
+            num_classes=5,
+            dim=256,
+            palm_teacher=train_missing_model.ArcFace(256, 5),
+            vein_teacher=train_missing_model.ArcFace(256, 5),
+            palm_teacher_encoder=TinyEncoder(),
+            vein_teacher_encoder=TinyEncoder(),
+        )
+        state = {
+            key: value
+            for key, value in model.state_dict().items()
+            if not key.startswith(("palm_teacher_encoder.", "vein_teacher_encoder."))
+        }
+        path = os.path.join(tempfile.gettempdir(), "pv_missing_resume_test.pth")
+        torch.save({"model": state, "num_classes": 5}, path)
+        train_missing_model.load_missing_checkpoint(model, path, 5, "cpu")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from models.missing_model import (
     shared_alignment_loss,
     transformation_loss,
 )
-from utils.checkpoint import load_arcface_from_checkpoint, load_encoder_from_checkpoint
+from utils.checkpoint import load_arcface_from_checkpoint, load_encoder_from_checkpoint, safe_torch_load
 from utils.datasets_txt import MissingPairTxtDataset, infer_num_classes
 from utils.evaluation import recognition_rate
 from utils.head import ArcFace
@@ -86,6 +86,8 @@ def make_model(args, num_classes, device):
     vein_encoder = load_encoder_from_checkpoint(args.vein_ckpt, "vein", args.input_size, args.embedding_size, device)
     palm_teacher = load_arcface_from_checkpoint(args.palm_ckpt, args.embedding_size, device)
     vein_teacher = load_arcface_from_checkpoint(args.vein_ckpt, args.embedding_size, device)
+    palm_teacher_encoder = load_encoder_from_checkpoint(args.palm_ckpt, "palm", args.input_size, args.embedding_size, device)
+    vein_teacher_encoder = load_encoder_from_checkpoint(args.vein_ckpt, "vein", args.input_size, args.embedding_size, device)
     if palm_teacher.out_features != num_classes or vein_teacher.out_features != num_classes:
         raise ValueError("Teacher classifier class count does not match train_list")
     args.palm_teacher_s, args.palm_teacher_m = palm_teacher.s, palm_teacher.m
@@ -104,6 +106,8 @@ def make_model(args, num_classes, device):
         freeze_backbone=args.freeze_backbone,
         palm_teacher=palm_teacher,
         vein_teacher=vein_teacher,
+        palm_teacher_encoder=palm_teacher_encoder,
+        vein_teacher_encoder=vein_teacher_encoder,
         gate_init=args.missing_gate_init,
     ).to(device)
 
@@ -238,6 +242,17 @@ def save_checkpoint(path, epoch, model, args, num_classes, best_loss):
     )
 
 
+def load_missing_checkpoint(model, path, num_classes, device):
+    ckpt = safe_torch_load(path, device)
+    if ckpt.get("num_classes") != num_classes:
+        raise ValueError("Resume checkpoint class count does not match train_list")
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    allowed = ("palm_teacher_encoder.", "vein_teacher_encoder.")
+    allowed_names = {"palm_missing_gate", "vein_missing_gate"}
+    if unexpected or any(key not in allowed_names and not key.startswith(allowed) for key in missing):
+        raise RuntimeError(f"Invalid resume checkpoint. Missing={missing}, unexpected={unexpected}")
+
+
 def get_device(name):
     if name == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. Check the PyTorch CUDA build and NVIDIA driver.")
@@ -249,6 +264,9 @@ def train(args):
     num_classes = infer_num_classes(args.train_list)
     train_loader = make_loader(args.train_list, args, train=True)
     model = make_model(args, num_classes, device)
+    if args.resume:
+        load_missing_checkpoint(model, args.resume, num_classes, device)
+        print(f"[Info] resumed {args.resume}")
     optimizer = make_optimizer(model, args)
     ce = nn.CrossEntropyLoss()
     best = float("inf")
@@ -277,6 +295,7 @@ def parse_args(argv=None):
     parser.add_argument("--palm_ckpt", default="outputs/encoders/palm_best.pth")
     parser.add_argument("--vein_ckpt", default="outputs/encoders/vein_best.pth")
     parser.add_argument("--save_path", default="outputs/missing_model/best.pth")
+    parser.add_argument("--resume", default=None)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=8)

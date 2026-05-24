@@ -141,6 +141,8 @@ class MissingModalityRecognizer(nn.Module):
         freeze_backbone=True,
         palm_teacher=None,
         vein_teacher=None,
+        palm_teacher_encoder=None,
+        vein_teacher_encoder=None,
         gate_init=-8.0,
     ):
         super().__init__()
@@ -150,6 +152,8 @@ class MissingModalityRecognizer(nn.Module):
         self.vein_encoder = vein_encoder
         self.palm_teacher = palm_teacher
         self.vein_teacher = vein_teacher
+        self.palm_teacher_encoder = palm_teacher_encoder
+        self.vein_teacher_encoder = vein_teacher_encoder
         self.part_dim = dim // 2
         self.p2v = CrossModalTransformation(self.part_dim, cmft_hidden)
         self.v2p = CrossModalTransformation(self.part_dim, cmft_hidden)
@@ -166,7 +170,12 @@ class MissingModalityRecognizer(nn.Module):
             self._freeze_encoder_backbones()
 
     def _freeze_teachers(self):
-        for teacher in (self.palm_teacher, self.vein_teacher):
+        for teacher in (
+            self.palm_teacher,
+            self.vein_teacher,
+            self.palm_teacher_encoder,
+            self.vein_teacher_encoder,
+        ):
             if teacher is None:
                 continue
             teacher.eval()
@@ -198,6 +207,10 @@ class MissingModalityRecognizer(nn.Module):
             self.palm_teacher.eval()
         if self.vein_teacher is not None:
             self.vein_teacher.eval()
+        if self.palm_teacher_encoder is not None:
+            self.palm_teacher_encoder.eval()
+        if self.vein_teacher_encoder is not None:
+            self.vein_teacher_encoder.eval()
         return self
 
     def _encode_one(self, encoder, image):
@@ -252,12 +265,26 @@ class MissingModalityRecognizer(nn.Module):
             logits = teacher(feature, labels) if labels is not None else raw_logits
         return logits, raw_logits
 
-    def _missing_logits(self, scenario, feats, fusion_logits, fusion_logits_raw, labels):
+    def _teacher_encoder_logits(self, encoder, teacher, image, labels):
+        with torch.no_grad():
+            return self._teacher_logits(teacher, encoder(image), labels)
+
+    def _missing_logits(self, scenario, feats, palm, vein, fusion_logits, fusion_logits_raw, labels):
         if scenario == "palmprint_missing" and self.vein_teacher is not None:
-            teacher_logits, teacher_logits_raw = self._teacher_logits(self.vein_teacher, feats["f_vein"], labels)
+            if self.vein_teacher_encoder is None:
+                teacher_logits, teacher_logits_raw = self._teacher_logits(self.vein_teacher, feats["f_vein"], labels)
+            else:
+                teacher_logits, teacher_logits_raw = self._teacher_encoder_logits(
+                    self.vein_teacher_encoder, self.vein_teacher, vein, labels
+                )
             alpha = torch.sigmoid(self.palm_missing_gate)
         elif scenario == "palmvein_missing" and self.palm_teacher is not None:
-            teacher_logits, teacher_logits_raw = self._teacher_logits(self.palm_teacher, feats["f_palm"], labels)
+            if self.palm_teacher_encoder is None:
+                teacher_logits, teacher_logits_raw = self._teacher_logits(self.palm_teacher, feats["f_palm"], labels)
+            else:
+                teacher_logits, teacher_logits_raw = self._teacher_encoder_logits(
+                    self.palm_teacher_encoder, self.palm_teacher, palm, labels
+                )
             alpha = torch.sigmoid(self.vein_missing_gate)
         else:
             return fusion_logits, {"fusion_logits": fusion_logits}
@@ -285,7 +312,7 @@ class MissingModalityRecognizer(nn.Module):
         z = self.fusion(use_palm, use_vein, scenario=scenario)
         fusion_logits = self.classifier(z, labels) if labels is not None else self.classifier(z)
         fusion_logits_raw = fusion_logits if labels is None else self.classifier(z)
-        logits, logit_outputs = self._missing_logits(scenario, feats, fusion_logits, fusion_logits_raw, labels)
+        logits, logit_outputs = self._missing_logits(scenario, feats, palm, vein, fusion_logits, fusion_logits_raw, labels)
         return {
             "logits": logits,
             "z": z,
