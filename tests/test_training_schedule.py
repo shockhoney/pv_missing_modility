@@ -83,7 +83,7 @@ class ScheduleAndFusionTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             test_encoder.parse_args(["--modality", "joint"])
 
-    def test_missing_model_defaults_use_availability_guarantee_weights(self):
+    def test_missing_model_defaults_use_balanced_missing_fusion_weights(self):
         args = train_missing_model.parse_args([])
         self.assertEqual(args.train_list, "data_txt/cumt/ssfd_train_full.txt")
         self.assertEqual(args.cmft_hidden, 1024)
@@ -92,8 +92,9 @@ class ScheduleAndFusionTest(unittest.TestCase):
         self.assertEqual(args.lr, 1e-3)
         self.assertEqual(args.warmup_epochs, 5)
         self.assertEqual(args.lambda_anchor, 1.0)
-        self.assertEqual(args.lambda_avail, 1.0)
-        self.assertEqual(args.lambda_distill, 1.0)
+        self.assertEqual(args.lambda_avail, 0.1)
+        self.assertEqual(args.lambda_distill, 0.1)
+        self.assertEqual(args.missing_gate_init, 0.0)
 
     def test_protocol_generation_is_closed_set_only(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

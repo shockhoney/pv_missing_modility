@@ -51,7 +51,7 @@ def build_model(ckpt, device):
         arcface_m=ckpt_args.get("arcface_m", 0.25),
         palm_teacher=palm_teacher,
         vein_teacher=vein_teacher,
-        gate_init=ckpt_args.get("missing_gate_init", -8.0),
+        gate_init=ckpt_args.get("missing_gate_init", 0.0),
     ).to(device)
     state = {
         key: value

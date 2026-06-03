@@ -25,4 +25,6 @@ comparative_experiment/
 sem_CKD_student_mobilefacenet.py
 test-copy.py
 
+documents/
+tools/
 !requirements.txt

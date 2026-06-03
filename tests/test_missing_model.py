@@ -82,7 +82,7 @@ class MissingModelTest(unittest.TestCase):
         self.assertFalse(next(model.palm_encoder.shared_head.parameters()).requires_grad)
         self.assertFalse(next(model.vein_encoder.specific_head.parameters()).requires_grad)
 
-    def test_missing_model_can_use_teacher_logits_for_missing_case(self):
+    def test_missing_model_balances_teacher_and_fusion_logits_for_missing_case(self):
         palm_teacher = ArcFace(256, 5)
         vein_teacher = ArcFace(256, 5)
         model = MissingModalityRecognizer(
@@ -98,16 +98,17 @@ class MissingModelTest(unittest.TestCase):
         output = model(palm, vein, scenario="palmprint_missing")
         self.assertIn("teacher_logits", output)
         self.assertIn("fusion_logits", output)
-        self.assertLess(output["gate_alpha"].item(), 0.01)
-        self.assertTrue(torch.allclose(output["logits"], output["teacher_logits"], atol=1e-1))
+        self.assertAlmostEqual(output["gate_alpha"].item(), 0.5)
+        self.assertTrue(torch.allclose(output["logits"], 0.5 * (output["teacher_logits"] + output["fusion_logits"])))
         self.assertFalse(next(model.vein_teacher.parameters()).requires_grad)
 
-    def test_available_guided_fusion_preserves_available_feature_at_init(self):
+    def test_available_guided_fusion_balances_available_and_restored_at_init(self):
         fusion = AvailableGuidedFusion(dim=256, reduction=4)
         available = torch.randn(2, 256)
         restored = torch.randn(2, 256)
         out = fusion(available, restored)
-        self.assertTrue(torch.allclose(out, torch.nn.functional.normalize(available, dim=1), atol=1e-6))
+        expected = torch.nn.functional.normalize(available + restored, dim=1)
+        self.assertTrue(torch.allclose(out, expected, atol=1e-6))
 
     def test_cross_channel_fusion_outputs_embedding(self):
         fusion = CrossChannelFusion(dim=256, heads=4, reduction=4)
