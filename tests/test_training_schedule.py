@@ -105,13 +105,17 @@ class ScheduleAndFusionTest(unittest.TestCase):
         labels = np.array([1, 0, 1], dtype=np.int64)
         self.assertAlmostEqual(test_encoder.recognition_rate(logits, labels), 2 / 3)
 
-    def test_eval_metrics_reports_only_recognition_rate(self):
-        logits = np.array([[0.1, 0.9], [0.7, 0.3]], dtype=np.float32)
-        labels = np.array([1, 0], dtype=np.int64)
+    def test_eval_metrics_reports_recognition_rate_and_eer(self):
+        logits = np.array([[0.9, 0.1], [0.8, 0.2], [0.1, 0.9], [0.2, 0.8]], dtype=np.float32)
+        embeddings = np.array([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]], dtype=np.float32)
+        labels = np.array([0, 0, 1, 1], dtype=np.int64)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            test_encoder.eval_metrics(logits, labels, "closed")
-        self.assertEqual(output.getvalue(), "\n===== closed =====\nSamples: 2\nRecognition Rate (%): 100.00\n")
+            test_encoder.eval_metrics(logits, embeddings, labels, "closed")
+        self.assertEqual(
+            output.getvalue(),
+            "\n===== closed =====\nSamples: 4\nRecognition Rate (%): 100.00\nEER (%): 0.00\n",
+        )
 
     def test_error_summary_detects_class_concentration(self):
         labels = np.array([1, 1, 1, 2, 3], dtype=np.int64)

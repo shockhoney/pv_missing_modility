@@ -8,6 +8,7 @@ from models.backbones import build_encoder
 from models.missing_model import MissingModalityRecognizer
 from utils.checkpoint import safe_torch_load
 from utils.datasets_txt import MissingPairTxtDataset
+from utils.evaluation import eer_from_embeddings
 from utils.head import ArcFace
 from utils.preprocess import build_palm_transform, build_vein_transform
 
@@ -91,15 +92,20 @@ def build_loader(protocol_list, split_name, img_size, batch_size, num_workers):
 @torch.no_grad()
 def evaluate_split(model, loader, split_name, device):
     correct = total = 0
+    embeddings, all_labels = [], []
     for palm, vein, labels, mask in tqdm(loader, desc=f"Evaluate {split_name}", dynamic_ncols=True, leave=False):
         palm = palm.to(device, non_blocking=True)
         vein = vein.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
-        logits = model(palm, vein, mask=mask)["logits"]
+        output = model(palm, vein, mask=mask)
+        logits = output["logits"]
         correct += (logits.argmax(1) == labels).sum().item()
         total += labels.size(0)
-    return correct / max(total, 1), total
+        embeddings.append(output["z"].cpu())
+        all_labels.append(labels.cpu())
+    eer = eer_from_embeddings(torch.cat(embeddings), torch.cat(all_labels)) if embeddings else float("nan")
+    return correct / max(total, 1), eer, total
 
 
 def evaluate(args):
@@ -109,8 +115,8 @@ def evaluate(args):
         loader = build_loader(args.protocol_list, split_name, img_size, args.batch_size, args.num_workers)
         if loader is None:
             continue
-        acc, total = evaluate_split(model, loader, split_name, device)
-        print(f"{split_name}: Samples={total}, Recognition Rate (%): {acc * 100:.2f}")
+        acc, eer, total = evaluate_split(model, loader, split_name, device)
+        print(f"{split_name}: Samples={total}, Recognition Rate (%): {acc * 100:.2f}, EER (%): {eer * 100:.2f}")
 
 
 def parse_args(argv=None):
