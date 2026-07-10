@@ -11,7 +11,7 @@ from tqdm import tqdm
 from models.backbones import build_encoder
 from utils.checkpoint import safe_torch_load
 from utils.datasets_txt import SingleModalityFromPairDataset
-from utils.evaluation import recognition_rate
+from utils.evaluation import eer_from_embeddings, recognition_rate
 from utils.head import ArcFace
 from utils.preprocess import build_palm_transform, build_vein_transform
 
@@ -59,20 +59,23 @@ def build_loader(protocol_list: str, modality: str, split_name: str, img_size: i
 
 @torch.no_grad()
 def extract_logits(encoder, classifier, loader, modality: str, device):
-    logits, labels = [], []
+    logits, embeddings, labels = [], [], []
     for images, batch_labels in tqdm(loader, desc=f"Extract {modality}", dynamic_ncols=True, leave=False):
         images = images.to(device, non_blocking=True)
-        logits.append(classifier(encoder(images)).cpu().numpy())
+        features = encoder(images)
+        embeddings.append(features.cpu().numpy())
+        logits.append(classifier(features).cpu().numpy())
         labels.append(batch_labels.numpy())
-    return np.concatenate(logits, axis=0), np.concatenate(labels, axis=0)
+    return np.concatenate(logits, axis=0), np.concatenate(embeddings, axis=0), np.concatenate(labels, axis=0)
 
 
-def eval_metrics(logits: np.ndarray, labels: np.ndarray, name: str):
+def eval_metrics(logits: np.ndarray, embeddings: np.ndarray, labels: np.ndarray, name: str):
     print(f"\n===== {name} =====")
     print(f"Samples: {len(labels)}")
     logits = torch.as_tensor(logits)
     labels = torch.as_tensor(labels)
     print(f"Recognition Rate (%): {recognition_rate(logits, labels) * 100:.2f}")
+    print(f"EER (%): {eer_from_embeddings(embeddings, labels) * 100:.2f}")
 
 
 def error_analysis(preds: np.ndarray, labels: np.ndarray, samples, modality: str):
@@ -134,8 +137,8 @@ def evaluate_encoder(modality: str, ckpt_path: str, args, device):
         loader = build_loader(args.protocol_list, modality, split_name, args.input_size, args.batch_size, args.num_workers)
         if loader is None:
             continue
-        logits, labels = extract_logits(encoder, classifier, loader, modality, device)
-        eval_metrics(logits, labels, f"{modality.capitalize()} Encoder - {split_name}")
+        logits, embeddings, labels = extract_logits(encoder, classifier, loader, modality, device)
+        eval_metrics(logits, embeddings, labels, f"{modality.capitalize()} Encoder - {split_name}")
         if args.error_csv and split_name != "complete":
             preds = logits.argmax(axis=1)
             rows, summary = error_analysis(preds, labels, loader.dataset.samples, modality)

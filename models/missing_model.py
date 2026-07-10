@@ -80,7 +80,8 @@ class AvailableGuidedFusion(nn.Module):
             [available_feat, restored_feat, available_feat * restored_feat, (available_feat - restored_feat).abs()],
             dim=1,
         )
-        return F.normalize(available_feat + self.residual_scale * self.delta(cue), dim=1)
+        gate = torch.sigmoid(self.residual_scale * self.delta(cue))
+        return F.normalize(gate * available_feat + (1.0 - gate) * restored_feat, dim=1)
 
 
 class CrossChannelFusion(nn.Module):
@@ -126,7 +127,7 @@ class MissingModalityRecognizer(nn.Module):
         arcface_m=0.25,
         palm_teacher=None,
         vein_teacher=None,
-        gate_init=-8.0,
+        gate_init=0.0,
     ):
         super().__init__()
         if dim % 2 != 0:
