@@ -28,3 +28,4 @@ test-copy.py
 documents/
 tools/
 !requirements.txt
+.codex
