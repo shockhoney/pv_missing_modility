@@ -102,8 +102,10 @@ python train_missing_model.py \
 ```
 
 The fusion stage performs full DDIM sampling online under `no_grad`, so it is slower than ordinary classifier
-fine-tuning but does not backpropagate through the sampling trajectory. Use a different output path when reusing an
-existing checkpoint so that the source checkpoint remains available for comparison.
+fine-tuning but does not backpropagate through the sampling trajectory. It freezes the complete-modality fusion
+branch and trains only a zero-initialized residual over the real available modality, the classifier, and the missing
+gates. Training and testing use the fixed default seed `42`. Use a different output path when reusing an existing
+checkpoint so that the source checkpoint remains available for comparison.
 
 ## Test
 

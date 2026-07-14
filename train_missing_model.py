@@ -15,7 +15,7 @@ from utils.checkpoint_io import safe_torch_load
 from utils.datasets_txt import MissingPairTxtDataset, infer_num_classes
 from utils.evaluation import recognition_rate
 from utils.preprocess import build_palm_transform, build_vein_transform
-from utils.runtime import build_data_loader, cosine_annealing_lr, resolve_device, set_optimizer_lr
+from utils.runtime import build_data_loader, cosine_annealing_lr, resolve_device, set_optimizer_lr, set_random_seed
 from utils.scenarios import COMPLETE, PALMPRINT_MISSING, PALMVEIN_MISSING, SSFD_SCENARIOS
 
 
@@ -192,7 +192,8 @@ def sampled_fusion_losses(model, palm, vein, labels, ce, args):
 def configure_fusion_stage(model):
     for param in model.parameters():
         param.requires_grad = False
-    for module in (model.fusion, model.classifier):
+    model.fusion.available_fusion.reset_residual_scale()
+    for module in (model.fusion.available_fusion, model.classifier):
         for param in module.parameters():
             param.requires_grad = True
     model.palm_missing_gate.requires_grad = True
@@ -314,6 +315,7 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
 
 def train(args):
     device = resolve_device(args.device, require_available=True)
+    set_random_seed(args.seed)
     num_classes = infer_num_classes(args.train_list)
     train_loader = make_loader(args.train_list, args, train=True)
     model = make_model(args, num_classes, device)
@@ -340,6 +342,7 @@ def parse_args(argv=None):
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--input_size", type=int, default=224)
     parser.add_argument("--embedding_size", type=int, default=256)
     parser.add_argument("--attn_heads", type=int, default=4)

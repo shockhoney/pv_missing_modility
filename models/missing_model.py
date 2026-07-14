@@ -62,13 +62,20 @@ class AvailableGuidedFusion(nn.Module):
         )
         self.residual_scale = nn.Parameter(torch.zeros(1))
 
+    @torch.no_grad()
+    def reset_residual_scale(self):
+        self.residual_scale.zero_()
+
     def forward(self, available_feat, restored_feat):
+        available_feat = F.normalize(available_feat, dim=1)
+        restored_feat = F.normalize(restored_feat, dim=1)
         cue = torch.cat(
             [available_feat, restored_feat, available_feat * restored_feat, (available_feat - restored_feat).abs()],
             dim=1,
         )
-        gate = torch.sigmoid(self.residual_scale * self.delta(cue))
-        return F.normalize(gate * available_feat + (1.0 - gate) * restored_feat, dim=1)
+        residual = F.normalize(self.delta(cue), dim=1)
+        scale = torch.tanh(self.residual_scale)
+        return F.normalize(available_feat + scale * residual, dim=1)
 
 
 class CrossChannelFusion(nn.Module):

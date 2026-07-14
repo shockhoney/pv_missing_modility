@@ -1,7 +1,19 @@
 import math
+import random
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
+
+
+def set_random_seed(seed, deterministic=True):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
 
 
 def resolve_device(name=None, require_available=False, announce=False):

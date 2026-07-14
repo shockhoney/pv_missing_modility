@@ -10,7 +10,7 @@ from utils.datasets_txt import MissingPairTxtDataset
 from utils.evaluation import format_gallery_probe_metrics, gallery_probe_metrics
 from utils.head import ArcFace
 from utils.preprocess import build_palm_transform, build_vein_transform
-from utils.runtime import build_data_loader, resolve_device
+from utils.runtime import build_data_loader, resolve_device, set_random_seed
 from utils.scenarios import SSFD_SCENARIOS
 
 
@@ -111,9 +111,7 @@ def print_metrics(split_name, metrics):
 
 def evaluate(args):
     device = resolve_device(args.device)
-    torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
+    set_random_seed(args.seed)
     model, img_size = load_model(args.ckpt, device)
     gallery_loader = build_loader(args.gallery_list, None, img_size, args.batch_size, args.num_workers)
     gallery_embeddings, gallery_labels = extract_embeddings(model, gallery_loader, "Build gallery", device)
