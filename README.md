@@ -124,9 +124,10 @@ python test_missing_model.py \
   --diagnostics
 ```
 
-For each missing scenario, diagnostics report the real available modality against the complete-fusion Gallery and
-the pure diffusion-recovered target modality against its corresponding real single-modality Gallery. This separates
-cross-scenario embedding mismatch from poor diffusion recovery without repeating DDIM sampling.
+For each missing scenario, diagnostics report the real available modality after the shared final projection against
+the complete-fusion Gallery, and the pure diffusion-recovered target modality against its corresponding real
+single-modality Gallery. This separates cross-scenario embedding mismatch from poor diffusion recovery without
+repeating DDIM sampling.
 
 Evaluation builds one complete-modality Gallery template per held-out test identity by averaging its Gallery
 embeddings. Probe samples are matched to the L2-normalized Gallery templates with cosine similarity. Each modality

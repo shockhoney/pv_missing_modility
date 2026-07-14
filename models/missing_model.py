@@ -86,13 +86,21 @@ class CrossChannelFusion(nn.Module):
         self.available_fusion = AvailableGuidedFusion(dim, reduction)
         self.project = nn.Linear(dim, dim)
 
+    def project_feature(self, feature):
+        return F.normalize(self.project(feature), dim=1)
+
+    def available_only(self, feature):
+        return self.project_feature(F.normalize(feature, dim=1))
+
     def forward(self, palm_feat, vein_feat, scenario=COMPLETE):
         if scenario == PALMPRINT_MISSING:
-            return self.available_fusion(vein_feat, palm_feat)
-        if scenario == PALMVEIN_MISSING:
-            return self.available_fusion(palm_feat, vein_feat)
-        palm_feat, vein_feat = self.cross_attention(palm_feat, vein_feat)
-        return F.normalize(self.project(self.channel_attention(palm_feat, vein_feat)), dim=1)
+            fused = self.available_fusion(vein_feat, palm_feat)
+        elif scenario == PALMVEIN_MISSING:
+            fused = self.available_fusion(palm_feat, vein_feat)
+        else:
+            palm_feat, vein_feat = self.cross_attention(palm_feat, vein_feat)
+            fused = self.channel_attention(palm_feat, vein_feat)
+        return self.project_feature(fused)
 
 
 def cosine_alignment_loss(pred, target, detach_target=True):

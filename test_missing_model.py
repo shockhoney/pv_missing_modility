@@ -17,13 +17,17 @@ from utils.scenarios import PALMPRINT_MISSING, PALMVEIN_MISSING, SSFD_SCENARIOS
 SPLITS = SSFD_SCENARIOS
 DIAGNOSTICS = {
     PALMPRINT_MISSING: (
-        ("available_only_vs_complete_gallery", "f_vein", "z"),
+        ("available_only_vs_complete_gallery", "projected_f_vein", "z"),
         ("recovered_palm_vs_palm_gallery", "generated_palm", "f_palm"),
     ),
     PALMVEIN_MISSING: (
-        ("available_only_vs_complete_gallery", "f_palm", "z"),
+        ("available_only_vs_complete_gallery", "projected_f_palm", "z"),
         ("recovered_vein_vs_vein_gallery", "generated_vein", "f_vein"),
     ),
+}
+PROJECTED_FEATURES = {
+    "projected_f_palm": "f_palm",
+    "projected_f_vein": "f_vein",
 }
 
 
@@ -111,7 +115,9 @@ def extract_embeddings(model, loader, description, device, keys=("z",)):
         mask = mask.to(device, non_blocking=True)
         output = model(palm, vein, mask=mask)
         for key in keys:
-            embeddings[key].append(output[key].cpu())
+            source_key = PROJECTED_FEATURES.get(key)
+            value = model.fusion.available_only(output[source_key]) if source_key else output[key]
+            embeddings[key].append(value.cpu())
         labels.append(batch_labels)
     return {key: torch.cat(values) for key, values in embeddings.items()}, torch.cat(labels)
 
