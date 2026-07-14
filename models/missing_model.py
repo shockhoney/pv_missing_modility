@@ -2,22 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.feature_diffusion import ConditionalFeatureDiffusion
 from utils.head import ArcFace
-
-
-class CrossModalTransformation(nn.Module):
-    def __init__(self, dim=128, hidden=1024):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, dim),
-        )
-
-    def forward(self, feature):
-        return self.net(feature)
+from utils.scenarios import COMPLETE, PALMPRINT_MISSING, PALMVEIN_MISSING
 
 
 class CrossModalAttention(nn.Module):
@@ -92,25 +79,22 @@ class CrossChannelFusion(nn.Module):
         self.available_fusion = AvailableGuidedFusion(dim, reduction)
         self.project = nn.Linear(dim, dim)
 
-    def forward(self, palm_feat, vein_feat, scenario="complete"):
-        if scenario == "palmprint_missing":
+    def forward(self, palm_feat, vein_feat, scenario=COMPLETE):
+        if scenario == PALMPRINT_MISSING:
             return self.available_fusion(vein_feat, palm_feat)
-        if scenario == "palmvein_missing":
+        if scenario == PALMVEIN_MISSING:
             return self.available_fusion(palm_feat, vein_feat)
         palm_feat, vein_feat = self.cross_attention(palm_feat, vein_feat)
         return F.normalize(self.project(self.channel_attention(palm_feat, vein_feat)), dim=1)
 
 
-def transformation_loss(pred, target):
-    return (1.0 - F.cosine_similarity(pred, target.detach(), dim=1)).mean()
+def cosine_alignment_loss(pred, target, detach_target=True):
+    target = target.detach() if detach_target else target
+    return (1.0 - F.cosine_similarity(pred, target, dim=1)).mean()
 
 
 def shared_alignment_loss(palm_shared, vein_shared):
-    return (1.0 - F.cosine_similarity(palm_shared, vein_shared, dim=1)).mean()
-
-
-def consistency_loss(pred, target):
-    return (1.0 - F.cosine_similarity(pred, target.detach(), dim=1)).mean()
+    return cosine_alignment_loss(palm_shared, vein_shared, detach_target=False)
 
 
 class MissingModalityRecognizer(nn.Module):
@@ -120,7 +104,6 @@ class MissingModalityRecognizer(nn.Module):
         vein_encoder,
         num_classes,
         dim=256,
-        cmft_hidden=1024,
         heads=4,
         reduction=4,
         arcface_s=32.0,
@@ -128,6 +111,12 @@ class MissingModalityRecognizer(nn.Module):
         palm_teacher=None,
         vein_teacher=None,
         gate_init=0.0,
+        diffusion_steps=100,
+        ddim_steps=20,
+        diffusion_base_channels=64,
+        diffusion_time_dim=128,
+        diffusion_dropout=0.0,
+        diffusion_stats_momentum=0.99,
     ):
         super().__init__()
         if dim % 2 != 0:
@@ -137,10 +126,21 @@ class MissingModalityRecognizer(nn.Module):
         self.vein_encoder = vein_encoder
         self.palm_teacher = palm_teacher
         self.vein_teacher = vein_teacher
-        self.part_dim = dim // 2
+        feature_channels = getattr(palm_encoder, "local_dim", None)
+        if feature_channels is None or feature_channels != getattr(vein_encoder, "local_dim", None):
+            raise ValueError("Both encoders must expose the same local_dim for feature diffusion")
 
-        self.p2v = CrossModalTransformation(self.part_dim, cmft_hidden)
-        self.v2p = CrossModalTransformation(self.part_dim, cmft_hidden)
+        diffusion_kwargs = dict(
+            feature_channels=feature_channels,
+            num_steps=diffusion_steps,
+            ddim_steps=ddim_steps,
+            base_channels=diffusion_base_channels,
+            time_dim=diffusion_time_dim,
+            dropout=diffusion_dropout,
+            stats_momentum=diffusion_stats_momentum,
+        )
+        self.p2v = ConditionalFeatureDiffusion(**diffusion_kwargs)
+        self.v2p = ConditionalFeatureDiffusion(**diffusion_kwargs)
         self.fusion = CrossChannelFusion(dim, heads, reduction)
         self.classifier = ArcFace(dim, num_classes, arcface_s, arcface_m)
         self.palm_missing_gate = nn.Parameter(torch.tensor(float(gate_init)))
@@ -164,18 +164,80 @@ class MissingModalityRecognizer(nn.Module):
                 module.eval()
         return self
 
-    def _encode_one(self, encoder, image):
-        if hasattr(encoder, "forward_parts"):
-            return encoder.forward_parts(image)
-        feature = encoder(image)
-        return feature[:, : self.part_dim], feature[:, self.part_dim :]
+    @staticmethod
+    def _encode_one(encoder, image):
+        feature_map = encoder(image, return_spatial=True)
+        shared, specific = encoder.parts_from_features(feature_map)
+        return feature_map, shared, specific
 
-    def _encode(self, palm, vein):
+    def encode_modalities(self, palm, vein):
         with torch.no_grad():
-            return self._encode_one(self.palm_encoder, palm), self._encode_one(self.vein_encoder, vein)
+            palm_map, palm_shared, palm_specific = self._encode_one(self.palm_encoder, palm)
+            vein_map, vein_shared, vein_specific = self._encode_one(self.vein_encoder, vein)
+        return {
+            "palm_map": palm_map,
+            "vein_map": vein_map,
+            "palm_shared": palm_shared,
+            "palm_specific": palm_specific,
+            "vein_shared": vein_shared,
+            "vein_specific": vein_specific,
+            "f_palm": self._compose(palm_shared, palm_specific),
+            "f_vein": self._compose(vein_shared, vein_specific),
+        }
 
     def _compose(self, shared, specific):
         return torch.cat([shared, specific], dim=1)
+
+    def recover_modalities(self, encoded, training_recovery=False, directions=("p2v", "v2p")):
+        directions = set(directions)
+        zero = encoded["palm_map"].new_zeros(())
+        recovery = {"diffusion_loss": zero, "reconstruction_loss": zero}
+
+        if "p2v" in directions:
+            result = (
+                self.p2v.training_recovery(encoded["palm_map"], encoded["vein_map"])
+                if training_recovery
+                else {"feature": self.p2v.sample(encoded["palm_map"])}
+            )
+            recovered_vein_map = result["feature"]
+            recovery["diffusion_loss"] = recovery["diffusion_loss"] + result.get("diffusion_loss", zero)
+            recovery["reconstruction_loss"] = recovery["reconstruction_loss"] + result.get(
+                "reconstruction_loss", zero
+            )
+        else:
+            recovered_vein_map = encoded["vein_map"]
+
+        if "v2p" in directions:
+            result = (
+                self.v2p.training_recovery(encoded["vein_map"], encoded["palm_map"])
+                if training_recovery
+                else {"feature": self.v2p.sample(encoded["vein_map"])}
+            )
+            recovered_palm_map = result["feature"]
+            recovery["diffusion_loss"] = recovery["diffusion_loss"] + result.get("diffusion_loss", zero)
+            recovery["reconstruction_loss"] = recovery["reconstruction_loss"] + result.get(
+                "reconstruction_loss", zero
+            )
+        else:
+            recovered_palm_map = encoded["palm_map"]
+
+        if directions:
+            recovery["diffusion_loss"] = recovery["diffusion_loss"] / len(directions)
+            recovery["reconstruction_loss"] = recovery["reconstruction_loss"] / len(directions)
+
+        hat_vein_shared, hat_vein_specific = self.vein_encoder.parts_from_features(recovered_vein_map)
+        hat_palm_shared, hat_palm_specific = self.palm_encoder.parts_from_features(recovered_palm_map)
+        recovery.update(
+            {
+                "hat_palm_specific": hat_palm_specific,
+                "hat_vein_specific": hat_vein_specific,
+                "generated_palm": self._compose(hat_palm_shared, hat_palm_specific),
+                "generated_vein": self._compose(hat_vein_shared, hat_vein_specific),
+                "hat_palm": self._compose(encoded["vein_shared"], hat_palm_specific),
+                "hat_vein": self._compose(encoded["palm_shared"], hat_vein_specific),
+            }
+        )
+        return recovery
 
     def _scenario_from_mask(self, mask, scenario):
         if mask is None:
@@ -184,11 +246,11 @@ class MissingModalityRecognizer(nn.Module):
         palm_exists = mask[:, 0]
         vein_exists = mask[:, 1]
         if torch.all(palm_exists & vein_exists):
-            return "complete"
+            return COMPLETE
         if torch.all(~palm_exists & vein_exists):
-            return "palmprint_missing"
+            return PALMPRINT_MISSING
         if torch.all(palm_exists & ~vein_exists):
-            return "palmvein_missing"
+            return PALMVEIN_MISSING
         return scenario
 
     def _select_features(self, feats, scenario, mask):
@@ -200,11 +262,11 @@ class MissingModalityRecognizer(nn.Module):
                 torch.where(palm_exists, feats["f_palm"], feats["hat_palm"]),
                 torch.where(vein_exists, feats["f_vein"], feats["hat_vein"]),
             )
-        if scenario == "complete":
+        if scenario == COMPLETE:
             return feats["f_palm"], feats["f_vein"]
-        if scenario == "palmprint_missing":
+        if scenario == PALMPRINT_MISSING:
             return feats["hat_palm"], feats["f_vein"]
-        if scenario == "palmvein_missing":
+        if scenario == PALMVEIN_MISSING:
             return feats["f_palm"], feats["hat_vein"]
         raise ValueError(f"Unsupported scenario: {scenario}")
 
@@ -215,34 +277,22 @@ class MissingModalityRecognizer(nn.Module):
         return logits, raw_logits
 
     def _missing_logits(self, scenario, feats, fusion_logits, fusion_logits_raw, labels):
-        if scenario == "palmprint_missing" and self.vein_teacher is not None:
+        if scenario == PALMPRINT_MISSING and self.vein_teacher is not None:
             teacher_logits, teacher_logits_raw = self._teacher_logits(self.vein_teacher, feats["f_vein"], labels)
             alpha = torch.sigmoid(self.palm_missing_gate)
-        elif scenario == "palmvein_missing" and self.palm_teacher is not None:
+        elif scenario == PALMVEIN_MISSING and self.palm_teacher is not None:
             teacher_logits, teacher_logits_raw = self._teacher_logits(self.palm_teacher, feats["f_palm"], labels)
             alpha = torch.sigmoid(self.vein_missing_gate)
         else:
-            return fusion_logits, {"fusion_logits": fusion_logits}
+            return fusion_logits, {}
 
         return (1.0 - alpha) * teacher_logits + alpha * fusion_logits, {
-            "fusion_logits": fusion_logits,
             "fusion_logits_raw": fusion_logits_raw,
-            "teacher_logits": teacher_logits,
             "teacher_logits_raw": teacher_logits_raw,
-            "gate_alpha": alpha,
         }
 
-    def forward(self, palm, vein, labels=None, scenario="complete", mask=None):
-        (palm_shared, palm_specific), (vein_shared, vein_specific) = self._encode(palm, vein)
-        hat_vein_specific = self.p2v(palm_specific)
-        hat_palm_specific = self.v2p(vein_specific)
-        feats = {
-            "f_palm": self._compose(palm_shared, palm_specific),
-            "f_vein": self._compose(vein_shared, vein_specific),
-            "hat_palm": self._compose(vein_shared, hat_palm_specific),
-            "hat_vein": self._compose(palm_shared, hat_vein_specific),
-        }
-
+    def forward_from_encoded(self, encoded, recovery, labels=None, scenario=COMPLETE, mask=None):
+        feats = {**encoded, **recovery}
         scenario = self._scenario_from_mask(mask, scenario)
         use_palm, use_vein = self._select_features(feats, scenario, mask)
         z = self.fusion(use_palm, use_vein, scenario=scenario)
@@ -253,11 +303,31 @@ class MissingModalityRecognizer(nn.Module):
             "logits": logits,
             "z": z,
             **logit_outputs,
-            "palm_shared": palm_shared,
-            "palm_specific": palm_specific,
-            "vein_shared": vein_shared,
-            "vein_specific": vein_specific,
-            "hat_palm_specific": hat_palm_specific,
-            "hat_vein_specific": hat_vein_specific,
             **feats,
         }
+
+    def _required_directions(self, scenario, mask):
+        if mask is not None:
+            mask = mask.bool()
+            directions = []
+            if torch.any(~mask[:, 0]):
+                directions.append("v2p")
+            if torch.any(~mask[:, 1]):
+                directions.append("p2v")
+            return directions
+        if scenario == PALMPRINT_MISSING:
+            return ["v2p"]
+        if scenario == PALMVEIN_MISSING:
+            return ["p2v"]
+        return []
+
+    def forward(self, palm, vein, labels=None, scenario=COMPLETE, mask=None):
+        encoded = self.encode_modalities(palm, vein)
+        if self.training:
+            directions = ("p2v", "v2p")
+            training_recovery = True
+        else:
+            directions = self._required_directions(scenario, mask)
+            training_recovery = False
+        recovery = self.recover_modalities(encoded, training_recovery, directions)
+        return self.forward_from_encoded(encoded, recovery, labels, scenario, mask)

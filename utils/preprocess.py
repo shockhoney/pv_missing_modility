@@ -78,3 +78,11 @@ def build_vein_transform(img_size, train=False):
             transforms.RandomAffine(degrees=5, translate=(0.03, 0.03), scale=(0.95, 1.05)),
         ]
     return transforms.Compose(ops + [transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
+
+
+def build_modality_transform(modality, img_size, train=False):
+    if modality == "palm":
+        return build_palm_transform(img_size, train=train)
+    if modality == "vein":
+        return build_vein_transform(img_size, train=train)
+    raise ValueError(f"Unsupported modality: {modality}")

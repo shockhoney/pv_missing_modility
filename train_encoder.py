@@ -1,22 +1,23 @@
 import argparse
-import math
 import os
 import sys
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models.backbones import build_encoder
+from utils.checkpoint import save_checkpoint
 from utils.datasets_txt import SingleModalityFromPairDataset, infer_num_classes
+from utils.evaluation import count_correct_predictions
 from utils.head import ArcFace
-from utils.preprocess import build_palm_transform, build_vein_transform
+from utils.preprocess import build_modality_transform
+from utils.runtime import build_data_loader, cosine_annealing_lr, resolve_device, set_optimizer_lr
 
 
 VEIN_DEFAULTS = {
-    "epochs": 300,
-    "lr": 3e-3,
+    "epochs": 100,
+    "lr": 1e-3,
     "backbone_lr": 3e-4,
     "wd": 5e-4,
     "arcface_m": 0.15,
@@ -25,36 +26,13 @@ VEIN_DEFAULTS = {
 }
 
 
-def get_device(name):
-    if name == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. Check the PyTorch CUDA build and NVIDIA driver.")
-    device = torch.device(name)
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        print(f"[Info] using GPU: {torch.cuda.get_device_name(device)}")
-    else:
-        print("[Info] using CPU")
-    return device
-
-
-def modality_transform(modality, img_size, train=False):
-    return build_palm_transform(img_size, train=train) if modality == "palm" else build_vein_transform(img_size, train=train)
-
-
 def make_loader(args, list_path, train=False):
     dataset = SingleModalityFromPairDataset(
         list_path,
         args.modality,
-        modality_transform(args.modality, args.input_size, train=train),
+        build_modality_transform(args.modality, args.input_size, train=train),
     )
-    return DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=train,
-        drop_last=train,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
+    return build_data_loader(dataset, args.batch_size, args.num_workers, train=train)
 
 
 def make_encoder(args):
@@ -62,25 +40,9 @@ def make_encoder(args):
     return build_encoder(
         args.modality,
         input_channel=3,
-        input_size=args.input_size,
         embedding_size=args.embedding_size,
         pretrained_path=pretrained,
     )
-
-
-def epoch_lr(args, epoch):
-    if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
-        return args.lr * epoch / args.warmup_epochs
-    span = max(1, args.epochs - args.warmup_epochs)
-    step = max(0, epoch - args.warmup_epochs)
-    scale = 0.5 * (1.0 + math.cos(math.pi * min(step, span) / span))
-    return args.min_lr + (args.lr - args.min_lr) * scale
-
-
-def set_lr(optimizer, lr):
-    for group in optimizer.param_groups:
-        scale = group.get("lr_scale", 1.0)
-        group["lr"] = lr * scale
 
 
 def make_optimizer(encoder, head, args):
@@ -105,23 +67,9 @@ def make_optimizer(encoder, head, args):
     )
 
 
-def save_checkpoint(path, epoch, encoder, classifier, args, num_classes):
-    torch.save(
-        {
-            "epoch": epoch,
-            "modality": args.modality,
-            "encoder": encoder.state_dict(),
-            "classifier": classifier.state_dict(),
-            "args": vars(args),
-            "num_classes": num_classes,
-        },
-        path,
-    )
-
-
 def train(args):
     os.makedirs(args.save_dir, exist_ok=True)
-    device = get_device(args.device)
+    device = resolve_device(args.device, require_available=True, announce=True)
     num_classes = infer_num_classes(args.train_list)
     train_loader = make_loader(args, args.train_list, train=True)
 
@@ -134,8 +82,8 @@ def train(args):
     best_path = os.path.join(args.save_dir, f"{args.modality}_best.pth")
 
     for epoch in range(1, args.epochs + 1):
-        lr = epoch_lr(args, epoch)
-        set_lr(optimizer, lr)
+        lr = cosine_annealing_lr(args.lr, args.min_lr, args.epochs, args.warmup_epochs, epoch)
+        set_optimizer_lr(optimizer, lr)
         encoder.train()
         head.train()
         loss_sum = correct = total = 0
@@ -156,7 +104,7 @@ def train(args):
             batch_size = labels.size(0)
             total += batch_size
             loss_sum += loss.item() * batch_size
-            correct += (logits.argmax(1) == labels).sum().item()
+            correct += count_correct_predictions(logits, labels)
 
         train_loss = loss_sum / max(total, 1)
         print(
@@ -166,7 +114,17 @@ def train(args):
 
         if train_loss < best:
             best = train_loss
-            save_checkpoint(best_path, epoch, encoder, head, args, num_classes)
+            save_checkpoint(
+                best_path,
+                {
+                    "epoch": epoch,
+                    "modality": args.modality,
+                    "encoder": encoder.state_dict(),
+                    "classifier": head.state_dict(),
+                    "args": vars(args),
+                    "num_classes": num_classes,
+                },
+            )
             print(f"[Info] saved {best_path} by train_loss")
 
 
@@ -174,7 +132,7 @@ def parse_args(argv=None):
     tokens = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser("Train palm/vein baseline encoder")
     parser.add_argument("--modality", choices=["palm", "vein"], default="palm")
-    parser.add_argument("--train_list", default="data_txt/cumt/ssfd_train_full.txt")
+    parser.add_argument("--train_list", default="data_txt/tongji/ssfd_train_full.txt")
     parser.add_argument("--save_dir", default="outputs/encoders")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=16)

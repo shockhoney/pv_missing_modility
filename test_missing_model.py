@@ -1,19 +1,20 @@
 import argparse
 
 import torch
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models.backbones import build_encoder
 from models.missing_model import MissingModalityRecognizer
 from utils.checkpoint import safe_torch_load
 from utils.datasets_txt import MissingPairTxtDataset
-from utils.evaluation import eer_from_embeddings
+from utils.evaluation import format_gallery_probe_metrics, gallery_probe_metrics
 from utils.head import ArcFace
 from utils.preprocess import build_palm_transform, build_vein_transform
+from utils.runtime import build_data_loader, resolve_device
+from utils.scenarios import SSFD_SCENARIOS
 
 
-SPLITS = ("complete", "palmprint_missing", "palmvein_missing")
+SPLITS = SSFD_SCENARIOS
 
 
 def build_model(ckpt, device):
@@ -22,8 +23,10 @@ def build_model(ckpt, device):
     input_size = ckpt_args.get("input_size", 224)
     num_classes = ckpt["num_classes"]
     state = ckpt["model"]
-    palm_encoder = build_encoder("palm", input_channel=3, input_size=input_size, embedding_size=dim).to(device)
-    vein_encoder = build_encoder("vein", input_channel=3, input_size=input_size, embedding_size=dim).to(device)
+    if any(key.startswith(("p2v.net.", "v2p.net.")) for key in state):
+        raise ValueError("This checkpoint uses the removed MLP recovery model; train a diffusion checkpoint first")
+    palm_encoder = build_encoder("palm", input_channel=3, embedding_size=dim).to(device)
+    vein_encoder = build_encoder("vein", input_channel=3, embedding_size=dim).to(device)
     palm_teacher = None
     vein_teacher = None
     if any(key.startswith("palm_teacher.") for key in state):
@@ -45,7 +48,6 @@ def build_model(ckpt, device):
         vein_encoder,
         num_classes,
         dim=dim,
-        cmft_hidden=ckpt_args.get("cmft_hidden", 1024),
         heads=ckpt_args.get("attn_heads", 4),
         reduction=ckpt_args.get("channel_reduction", 4),
         arcface_s=ckpt_args.get("arcface_s", 32.0),
@@ -53,6 +55,12 @@ def build_model(ckpt, device):
         palm_teacher=palm_teacher,
         vein_teacher=vein_teacher,
         gate_init=ckpt_args.get("missing_gate_init", 0.0),
+        diffusion_steps=ckpt_args.get("diffusion_steps", 100),
+        ddim_steps=ckpt_args.get("ddim_steps", 20),
+        diffusion_base_channels=ckpt_args.get("diffusion_base_channels", 64),
+        diffusion_time_dim=ckpt_args.get("diffusion_time_dim", 128),
+        diffusion_dropout=ckpt_args.get("diffusion_dropout", 0.0),
+        diffusion_stats_momentum=ckpt_args.get("diffusion_stats_momentum", 0.99),
     ).to(device)
     state = {
         key: value
@@ -80,52 +88,62 @@ def build_loader(protocol_list, split_name, img_size, batch_size, num_workers):
     )
     if len(dataset) == 0:
         return None
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
+    return build_data_loader(dataset, batch_size, num_workers)
 
 
 @torch.no_grad()
-def evaluate_split(model, loader, split_name, device):
-    correct = total = 0
-    embeddings, all_labels = [], []
-    for palm, vein, labels, mask in tqdm(loader, desc=f"Evaluate {split_name}", dynamic_ncols=True, leave=False):
+def extract_embeddings(model, loader, description, device):
+    embeddings, labels = [], []
+    for palm, vein, batch_labels, mask in tqdm(loader, desc=description, dynamic_ncols=True, leave=False):
         palm = palm.to(device, non_blocking=True)
         vein = vein.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
         output = model(palm, vein, mask=mask)
-        logits = output["logits"]
-        correct += (logits.argmax(1) == labels).sum().item()
-        total += labels.size(0)
         embeddings.append(output["z"].cpu())
-        all_labels.append(labels.cpu())
-    eer = eer_from_embeddings(torch.cat(embeddings), torch.cat(all_labels)) if embeddings else float("nan")
-    return correct / max(total, 1), eer, total
+        labels.append(batch_labels)
+    return torch.cat(embeddings), torch.cat(labels)
+
+
+def print_metrics(split_name, metrics):
+    print(f"\n[{split_name}]")
+    print("\n".join(format_gallery_probe_metrics(metrics)))
 
 
 def evaluate(args):
-    device = torch.device("cuda" if torch.cuda.is_available() and args.device == "cuda" else "cpu")
+    device = resolve_device(args.device)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
     model, img_size = load_model(args.ckpt, device)
+    gallery_loader = build_loader(args.gallery_list, None, img_size, args.batch_size, args.num_workers)
+    gallery_embeddings, gallery_labels = extract_embeddings(model, gallery_loader, "Build gallery", device)
     for split_name in SPLITS:
         loader = build_loader(args.protocol_list, split_name, img_size, args.batch_size, args.num_workers)
         if loader is None:
             continue
-        acc, eer, total = evaluate_split(model, loader, split_name, device)
-        print(f"{split_name}: Samples={total}, Recognition Rate (%): {acc * 100:.2f}, EER (%): {eer * 100:.2f}")
+        probe_embeddings, probe_labels = extract_embeddings(model, loader, f"Evaluate {split_name}", device)
+        metrics = gallery_probe_metrics(
+            gallery_embeddings,
+            gallery_labels,
+            probe_embeddings,
+            probe_labels,
+            topk=args.top_k,
+            far_points=args.far_points,
+        )
+        print_metrics(split_name, metrics)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser("Evaluate missing-modality recognizer")
-    parser.add_argument("--protocol_list", default="data_txt/cumt/ssfd_test_protocol.txt")
+    parser.add_argument("--gallery_list", default="data_txt/tongji/ssfd_train_full.txt")
+    parser.add_argument("--protocol_list", default="data_txt/tongji/ssfd_test_protocol.txt")
     parser.add_argument("--ckpt", default="outputs/missing_model/best.pth")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--top_k", type=int, nargs="+", default=[1, 5])
+    parser.add_argument("--far_points", type=float, nargs="+", default=[1e-4, 1e-5])
     return parser.parse_args(argv)
 
 
