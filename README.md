@@ -115,6 +115,19 @@ python test_encoder.py --modality vein --ckpt outputs/encoders/vein_best.pth
 python test_missing_model.py --ckpt outputs/missing_model/best.pth
 ```
 
+Run the missing-modality diagnostics with the same DDIM samples used by the normal evaluation:
+
+```bash
+python test_missing_model.py \
+  --ckpt outputs/missing_model/best_safe_residual.pth \
+  --seed 42 \
+  --diagnostics
+```
+
+For each missing scenario, diagnostics report the real available modality against the complete-fusion Gallery and
+the pure diffusion-recovered target modality against its corresponding real single-modality Gallery. This separates
+cross-scenario embedding mismatch from poor diffusion recovery without repeating DDIM sampling.
+
 Evaluation builds one complete-modality Gallery template per held-out test identity by averaging its Gallery
 embeddings. Probe samples are matched to the L2-normalized Gallery templates with cosine similarity. Each modality
 condition reports:
