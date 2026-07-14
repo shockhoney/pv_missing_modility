@@ -23,6 +23,8 @@ DATASET_CONFIGS = {
         "root_dir": "data/tongji",
         "palm_dir": "palm_session1",
         "vein_dir": "vein_session1",
+        "probe_palm_dir": "palm_session2",
+        "probe_vein_dir": "vein_session2",
         "gallery_count": 8,
         "probe_count": 2,
         "class_count": 600,
@@ -141,10 +143,9 @@ def _split_gallery_probe(samples, dataset: str, class_id: str, seed: int, config
     return {"gallery": sorted(gallery), "probe": sorted(probe)}
 
 
-def _collect_pairs(root_dir: str, dataset: str):
-    config = DATASET_CONFIGS[dataset]
-    palm_root = _path(os.path.join(root_dir, config["palm_dir"]))
-    vein_root = _path(os.path.join(root_dir, config["vein_dir"]))
+def _collect_pairs(root_dir: str, palm_subdir: str, vein_subdir: str, expected: int):
+    palm_root = _path(os.path.join(root_dir, palm_subdir))
+    vein_root = _path(os.path.join(root_dir, vein_subdir))
     if not os.path.isdir(palm_root):
         raise FileNotFoundError(f"Palm directory not found: {palm_root}")
     if not os.path.isdir(vein_root):
@@ -157,11 +158,16 @@ def _collect_pairs(root_dir: str, dataset: str):
         if not os.path.isdir(palm_dir) or not os.path.isdir(vein_dir):
             continue
         samples = _paired_samples(palm_dir, vein_dir)
-        expected = config["gallery_count"] + config["probe_count"]
         if len(samples) != expected:
             raise RuntimeError(f"Class {class_id} has {len(samples)} paired samples; expected exactly {expected}")
         pairs[class_id] = samples
     return pairs
+
+
+def _cross_session_gallery_probe(gallery_samples, probe_samples, dataset, class_id, seed, config):
+    gallery_split = _split_gallery_probe(gallery_samples, dataset, class_id, seed, config)
+    probe_split = _split_gallery_probe(probe_samples, dataset, class_id, seed, config)
+    return {"gallery": gallery_split["gallery"], "probe": probe_split["probe"]}
 
 
 def _split_identity_ids(class_ids, dataset: str, seed: int, config):
@@ -202,7 +208,8 @@ def _ssfd_test_protocol(pairs, class_ids):
 def build_ssfd_protocols(root_dir: str, output_dir: str, dataset: str, seed: int = 2026):
     dataset = dataset.lower()
     config = DATASET_CONFIGS[dataset]
-    pairs = _collect_pairs(root_dir, dataset)
+    expected_pairs = config["gallery_count"] + config["probe_count"]
+    pairs = _collect_pairs(root_dir, config["palm_dir"], config["vein_dir"], expected_pairs)
     class_ids = sorted(pairs)
     if not class_ids:
         raise RuntimeError(f"No paired samples found under: {root_dir}")
@@ -211,10 +218,26 @@ def build_ssfd_protocols(root_dir: str, output_dir: str, dataset: str, seed: int
         raise RuntimeError(f"{dataset} has {len(class_ids)} paired classes; expected {expected_classes}")
 
     train_ids, test_ids = _split_identity_ids(class_ids, dataset, seed, config)
-    test_pairs = {
-        class_id: _split_gallery_probe(pairs[class_id], dataset, class_id, seed, config)
-        for class_id in test_ids
-    }
+    if "probe_palm_dir" in config:
+        probe_source = _collect_pairs(
+            root_dir,
+            config["probe_palm_dir"],
+            config["probe_vein_dir"],
+            expected_pairs,
+        )
+        if set(probe_source) != set(pairs):
+            raise RuntimeError(f"{dataset} Gallery and Probe sessions contain different identity sets")
+        test_pairs = {
+            class_id: _cross_session_gallery_probe(
+                pairs[class_id], probe_source[class_id], dataset, class_id, seed, config
+            )
+            for class_id in test_ids
+        }
+    else:
+        test_pairs = {
+            class_id: _split_gallery_probe(pairs[class_id], dataset, class_id, seed, config)
+            for class_id in test_ids
+        }
     gallery_pairs = {class_id: test_pairs[class_id]["gallery"] for class_id in test_ids}
     probe_pairs = {class_id: test_pairs[class_id]["probe"] for class_id in test_ids}
     payload = {

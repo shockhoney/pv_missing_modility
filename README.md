@@ -39,15 +39,16 @@ are split into a complete-modality Gallery and Probes using the original per-ide
 
 | Dataset | Train / test identities | Train pairs | Gallery / Probe pairs per test identity | Total Gallery / Probes |
 | --- | ---: | ---: | ---: | ---: |
-| Tongji Session 1 | 480 / 120 | 4800 | 8 / 2 | 960 / 240 |
+| Tongji Session 1 -> 2 | 480 / 120 | 4800 | 8 / 2 | 960 / 240 |
 | CUMT | 232 / 58 | 2320 | 8 / 2 | 464 / 116 |
 | PolyU | 417 / 83 | 5004 | 10 / 2 | 830 / 166 |
 | CASIA | 133 / 67 | 798 | 4 / 2 | 268 / 134 |
 
 Each palmprint-palm-vein pair stays in the same split, and training identities never occur in the Gallery or Probe
 sets. Every Probe identity is enrolled in the held-out Gallery, so evaluation remains closed-set identification while
-testing generalization to unseen identities. Tongji still uses only Session 1 and must not be described as
-cross-session evaluation. CUMT, PolyU, and CASIA reserve one Probe pair from each acquisition half/session.
+testing generalization to unseen identities. Tongji trains on Session 1, builds the held-out test-identity Gallery
+from eight Session 1 pairs, and uses two Session 2 pairs as Probes. CUMT, PolyU, and CASIA keep their previous
+within-dataset protocols and reserve one Probe pair from each acquisition half/session.
 
 Generated files:
 
