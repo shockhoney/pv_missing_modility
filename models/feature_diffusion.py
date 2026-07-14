@@ -119,17 +119,23 @@ class ConditionalFeatureDiffusion(nn.Module):
         dropout: float = 0.0,
         stats_momentum: float = 0.99,
         clip_value: float = 5.0,
+        high_noise_min_ratio: float = 0.8,
+        high_noise_max_ratio: float = 0.95,
     ):
         super().__init__()
         if num_steps <= 1:
             raise ValueError("num_steps must be greater than 1")
         if ddim_steps <= 0:
             raise ValueError("ddim_steps must be positive")
+        if not 0.0 <= high_noise_min_ratio < high_noise_max_ratio <= 1.0:
+            raise ValueError("high-noise ratios must satisfy 0 <= min < max <= 1")
 
         self.num_steps = num_steps
         self.ddim_steps = min(ddim_steps, num_steps)
         self.stats_momentum = stats_momentum
         self.clip_value = clip_value
+        self.high_noise_min_ratio = high_noise_min_ratio
+        self.high_noise_max_ratio = high_noise_max_ratio
         self.denoiser = ConditionalFeatureUNet(
             feature_channels=feature_channels,
             base_channels=base_channels,
@@ -188,6 +194,13 @@ class ConditionalFeatureDiffusion(nn.Module):
             + _extract(self.sqrt_one_minus_alpha_bars, timesteps, clean_target) * noise
         )
 
+    def _sample_timesteps(self, batch_size: int, device: torch.device, high_noise=False) -> torch.Tensor:
+        if not high_noise:
+            return torch.randint(0, self.num_steps, (batch_size,), device=device)
+        lower = min(int(self.num_steps * self.high_noise_min_ratio), self.num_steps - 1)
+        upper = min(max(int(self.num_steps * self.high_noise_max_ratio), lower + 1), self.num_steps)
+        return torch.randint(lower, upper, (batch_size,), device=device)
+
     def predict_clean_target(
         self,
         noisy_target: torch.Tensor,
@@ -203,15 +216,23 @@ class ConditionalFeatureDiffusion(nn.Module):
         self._update_statistics(condition.detach(), target.detach())
         condition_normalized = self._normalize_condition(condition)
         target_normalized = self._normalize_target(target)
-        timesteps = torch.randint(0, self.num_steps, (target.size(0),), device=target.device)
+
+        timesteps = self._sample_timesteps(target.size(0), target.device)
         noise = torch.randn_like(target_normalized)
         noisy_target = self.q_sample(target_normalized, timesteps, noise)
         predicted_noise = self.denoiser(noisy_target, condition_normalized, timesteps)
-        predicted_clean = self.predict_clean_target(noisy_target, timesteps, predicted_noise)
+
+        high_timesteps = self._sample_timesteps(target.size(0), target.device, high_noise=True)
+        high_noise = torch.randn_like(target_normalized)
+        high_noisy_target = self.q_sample(target_normalized, high_timesteps, high_noise)
+        high_predicted_noise = self.denoiser(high_noisy_target, condition_normalized, high_timesteps)
+        predicted_clean = self.predict_clean_target(high_noisy_target, high_timesteps, high_predicted_noise)
 
         return {
             "feature": self._denormalize_target(predicted_clean),
-            "diffusion_loss": F.mse_loss(predicted_noise, noise),
+            "diffusion_loss": 0.5 * (
+                F.mse_loss(predicted_noise, noise) + F.mse_loss(high_predicted_noise, high_noise)
+            ),
             "reconstruction_loss": F.l1_loss(predicted_clean, target_normalized),
         }
 

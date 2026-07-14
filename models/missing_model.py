@@ -86,30 +86,18 @@ class CrossChannelFusion(nn.Module):
         self.available_fusion = AvailableGuidedFusion(dim, reduction)
         self.project = nn.Linear(dim, dim)
 
-    def project_feature(self, feature):
-        return F.normalize(self.project(feature), dim=1)
-
-    def available_only(self, feature):
-        return self.project_feature(F.normalize(feature, dim=1))
-
     def forward(self, palm_feat, vein_feat, scenario=COMPLETE):
         if scenario == PALMPRINT_MISSING:
-            fused = self.available_fusion(vein_feat, palm_feat)
-        elif scenario == PALMVEIN_MISSING:
-            fused = self.available_fusion(palm_feat, vein_feat)
-        else:
-            palm_feat, vein_feat = self.cross_attention(palm_feat, vein_feat)
-            fused = self.channel_attention(palm_feat, vein_feat)
-        return self.project_feature(fused)
+            return self.available_fusion(vein_feat, palm_feat)
+        if scenario == PALMVEIN_MISSING:
+            return self.available_fusion(palm_feat, vein_feat)
+        palm_feat, vein_feat = self.cross_attention(palm_feat, vein_feat)
+        return F.normalize(self.project(self.channel_attention(palm_feat, vein_feat)), dim=1)
 
 
 def cosine_alignment_loss(pred, target, detach_target=True):
     target = target.detach() if detach_target else target
     return (1.0 - F.cosine_similarity(pred, target, dim=1)).mean()
-
-
-def shared_alignment_loss(palm_shared, vein_shared):
-    return cosine_alignment_loss(palm_shared, vein_shared, detach_target=False)
 
 
 class MissingModalityRecognizer(nn.Module):
@@ -132,6 +120,8 @@ class MissingModalityRecognizer(nn.Module):
         diffusion_time_dim=128,
         diffusion_dropout=0.0,
         diffusion_stats_momentum=0.99,
+        high_noise_min_ratio=0.8,
+        high_noise_max_ratio=0.95,
     ):
         super().__init__()
         if dim % 2 != 0:
@@ -153,6 +143,8 @@ class MissingModalityRecognizer(nn.Module):
             time_dim=diffusion_time_dim,
             dropout=diffusion_dropout,
             stats_momentum=diffusion_stats_momentum,
+            high_noise_min_ratio=high_noise_min_ratio,
+            high_noise_max_ratio=high_noise_max_ratio,
         )
         self.p2v = ConditionalFeatureDiffusion(**diffusion_kwargs)
         self.v2p = ConditionalFeatureDiffusion(**diffusion_kwargs)

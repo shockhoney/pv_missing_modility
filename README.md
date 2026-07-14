@@ -16,11 +16,11 @@ The current main route is intentionally simple:
    - distillation to the available single-modality teacher.
 5. Freeze the trained diffusion recoverers and fine-tune fusion with the same full DDIM samples used at test time.
 
-The diffusion models operate on the frozen encoders' 2D feature maps. The first training stage uses the DDPM
-noise-prediction objective plus feature reconstruction and identity-aware recognition losses. The second stage
-freezes both recoverers, generates missing features with the same DDIM sampler used for inference, and aligns the
-complete and missing-scenario embeddings. The missing model does not fine-tune encoders, so the available-modality
-baseline stays fixed.
+The diffusion models operate on the frozen encoders' 2D feature maps. The first training stage keeps the standard
+DDPM objective over all timesteps and adds a high-noise conditional branch for feature reconstruction, target-teacher
+identity supervision, and specific-feature alignment. The second stage freezes both recoverers, generates missing
+features with the same DDIM sampler used for inference, and aligns the complete and missing-scenario embeddings. The
+missing model does not fine-tune encoders, so the available-modality baseline stays fixed.
 
 ## Protocol
 
@@ -90,7 +90,14 @@ python train_missing_model.py
 This runs 200 epochs of diffusion training and then 40 epochs of sampled-feature fusion fine-tuning. The first-stage
 checkpoint is saved to `outputs/missing_model/diffusion_best.pth`; the final checkpoint is saved to
 `outputs/missing_model/best.pth`. The default diffusion configuration uses 100 training steps and 20 DDIM sampling
-steps. It can be changed with `--diffusion_steps` and `--ddim_steps`.
+steps. Identity-aware recovery uses the 80%-95% high-noise timestep interval by default, avoiding the numerically
+degenerate final steps. These settings can be changed with `--diffusion_steps`, `--ddim_steps`,
+`--high_noise_min_ratio`, and `--high_noise_max_ratio`. The extra high-noise denoiser pass makes the diffusion stage
+slower than the previous training objective.
+
+Diffusion checkpoints trained before the high-noise conditional branch was introduced are structurally loadable but
+must not be reused as final recoverers, because they did not receive high-noise identity supervision. Re-run the full
+missing-model training while reusing the existing palm and vein encoder checkpoints.
 
 To fine-tune fusion directly from an existing diffusion checkpoint without retraining the recoverers:
 
@@ -124,10 +131,9 @@ python test_missing_model.py \
   --diagnostics
 ```
 
-For each missing scenario, diagnostics report the real available modality after the shared final projection against
-the complete-fusion Gallery, and the pure diffusion-recovered target modality against its corresponding real
-single-modality Gallery. This separates cross-scenario embedding mismatch from poor diffusion recovery without
-repeating DDIM sampling.
+For each missing scenario, diagnostics report the real available modality against the complete-fusion Gallery and
+the pure diffusion-recovered target modality against its corresponding real single-modality Gallery. This separates
+cross-scenario embedding mismatch from poor diffusion recovery without repeating DDIM sampling.
 
 Evaluation builds one complete-modality Gallery template per held-out test identity by averaging its Gallery
 embeddings. Probe samples are matched to the L2-normalized Gallery templates with cosine similarity. Each modality

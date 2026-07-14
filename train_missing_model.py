@@ -8,7 +8,6 @@ from tqdm import tqdm
 from models.missing_model import (
     MissingModalityRecognizer,
     cosine_alignment_loss,
-    shared_alignment_loss,
 )
 from utils.checkpoint import load_arcface_from_checkpoint, load_encoder_from_checkpoint, save_checkpoint
 from utils.checkpoint_io import safe_torch_load
@@ -68,6 +67,8 @@ def make_model(args, num_classes, device):
         diffusion_time_dim=args.diffusion_time_dim,
         diffusion_dropout=args.diffusion_dropout,
         diffusion_stats_momentum=args.diffusion_stats_momentum,
+        high_noise_min_ratio=args.high_noise_min_ratio,
+        high_noise_max_ratio=args.high_noise_max_ratio,
     ).to(device)
 
 
@@ -129,7 +130,6 @@ def batch_losses(model, palm, vein, labels, ce, args):
         + cosine_alignment_loss(outputs[COMPLETE]["hat_palm_specific"], outputs[COMPLETE]["palm_specific"])
     )
     recovery_id_loss = recovery_identity_loss(model, recovery, labels, ce)
-    shared_loss = shared_alignment_loss(outputs[COMPLETE]["palm_shared"], outputs[COMPLETE]["vein_shared"])
     anchor = anchor_loss(model, outputs[COMPLETE], labels, ce)
     avail_loss = 0.5 * (
         cosine_alignment_loss(outputs[PALMPRINT_MISSING]["z"], outputs[COMPLETE]["f_vein"])
@@ -142,7 +142,6 @@ def batch_losses(model, palm, vein, labels, ce, args):
         + args.lambda_diffusion_rec * recovery["reconstruction_loss"]
         + args.lambda_recovery_id * recovery_id_loss
         + args.lambda_anchor * anchor
-        + args.lambda_shared * shared_loss
         + args.lambda_recovery_alignment * recovery_alignment_loss
         + args.lambda_avail * avail_loss
         + args.lambda_distill * distill
@@ -154,7 +153,6 @@ def batch_losses(model, palm, vein, labels, ce, args):
         "diffusion_rec": recovery["reconstruction_loss"],
         "recovery_id": recovery_id_loss,
         "recovery_align": recovery_alignment_loss,
-        "shared": shared_loss,
         "anchor": anchor,
         "avail": avail_loss,
         "distill": distill,
@@ -265,7 +263,6 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
             "diffusion_rec",
             "recovery_id",
             "recovery_align",
-            "shared",
             "anchor",
             "avail",
             "distill",
@@ -353,11 +350,12 @@ def parse_args(argv=None):
     parser.add_argument("--diffusion_time_dim", type=int, default=128)
     parser.add_argument("--diffusion_dropout", type=float, default=0.0)
     parser.add_argument("--diffusion_stats_momentum", type=float, default=0.99)
+    parser.add_argument("--high_noise_min_ratio", type=float, default=0.8)
+    parser.add_argument("--high_noise_max_ratio", type=float, default=0.95)
     parser.add_argument("--lambda_diffusion", type=float, default=1.0)
     parser.add_argument("--lambda_diffusion_rec", type=float, default=0.5)
     parser.add_argument("--lambda_recovery_id", type=float, default=0.5)
     parser.add_argument("--lambda_recovery_alignment", type=float, default=0.1)
-    parser.add_argument("--lambda_shared", type=float, default=0.05)
     parser.add_argument("--lambda_anchor", type=float, default=1.0)
     parser.add_argument("--lambda_avail", type=float, default=0.1)
     parser.add_argument("--lambda_distill", type=float, default=0.1)
