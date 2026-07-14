@@ -14,10 +14,13 @@ The current main route is intentionally simple:
    - available-guided fusion,
    - logit-level gated ensemble,
    - distillation to the available single-modality teacher.
+5. Freeze the trained diffusion recoverers and fine-tune fusion with the same full DDIM samples used at test time.
 
-The diffusion models operate on the frozen encoders' 2D feature maps. Training uses the DDPM noise-prediction
-objective plus feature reconstruction and identity-aware recognition losses; inference uses DDIM sampling. The
-missing model does not fine-tune encoders, so the available-modality baseline stays fixed.
+The diffusion models operate on the frozen encoders' 2D feature maps. The first training stage uses the DDPM
+noise-prediction objective plus feature reconstruction and identity-aware recognition losses. The second stage
+freezes both recoverers, generates missing features with the same DDIM sampler used for inference, and aligns the
+complete and missing-scenario embeddings. The missing model does not fine-tune encoders, so the available-modality
+baseline stays fixed.
 
 ## Protocol
 
@@ -84,8 +87,23 @@ Train the missing-modality recognizer:
 python train_missing_model.py
 ```
 
-The default diffusion configuration uses 100 training steps and 20 DDIM sampling steps. It can be changed with
-`--diffusion_steps` and `--ddim_steps`.
+This runs 200 epochs of diffusion training and then 40 epochs of sampled-feature fusion fine-tuning. The first-stage
+checkpoint is saved to `outputs/missing_model/diffusion_best.pth`; the final checkpoint is saved to
+`outputs/missing_model/best.pth`. The default diffusion configuration uses 100 training steps and 20 DDIM sampling
+steps. It can be changed with `--diffusion_steps` and `--ddim_steps`.
+
+To fine-tune fusion directly from an existing diffusion checkpoint without retraining the recoverers:
+
+```bash
+python train_missing_model.py \
+  --stage fusion \
+  --diffusion_ckpt outputs/missing_model/best.pth \
+  --save_path outputs/missing_model/best_sampled.pth
+```
+
+The fusion stage performs full DDIM sampling online under `no_grad`, so it is slower than ordinary classifier
+fine-tuning but does not backpropagate through the sampling trajectory. Use a different output path when reusing an
+existing checkpoint so that the source checkpoint remains available for comparison.
 
 ## Test
 

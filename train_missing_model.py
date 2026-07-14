@@ -11,6 +11,7 @@ from models.missing_model import (
     shared_alignment_loss,
 )
 from utils.checkpoint import load_arcface_from_checkpoint, load_encoder_from_checkpoint, save_checkpoint
+from utils.checkpoint_io import safe_torch_load
 from utils.datasets_txt import MissingPairTxtDataset, infer_num_classes
 from utils.evaluation import recognition_rate
 from utils.preprocess import build_palm_transform, build_vein_transform
@@ -19,6 +20,8 @@ from utils.scenarios import COMPLETE, PALMPRINT_MISSING, PALMVEIN_MISSING, SSFD_
 
 
 SCENARIOS = SSFD_SCENARIOS
+DIFFUSION_STAGE = "diffusion"
+FUSION_STAGE = "fusion"
 
 
 def make_loader(list_path, args, train=False):
@@ -30,9 +33,11 @@ def make_loader(list_path, args, train=False):
     return build_data_loader(dataset, args.batch_size, args.num_workers, train=train)
 
 
-def make_optimizer(model, args):
+def make_optimizer(model, lr, weight_decay):
     params = [param for param in model.parameters() if param.requires_grad]
-    return torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
+    if not params:
+        raise ValueError("No trainable parameters found")
+    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
 
 def make_model(args, num_classes, device):
@@ -80,6 +85,31 @@ def missing_distillation_loss(output):
     return distillation_loss(output["fusion_logits_raw"], output["teacher_logits_raw"])
 
 
+def scenario_outputs(model, encoded, recovery, labels):
+    return {
+        scenario: model.forward_from_encoded(encoded, recovery, labels=labels, scenario=scenario)
+        for scenario in SCENARIOS
+    }
+
+
+def classification_loss(outputs, labels, ce):
+    return sum(ce(outputs[scenario]["logits"], labels) for scenario in SCENARIOS) / len(SCENARIOS)
+
+
+def anchor_loss(model, complete_output, labels, ce):
+    return 0.5 * (
+        ce(model.classifier(complete_output["f_palm"], labels), labels)
+        + ce(model.classifier(complete_output["f_vein"], labels), labels)
+    )
+
+
+def missing_distillation_losses(outputs):
+    return 0.5 * (
+        missing_distillation_loss(outputs[PALMPRINT_MISSING])
+        + missing_distillation_loss(outputs[PALMVEIN_MISSING])
+    )
+
+
 def recovery_identity_loss(model, recovery, labels, ce):
     losses = []
     if model.palm_teacher is not None:
@@ -92,39 +122,30 @@ def recovery_identity_loss(model, recovery, labels, ce):
 def batch_losses(model, palm, vein, labels, ce, args):
     encoded = model.encode_modalities(palm, vein)
     recovery = model.recover_modalities(encoded, training_recovery=True)
-    outputs = {
-        scenario: model.forward_from_encoded(encoded, recovery, labels=labels, scenario=scenario)
-        for scenario in SCENARIOS
-    }
-    cls_loss = sum(ce(outputs[scenario]["logits"], labels) for scenario in SCENARIOS) / len(SCENARIOS)
+    outputs = scenario_outputs(model, encoded, recovery, labels)
+    cls_loss = classification_loss(outputs, labels, ce)
     recovery_alignment_loss = 0.5 * (
         cosine_alignment_loss(outputs[COMPLETE]["hat_vein_specific"], outputs[COMPLETE]["vein_specific"])
         + cosine_alignment_loss(outputs[COMPLETE]["hat_palm_specific"], outputs[COMPLETE]["palm_specific"])
     )
     recovery_id_loss = recovery_identity_loss(model, recovery, labels, ce)
     shared_loss = shared_alignment_loss(outputs[COMPLETE]["palm_shared"], outputs[COMPLETE]["vein_shared"])
-    anchor_loss = 0.5 * (
-        ce(model.classifier(outputs[COMPLETE]["f_palm"], labels), labels)
-        + ce(model.classifier(outputs[COMPLETE]["f_vein"], labels), labels)
-    )
+    anchor = anchor_loss(model, outputs[COMPLETE], labels, ce)
     avail_loss = 0.5 * (
         cosine_alignment_loss(outputs[PALMPRINT_MISSING]["z"], outputs[COMPLETE]["f_vein"])
         + cosine_alignment_loss(outputs[PALMVEIN_MISSING]["z"], outputs[COMPLETE]["f_palm"])
     )
-    distill_loss = 0.5 * (
-        missing_distillation_loss(outputs[PALMPRINT_MISSING])
-        + missing_distillation_loss(outputs[PALMVEIN_MISSING])
-    )
+    distill = missing_distillation_losses(outputs)
     loss = (
         cls_loss
         + args.lambda_diffusion * recovery["diffusion_loss"]
         + args.lambda_diffusion_rec * recovery["reconstruction_loss"]
         + args.lambda_recovery_id * recovery_id_loss
-        + args.lambda_anchor * anchor_loss
+        + args.lambda_anchor * anchor
         + args.lambda_shared * shared_loss
         + args.lambda_recovery_alignment * recovery_alignment_loss
         + args.lambda_avail * avail_loss
-        + args.lambda_distill * distill_loss
+        + args.lambda_distill * distill
     )
     return {
         "loss": loss,
@@ -134,36 +155,72 @@ def batch_losses(model, palm, vein, labels, ce, args):
         "recovery_id": recovery_id_loss,
         "recovery_align": recovery_alignment_loss,
         "shared": shared_loss,
-        "anchor": anchor_loss,
+        "anchor": anchor,
         "avail": avail_loss,
-        "distill": distill_loss,
+        "distill": distill,
         "outputs": outputs,
     }
 
 
-def train_epoch(model, loader, optimizer, ce, device, args):
-    model.train()
-    loss_names = (
-        "loss",
-        "cls",
-        "diffusion",
-        "diffusion_rec",
-        "recovery_id",
-        "recovery_align",
-        "shared",
-        "anchor",
-        "avail",
-        "distill",
+def sampled_fusion_losses(model, palm, vein, labels, ce, args):
+    encoded = model.encode_modalities(palm, vein)
+    recovery = model.recover_modalities(encoded, training_recovery=False)
+    outputs = scenario_outputs(model, encoded, recovery, labels)
+    cls_loss = classification_loss(outputs, labels, ce)
+    anchor = anchor_loss(model, outputs[COMPLETE], labels, ce)
+    scenario_alignment = 0.5 * (
+        cosine_alignment_loss(outputs[PALMPRINT_MISSING]["z"], outputs[COMPLETE]["z"])
+        + cosine_alignment_loss(outputs[PALMVEIN_MISSING]["z"], outputs[COMPLETE]["z"])
     )
+    distill = missing_distillation_losses(outputs)
+    loss = (
+        cls_loss
+        + args.lambda_anchor * anchor
+        + args.lambda_scenario * scenario_alignment
+        + args.lambda_distill * distill
+    )
+    return {
+        "loss": loss,
+        "cls": cls_loss,
+        "scenario": scenario_alignment,
+        "anchor": anchor,
+        "distill": distill,
+        "outputs": outputs,
+    }
+
+
+def configure_fusion_stage(model):
+    for param in model.parameters():
+        param.requires_grad = False
+    for module in (model.fusion, model.classifier):
+        for param in module.parameters():
+            param.requires_grad = True
+    model.palm_missing_gate.requires_grad = True
+    model.vein_missing_gate.requires_grad = True
+
+
+def load_model_state(model, checkpoint_path, device, num_classes):
+    checkpoint = safe_torch_load(checkpoint_path, device)
+    if checkpoint.get("num_classes") != num_classes:
+        raise ValueError("Missing-model checkpoint class count does not match train_list")
+    model.load_state_dict(checkpoint["model"])
+    return checkpoint
+
+
+def train_epoch(model, loader, optimizer, ce, device, args, loss_fn, loss_names, description, freeze_diffusion):
+    model.train()
+    if freeze_diffusion:
+        model.p2v.eval()
+        model.v2p.eval()
     sums = {name: 0.0 for name in loss_names}
     sums.update({f"acc_{scenario}": 0.0 for scenario in SCENARIOS})
     total = 0
 
-    for palm, vein, labels, _ in tqdm(loader, desc="Train missing", dynamic_ncols=True):
+    for palm, vein, labels, _ in tqdm(loader, desc=description, dynamic_ncols=True):
         palm = palm.to(device, non_blocking=True)
         vein = vein.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        losses = batch_losses(model, palm, vein, labels, ce, args)
+        losses = loss_fn(model, palm, vein, labels, ce, args)
         loss = losses["loss"]
         if not torch.isfinite(loss):
             continue
@@ -179,7 +236,80 @@ def train_epoch(model, loader, optimizer, ce, device, args):
             sums[name] += losses[name].item() * batch_size
         for scenario in SCENARIOS:
             sums[f"acc_{scenario}"] += recognition_rate(losses["outputs"][scenario]["logits"], labels) * batch_size
-    return {key: value / max(total, 1) for key, value in sums.items()}
+    if total == 0:
+        raise RuntimeError(f"No finite batches were produced during {description}")
+    return {key: value / total for key, value in sums.items()}
+
+
+def train_stage(model, loader, device, args, num_classes, stage, save_path):
+    is_fusion = stage == FUSION_STAGE
+    if is_fusion:
+        configure_fusion_stage(model)
+        epochs = args.fusion_epochs
+        base_lr = args.fusion_lr
+        min_lr = args.fusion_min_lr
+        warmup_epochs = args.fusion_warmup_epochs
+        loss_fn = sampled_fusion_losses
+        loss_names = ("loss", "cls", "scenario", "anchor", "distill")
+    else:
+        epochs = args.epochs
+        base_lr = args.lr
+        min_lr = args.min_lr
+        warmup_epochs = args.warmup_epochs
+        loss_fn = batch_losses
+        loss_names = (
+            "loss",
+            "cls",
+            "diffusion",
+            "diffusion_rec",
+            "recovery_id",
+            "recovery_align",
+            "shared",
+            "anchor",
+            "avail",
+            "distill",
+        )
+
+    optimizer = make_optimizer(model, base_lr, args.wd)
+    ce = nn.CrossEntropyLoss()
+    best = float("inf")
+    print(f"[Info] start {stage} stage: epochs={epochs}, trainable_params={sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    for epoch in range(1, epochs + 1):
+        lr = cosine_annealing_lr(base_lr, min_lr, epochs, warmup_epochs, epoch)
+        set_optimizer_lr(optimizer, lr)
+        stats = train_epoch(
+            model,
+            loader,
+            optimizer,
+            ce,
+            device,
+            args,
+            loss_fn,
+            loss_names,
+            f"Train {stage}",
+            freeze_diffusion=is_fusion,
+        )
+        losses = " ".join(f"{name}={stats[name]:.4f}" for name in loss_names)
+        print(
+            f"[{stage} Epoch {epoch}] {losses} "
+            f"acc_c={stats['acc_complete']:.4f} acc_pm={stats['acc_palmprint_missing']:.4f} "
+            f"acc_vm={stats['acc_palmvein_missing']:.4f} lr={lr:.6g}"
+        )
+        if stats["loss"] < best:
+            best = stats["loss"]
+            save_checkpoint(
+                save_path,
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "args": vars(args),
+                    "num_classes": num_classes,
+                    "best_loss": best,
+                    "training_stage": stage,
+                },
+            )
+            print(f"[Info] saved {save_path} by {stage}_train_loss")
 
 
 def train(args):
@@ -187,36 +317,14 @@ def train(args):
     num_classes = infer_num_classes(args.train_list)
     train_loader = make_loader(args.train_list, args, train=True)
     model = make_model(args, num_classes, device)
-    optimizer = make_optimizer(model, args)
-    ce = nn.CrossEntropyLoss()
-    best = float("inf")
 
-    for epoch in range(1, args.epochs + 1):
-        lr = cosine_annealing_lr(args.lr, args.min_lr, args.epochs, args.warmup_epochs, epoch)
-        set_optimizer_lr(optimizer, lr)
-        stats = train_epoch(model, train_loader, optimizer, ce, device, args)
-        print(
-            f"[Epoch {epoch}] loss={stats['loss']:.4f} cls={stats['cls']:.4f} "
-            f"diff={stats['diffusion']:.4f} rec={stats['diffusion_rec']:.4f} "
-            f"rec_id={stats['recovery_id']:.4f} align={stats['recovery_align']:.4f} "
-            f"shared={stats['shared']:.4f} "
-            f"anchor={stats['anchor']:.4f} avail={stats['avail']:.4f} distill={stats['distill']:.4f} "
-            f"acc_c={stats['acc_complete']:.4f} acc_pm={stats['acc_palmprint_missing']:.4f} "
-            f"acc_vm={stats['acc_palmvein_missing']:.4f} lr={lr:.6g}"
-        )
-        if stats["loss"] < best:
-            best = stats["loss"]
-            save_checkpoint(
-                args.save_path,
-                {
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "args": vars(args),
-                    "num_classes": num_classes,
-                    "best_loss": best,
-                },
-            )
-            print(f"[Info] saved {args.save_path} by train_loss")
+    if args.stage in ("all", DIFFUSION_STAGE):
+        train_stage(model, train_loader, device, args, num_classes, DIFFUSION_STAGE, args.diffusion_ckpt)
+        if args.stage == DIFFUSION_STAGE:
+            return
+
+    load_model_state(model, args.diffusion_ckpt, device, num_classes)
+    train_stage(model, train_loader, device, args, num_classes, FUSION_STAGE, args.save_path)
 
 
 def parse_args(argv=None):
@@ -224,8 +332,11 @@ def parse_args(argv=None):
     parser.add_argument("--train_list", default="data_txt/tongji/ssfd_train_full.txt")
     parser.add_argument("--palm_ckpt", default="outputs/encoders/palm_best.pth")
     parser.add_argument("--vein_ckpt", default="outputs/encoders/vein_best.pth")
+    parser.add_argument("--diffusion_ckpt", default="outputs/missing_model/diffusion_best.pth")
     parser.add_argument("--save_path", default="outputs/missing_model/best.pth")
+    parser.add_argument("--stage", choices=["all", DIFFUSION_STAGE, FUSION_STAGE], default="all")
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--fusion_epochs", type=int, default=40)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
@@ -247,13 +358,17 @@ def parse_args(argv=None):
     parser.add_argument("--lambda_anchor", type=float, default=1.0)
     parser.add_argument("--lambda_avail", type=float, default=0.1)
     parser.add_argument("--lambda_distill", type=float, default=0.1)
+    parser.add_argument("--lambda_scenario", type=float, default=0.5)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min_lr", type=float, default=0.0)
+    parser.add_argument("--fusion_lr", type=float, default=1e-4)
+    parser.add_argument("--fusion_min_lr", type=float, default=1e-6)
     parser.add_argument("--wd", type=float, default=1e-4)
     parser.add_argument("--arcface_s", type=float, default=32.0)
     parser.add_argument("--arcface_m", type=float, default=0.25)
     parser.add_argument("--missing_gate_init", type=float, default=0.0)
     parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.add_argument("--fusion_warmup_epochs", type=int, default=2)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     return parser.parse_args(argv)
 
