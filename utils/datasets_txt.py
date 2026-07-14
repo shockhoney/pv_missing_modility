@@ -15,6 +15,7 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 NA_TOKEN = "NA"
 SSFD_PROTOCOL_FILES = {
     "ssfd_train_full": "ssfd_train_full.txt",
+    "ssfd_gallery_full": "ssfd_gallery_full.txt",
     "ssfd_test_protocol": "ssfd_test_protocol.txt",
 }
 DATASET_CONFIGS = {
@@ -22,8 +23,8 @@ DATASET_CONFIGS = {
         "root_dir": "data/tongji",
         "palm_dir": "palm_session1",
         "vein_dir": "vein_session1",
-        "train_count": 8,
-        "test_count": 2,
+        "gallery_count": 8,
+        "probe_count": 2,
         "class_count": 600,
         "session_split": False,
     },
@@ -31,8 +32,8 @@ DATASET_CONFIGS = {
         "root_dir": "data/CUMT",
         "palm_dir": "palmprint",
         "vein_dir": "palmvein",
-        "train_count": 8,
-        "test_count": 2,
+        "gallery_count": 8,
+        "probe_count": 2,
         "class_count": 290,
         "session_split": True,
     },
@@ -40,8 +41,8 @@ DATASET_CONFIGS = {
         "root_dir": "data/PolyU",
         "palm_dir": "Green",
         "vein_dir": "NIR",
-        "train_count": 10,
-        "test_count": 2,
+        "gallery_count": 10,
+        "probe_count": 2,
         "class_count": 500,
         "session_split": True,
     },
@@ -49,8 +50,8 @@ DATASET_CONFIGS = {
         "root_dir": "data/CASIA",
         "palm_dir": "vi",
         "vein_dir": "ir",
-        "train_count": 4,
-        "test_count": 2,
+        "gallery_count": 4,
+        "probe_count": 2,
         "class_count": 200,
         "session_split": True,
     },
@@ -111,10 +112,10 @@ def _session_key(dataset: str, sample_key: str) -> str:
     return str((index - offset) // group_size)
 
 
-def _split_pairs(samples, dataset: str, class_id: str, seed: int, config):
-    train_count = config["train_count"]
-    test_count = config["test_count"]
-    needed = train_count + test_count
+def _split_gallery_probe(samples, dataset: str, class_id: str, seed: int, config):
+    gallery_count = config["gallery_count"]
+    probe_count = config["probe_count"]
+    needed = gallery_count + probe_count
     if len(samples) != needed:
         raise RuntimeError(f"Class {class_id} has {len(samples)} paired samples; expected exactly {needed}")
 
@@ -122,25 +123,25 @@ def _split_pairs(samples, dataset: str, class_id: str, seed: int, config):
     if not config["session_split"]:
         shuffled = list(samples)
         rng.shuffle(shuffled)
-        return {"train": sorted(shuffled[:train_count]), "test": sorted(shuffled[train_count:])}
+        return {"gallery": sorted(shuffled[:gallery_count]), "probe": sorted(shuffled[gallery_count:])}
 
     groups = {}
     for sample in samples:
         groups.setdefault(_session_key(dataset, sample[0]), []).append(sample)
-    if len(groups) != test_count:
-        raise RuntimeError(f"Class {class_id} has {len(groups)} session groups; expected {test_count}")
+    if len(groups) != probe_count:
+        raise RuntimeError(f"Class {class_id} has {len(groups)} session groups; expected {probe_count}")
 
-    train, test = [], []
+    gallery, probe = [], []
     for group in groups.values():
         rng.shuffle(group)
-        test.append(group[0])
-        train.extend(group[1:])
-    if len(train) != train_count:
-        raise RuntimeError(f"Class {class_id} produced {len(train)} train pairs; expected {train_count}")
-    return {"train": sorted(train), "test": sorted(test)}
+        probe.append(group[0])
+        gallery.extend(group[1:])
+    if len(gallery) != gallery_count:
+        raise RuntimeError(f"Class {class_id} produced {len(gallery)} gallery pairs; expected {gallery_count}")
+    return {"gallery": sorted(gallery), "probe": sorted(probe)}
 
 
-def _collect_ssfd_pairs(root_dir: str, dataset: str, seed: int):
+def _collect_pairs(root_dir: str, dataset: str):
     config = DATASET_CONFIGS[dataset]
     palm_root = _path(os.path.join(root_dir, config["palm_dir"]))
     vein_root = _path(os.path.join(root_dir, config["vein_dir"]))
@@ -156,8 +157,19 @@ def _collect_ssfd_pairs(root_dir: str, dataset: str, seed: int):
         if not os.path.isdir(palm_dir) or not os.path.isdir(vein_dir):
             continue
         samples = _paired_samples(palm_dir, vein_dir)
-        pairs[class_id] = _split_pairs(samples, dataset, class_id, seed, config)
+        expected = config["gallery_count"] + config["probe_count"]
+        if len(samples) != expected:
+            raise RuntimeError(f"Class {class_id} has {len(samples)} paired samples; expected exactly {expected}")
+        pairs[class_id] = samples
     return pairs
+
+
+def _split_identity_ids(class_ids, dataset: str, seed: int, config):
+    train_fraction = config["gallery_count"] / (config["gallery_count"] + config["probe_count"])
+    num_train = round(len(class_ids) * train_fraction)
+    shuffled = list(class_ids)
+    _identity_rng(seed, dataset, "identity-split").shuffle(shuffled)
+    return sorted(shuffled[:num_train]), sorted(shuffled[num_train:])
 
 
 def _line(palm: str, vein: str, label: int, palm_exists: int, vein_exists: int, split: str) -> str:
@@ -189,19 +201,26 @@ def _ssfd_test_protocol(pairs, class_ids):
 
 def build_ssfd_protocols(root_dir: str, output_dir: str, dataset: str, seed: int = 2026):
     dataset = dataset.lower()
-    pairs = _collect_ssfd_pairs(root_dir, dataset, seed)
+    config = DATASET_CONFIGS[dataset]
+    pairs = _collect_pairs(root_dir, dataset)
     class_ids = sorted(pairs)
     if not class_ids:
         raise RuntimeError(f"No paired samples found under: {root_dir}")
-    expected_classes = DATASET_CONFIGS[dataset]["class_count"]
+    expected_classes = config["class_count"]
     if len(class_ids) != expected_classes:
         raise RuntimeError(f"{dataset} has {len(class_ids)} paired classes; expected {expected_classes}")
 
-    train_pairs = {class_id: pairs[class_id]["train"] for class_id in class_ids}
-    test_pairs = {class_id: pairs[class_id]["test"] for class_id in class_ids}
+    train_ids, test_ids = _split_identity_ids(class_ids, dataset, seed, config)
+    test_pairs = {
+        class_id: _split_gallery_probe(pairs[class_id], dataset, class_id, seed, config)
+        for class_id in test_ids
+    }
+    gallery_pairs = {class_id: test_pairs[class_id]["gallery"] for class_id in test_ids}
+    probe_pairs = {class_id: test_pairs[class_id]["probe"] for class_id in test_ids}
     payload = {
-        "ssfd_train_full": _full_protocol(train_pairs, class_ids, "train"),
-        "ssfd_test_protocol": _ssfd_test_protocol(test_pairs, class_ids),
+        "ssfd_train_full": _full_protocol(pairs, train_ids, "train"),
+        "ssfd_gallery_full": _full_protocol(gallery_pairs, test_ids, "gallery"),
+        "ssfd_test_protocol": _ssfd_test_protocol(probe_pairs, test_ids),
     }
     files = {key: os.path.join(output_dir, name) for key, name in SSFD_PROTOCOL_FILES.items()}
     for key, lines in payload.items():
@@ -211,8 +230,11 @@ def build_ssfd_protocols(root_dir: str, output_dir: str, dataset: str, seed: int
         "dataset": dataset.lower(),
         "seed": seed,
         "num_classes_total": len(class_ids),
+        "num_train_identities": len(train_ids),
+        "num_test_identities": len(test_ids),
         "num_train_pairs": len(payload["ssfd_train_full"]),
-        "num_test_pairs": len(payload["ssfd_test_protocol"]) // 3,
+        "num_gallery_pairs": len(payload["ssfd_gallery_full"]),
+        "num_probe_pairs": len(payload["ssfd_test_protocol"]) // 3,
         "num_test_protocol_pairs": len(payload["ssfd_test_protocol"]),
         "files": {key: _path(path) for key, path in files.items()},
     }

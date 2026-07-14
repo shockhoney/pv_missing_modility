@@ -63,7 +63,7 @@ def evaluate_encoder(modality: str, ckpt_path: str, args, device):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser("Evaluate single-modality encoders")
-    parser.add_argument("--gallery_list", default="data_txt/tongji/ssfd_train_full.txt")
+    parser.add_argument("--gallery_list", default="data_txt/tongji/ssfd_gallery_full.txt")
     parser.add_argument("--protocol_list", default="data_txt/tongji/ssfd_test_protocol.txt")
     parser.add_argument("--modality", type=str, choices=["palm", "vein"], default="palm")
     parser.add_argument("--ckpt", type=str, default=None)

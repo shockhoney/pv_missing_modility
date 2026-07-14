@@ -135,7 +135,7 @@ def evaluate(args):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser("Evaluate missing-modality recognizer")
-    parser.add_argument("--gallery_list", default="data_txt/tongji/ssfd_train_full.txt")
+    parser.add_argument("--gallery_list", default="data_txt/tongji/ssfd_gallery_full.txt")
     parser.add_argument("--protocol_list", default="data_txt/tongji/ssfd_test_protocol.txt")
     parser.add_argument("--ckpt", default="outputs/missing_model/best.pth")
     parser.add_argument("--batch_size", type=int, default=32)

@@ -27,34 +27,39 @@ Protocol format:
 palm_path vein_path label palm_exists vein_exists split
 ```
 
-Generate all four paired closed-set protocols with the fixed seed `2026`:
+Generate all four paired identity-disjoint closed-set protocols with the fixed seed `2026`:
 
 ```bash
 python -m utils.datasets_txt
 ```
 
-The generated splits are:
+Palm identities are split between training and testing with the original per-dataset train/test ratio. All paired
+samples from training identities are used to train the encoders and missing-modality model. Held-out test identities
+are split into a complete-modality Gallery and Probes using the original per-identity ratio:
 
-| Dataset | Modalities | Train pairs / identity | Test pairs / identity | Total train / test pairs |
-| --- | --- | ---: | ---: | ---: |
-| Tongji Session 1 | Palmprint / palm vein | 8 | 2 | 4800 / 1200 |
-| CUMT | Palmprint / palm vein | 8 | 2 | 2320 / 580 |
-| PolyU | Green / NIR | 10 | 2 | 5000 / 1000 |
-| CASIA | VI / IR | 4 | 2 | 800 / 400 |
+| Dataset | Train / test identities | Train pairs | Gallery / Probe pairs per test identity | Total Gallery / Probes |
+| --- | ---: | ---: | ---: | ---: |
+| Tongji Session 1 | 480 / 120 | 4800 | 8 / 2 | 960 / 240 |
+| CUMT | 232 / 58 | 2320 | 8 / 2 | 464 / 116 |
+| PolyU | 417 / 83 | 5004 | 10 / 2 | 830 / 166 |
+| CASIA | 133 / 67 | 798 | 4 / 2 | 268 / 134 |
 
-Each palmprint-palm-vein pair stays in the same split. Train and test identities overlap, so this is a closed-set
-protocol. Tongji uses only Session 1 and must not be described as cross-session evaluation. CUMT, PolyU, and CASIA
-reserve one test pair from each acquisition half/session.
+Each palmprint-palm-vein pair stays in the same split, and training identities never occur in the Gallery or Probe
+sets. Every Probe identity is enrolled in the held-out Gallery, so evaluation remains closed-set identification while
+testing generalization to unseen identities. Tongji still uses only Session 1 and must not be described as
+cross-session evaluation. CUMT, PolyU, and CASIA reserve one Probe pair from each acquisition half/session.
 
 Generated files:
 
 ```text
 data_txt/<dataset_name>/ssfd_train_full.txt
+data_txt/<dataset_name>/ssfd_gallery_full.txt
 data_txt/<dataset_name>/ssfd_test_protocol.txt
 ```
 
-The test protocol contains `complete`, `palmprint_missing`, and `palmvein_missing`. Training and testing default to
-the Tongji files under `data_txt/tongji/`; use explicit paths to run another dataset.
+The Gallery file always contains complete modalities. The Probe protocol contains `complete`, `palmprint_missing`,
+and `palmvein_missing`. Training and testing default to the Tongji files under `data_txt/tongji/`; use explicit paths
+to run another dataset.
 
 ## Train
 
@@ -89,8 +94,8 @@ python test_encoder.py --modality vein --ckpt outputs/encoders/vein_best.pth
 python test_missing_model.py --ckpt outputs/missing_model/best.pth
 ```
 
-Evaluation builds one complete-modality Gallery template per identity by averaging its training embeddings. Test
-samples are Probes and are matched to the L2-normalized Gallery templates with cosine similarity. Each modality
+Evaluation builds one complete-modality Gallery template per held-out test identity by averaging its Gallery
+embeddings. Probe samples are matched to the L2-normalized Gallery templates with cosine similarity. Each modality
 condition reports:
 
 - RR (Rank-1 recognition rate)
@@ -123,4 +128,6 @@ Use `--top_k` or `--far_points` to change the reported operating points.
 Local data, generated protocols, pretrained weights, checkpoints, and logs stay under ignored directories such as `data/`, `data_txt/`, `pretrained/`, `outputs/`, and `runs/`.
 
 The previous deterministic MLP recovery checkpoints are not compatible with the diffusion architecture and must
-not be used for evaluation; train a new missing-model checkpoint after this change.
+not be used for evaluation. Checkpoints trained with the previous identity-overlapping protocol must also not be
+reused because they have already seen the new held-out test identities; regenerate the protocols and retrain both
+encoders and the missing model.
