@@ -73,7 +73,7 @@ def parse_args(argv=None):
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--top_k", type=int, nargs="+", default=[1, 5])
-    parser.add_argument("--far_points", type=float, nargs="+", default=[1e-4, 1e-5])
+    parser.add_argument("--far_points", type=float, nargs="+", default=[1e-3, 1e-4])
     args = parser.parse_args(argv)
     if args.ckpt is None:
         args.ckpt = f"outputs/encoders/{args.modality}_best.pth"

@@ -4,7 +4,7 @@ import torch
 from tqdm import tqdm
 
 from models.backbones import build_encoder
-from models.missing_model import MissingModalityRecognizer
+from models.missing_model import ARCHITECTURE_VERSION, MissingModalityRecognizer, load_missing_model_state
 from utils.checkpoint import safe_torch_load
 from utils.datasets_txt import MissingPairTxtDataset
 from utils.evaluation import format_gallery_probe_metrics, gallery_probe_metrics
@@ -28,6 +28,10 @@ DIAGNOSTICS = {
 
 
 def build_model(ckpt, device):
+    if ckpt.get("architecture_version") != ARCHITECTURE_VERSION or ckpt.get("training_stage") != "fusion":
+        raise ValueError(
+            "Evaluation requires a final fusion checkpoint from the spatial cross-attention training pipeline"
+        )
     ckpt_args = ckpt.get("args", {})
     dim = ckpt_args.get("embedding_size", 256)
     input_size = ckpt_args.get("input_size", 224)
@@ -64,7 +68,6 @@ def build_model(ckpt, device):
         arcface_m=ckpt_args.get("arcface_m", 0.25),
         palm_teacher=palm_teacher,
         vein_teacher=vein_teacher,
-        gate_init=ckpt_args.get("missing_gate_init", 0.0),
         diffusion_steps=ckpt_args.get("diffusion_steps", 100),
         ddim_steps=ckpt_args.get("ddim_steps", 5),
         diffusion_base_channels=ckpt_args.get("diffusion_base_channels", 64),
@@ -77,10 +80,7 @@ def build_model(ckpt, device):
         for key, value in state.items()
         if not key.startswith(("palm_teacher_encoder.", "vein_teacher_encoder."))
     }
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    allowed_missing = {"palm_missing_gate", "vein_missing_gate"}
-    if unexpected or any(key not in allowed_missing for key in missing):
-        raise RuntimeError(f"Invalid missing-model checkpoint. Missing={missing}, unexpected={unexpected}")
+    load_missing_model_state(model, state)
     model.eval()
     return model, input_size
 
@@ -184,7 +184,7 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--diagnostics", action="store_true")
     parser.add_argument("--top_k", type=int, nargs="+", default=[1, 5])
-    parser.add_argument("--far_points", type=float, nargs="+", default=[1e-4, 1e-5])
+    parser.add_argument("--far_points", type=float, nargs="+", default=[1e-3, 1e-4])
     return parser.parse_args(argv)
 
 

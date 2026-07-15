@@ -3,14 +3,18 @@ from utils.head import ArcFace
 from utils.checkpoint_io import safe_torch_load, save_checkpoint
 
 
-def load_encoder_from_checkpoint(ckpt_path, modality, embedding_size, device):
-    ckpt = safe_torch_load(ckpt_path, device)
+def _encoder_from_checkpoint(ckpt, modality, embedding_size, device):
     encoder = build_encoder(modality, input_channel=3, embedding_size=embedding_size).to(device)
     state = ckpt.get("encoder", ckpt.get("model", ckpt))
     state = {key: value for key, value in state.items() if not key.startswith(("shared_head.", "specific_head."))}
     encoder.load_state_dict(state, strict=False)
     encoder.eval()
     return encoder
+
+
+def load_encoder_from_checkpoint(ckpt_path, modality, embedding_size, device):
+    checkpoint = safe_torch_load(ckpt_path, device)
+    return _encoder_from_checkpoint(checkpoint, modality, embedding_size, device)
 
 
 def _arcface_from_checkpoint(ckpt, embedding_size, device):
@@ -38,3 +42,12 @@ def load_arcface_from_checkpoint(ckpt_path, embedding_size, device):
     for param in classifier.parameters():
         param.requires_grad = False
     return classifier
+
+
+def load_encoder_teacher_from_checkpoint(ckpt_path, modality, embedding_size, device):
+    checkpoint = safe_torch_load(ckpt_path, device)
+    encoder = _encoder_from_checkpoint(checkpoint, modality, embedding_size, device)
+    classifier = _arcface_from_checkpoint(checkpoint, embedding_size, device)
+    for param in classifier.parameters():
+        param.requires_grad = False
+    return encoder, classifier, checkpoint

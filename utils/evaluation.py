@@ -1,3 +1,5 @@
+import warnings
+
 import torch
 import torch.nn.functional as F
 
@@ -85,7 +87,7 @@ def gallery_probe_metrics(
     probe_embeddings,
     probe_labels,
     topk=(1, 5),
-    far_points=(1e-4, 1e-5),
+    far_points=(1e-3, 1e-4),
 ):
     scores, template_labels = gallery_probe_scores(gallery_embeddings, gallery_labels, probe_embeddings)
     probe_labels = torch.as_tensor(probe_labels, dtype=torch.long)
@@ -98,7 +100,22 @@ def gallery_probe_metrics(
     genuine_scores = scores[genuine_mask]
     impostor_scores = scores[~genuine_mask]
     far, tar = _verification_curve(genuine_scores, impostor_scores)
-    predictions = template_labels[scores.argmax(dim=1)]
+
+    far_points = tuple(float(point) for point in far_points)
+    for point in far_points:
+        if not 0.0 <= point <= 1.0:
+            raise ValueError("FAR operating points must be in [0, 1]")
+    far_count_resolution = 1.0 / impostor_scores.numel()
+    minimum_nonzero_far = float(far[far > 0].min().item())
+    for point in far_points:
+        if point + 1e-12 < minimum_nonzero_far:
+            warnings.warn(
+                f"FAR={point:g} is below the minimum positive empirical FAR {minimum_nonzero_far:g} "
+                f"(count resolution {far_count_resolution:g}); "
+                "the returned TAR is measured at FAR=0.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     topk = tuple(sorted(set(int(k) for k in topk if int(k) > 0)))
     if not topk:
@@ -110,10 +127,11 @@ def gallery_probe_metrics(
         for k in topk
     }
     return {
-        "rr": float(predictions.eq(probe_labels).float().mean().item()),
         "eer": _eer_from_curve(far, tar),
         "tar_at_far": {float(point): _tar_from_curve(far, tar, point) for point in far_points},
         "topk": topk_accuracy,
+        "far_count_resolution": far_count_resolution,
+        "minimum_nonzero_far": minimum_nonzero_far,
         "num_gallery_identities": int(template_labels.numel()),
         "num_probes": int(probe_labels.numel()),
         "num_genuine_scores": int(genuine_scores.numel()),
@@ -125,12 +143,19 @@ def format_gallery_probe_metrics(metrics):
     lines = [
         (
             f"Gallery identities={metrics['num_gallery_identities']}, Probes={metrics['num_probes']}, "
-            f"Genuine={metrics['num_genuine_scores']}, Impostor={metrics['num_impostor_scores']}"
+            f"Genuine={metrics['num_genuine_scores']}, Impostor={metrics['num_impostor_scores']}, "
+            f"FAR count resolution={metrics['far_count_resolution']:g}, "
+            f"minimum positive FAR={metrics['minimum_nonzero_far']:g}"
         ),
-        f"RR (%): {metrics['rr'] * 100:.2f}",
         f"EER (%): {metrics['eer'] * 100:.2f}",
     ]
-    lines.extend(f"TAR@FAR={far:g} (%): {tar * 100:.2f}" for far, tar in metrics["tar_at_far"].items())
+    for far, tar in metrics["tar_at_far"].items():
+        unresolved = (
+            " [FAR=0 empirical point]"
+            if far + 1e-12 < metrics["minimum_nonzero_far"]
+            else ""
+        )
+        lines.append(f"TAR@FAR={far:g} (%): {tar * 100:.2f}{unresolved}")
     lines.append(
         "Top-k Accuracy: "
         + ", ".join(f"Top-{k}={value * 100:.2f}%" for k, value in metrics["topk"].items())

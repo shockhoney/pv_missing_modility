@@ -1,8 +1,17 @@
+import hashlib
 import os
 from collections.abc import Mapping
 from typing import Any
 
 import torch
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def safe_torch_load(path, map_location):

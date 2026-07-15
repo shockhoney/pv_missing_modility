@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from models.backbones import build_encoder
 from utils.checkpoint import save_checkpoint
+from utils.checkpoint_io import file_sha256
 from utils.datasets_txt import SingleModalityFromPairDataset, infer_num_classes
 from utils.evaluation import count_correct_predictions
 from utils.head import ArcFace
@@ -71,6 +72,10 @@ def train(args):
     os.makedirs(args.save_dir, exist_ok=True)
     device = resolve_device(args.device, require_available=True, announce=True)
     num_classes = infer_num_classes(args.train_list)
+    train_list_path = args.train_list if os.path.isabs(args.train_list) else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), args.train_list
+    )
+    args.train_list_fingerprint = file_sha256(train_list_path)
     train_loader = make_loader(args, args.train_list, train=True)
 
     encoder = make_encoder(args).to(device)
