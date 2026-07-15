@@ -66,13 +66,11 @@ def build_model(ckpt, device):
         vein_teacher=vein_teacher,
         gate_init=ckpt_args.get("missing_gate_init", 0.0),
         diffusion_steps=ckpt_args.get("diffusion_steps", 100),
-        ddim_steps=ckpt_args.get("ddim_steps", 20),
+        ddim_steps=ckpt_args.get("ddim_steps", 5),
         diffusion_base_channels=ckpt_args.get("diffusion_base_channels", 64),
         diffusion_time_dim=ckpt_args.get("diffusion_time_dim", 128),
         diffusion_dropout=ckpt_args.get("diffusion_dropout", 0.0),
         diffusion_stats_momentum=ckpt_args.get("diffusion_stats_momentum", 0.99),
-        high_noise_min_ratio=ckpt_args.get("high_noise_min_ratio", 0.8),
-        high_noise_max_ratio=ckpt_args.get("high_noise_max_ratio", 0.95),
     ).to(device)
     state = {
         key: value

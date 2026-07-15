@@ -14,12 +14,14 @@ The current main route is intentionally simple:
    - available-guided fusion,
    - logit-level gated ensemble,
    - distillation to the available single-modality teacher.
-5. Freeze the trained diffusion recoverers and fine-tune fusion with the same full DDIM samples used at test time.
+5. Fine-tune both recoverers through the exact DDIM sampling trajectory used at test time.
+6. Freeze the recoverers and train fusion with those same DDIM samples.
 
-The diffusion models operate on the frozen encoders' 2D feature maps. The first training stage keeps the standard
-DDPM objective over all timesteps and adds a high-noise conditional branch for feature reconstruction, target-teacher
-identity supervision, and specific-feature alignment. The second stage freezes both recoverers, generates missing
-features with the same DDIM sampler used for inference, and aligns the complete and missing-scenario embeddings. The
+The diffusion models operate on the frozen encoders' 2D feature maps. Stage 1 uses the standard DDPM noise-prediction
+objective. Stage 2 starts from Gaussian noise, runs the shared DDIM sampler with gradients enabled, and applies map
+reconstruction, embedding cosine, and target-teacher identity losses to its final samples. Stage 3 freezes both
+recoverers, calls the same sampler, and trains only the missing-modality fusion path. Training and inference therefore
+share the same sampling start distribution, timestep schedule, update equations, and number of DDIM steps. The
 missing model does not fine-tune encoders, so the available-modality baseline stays fixed.
 
 ## Protocol
@@ -87,32 +89,38 @@ Train the missing-modality recognizer:
 python train_missing_model.py
 ```
 
-This runs 200 epochs of diffusion training and then 40 epochs of sampled-feature fusion fine-tuning. The first-stage
-checkpoint is saved to `outputs/missing_model/diffusion_best.pth`; the final checkpoint is saved to
-`outputs/missing_model/best.pth`. The default diffusion configuration uses 100 training steps and 20 DDIM sampling
-steps. Identity-aware recovery uses the 80%-95% high-noise timestep interval by default, avoiding the numerically
-degenerate final steps. These settings can be changed with `--diffusion_steps`, `--ddim_steps`,
-`--high_noise_min_ratio`, and `--high_noise_max_ratio`. The extra high-noise denoiser pass makes the diffusion stage
-slower than the previous training objective.
+This runs 200 epochs of DDPM pretraining, 30 epochs of differentiable DDIM recovery fine-tuning, and 40 epochs of
+fusion training. The three checkpoints are saved to `outputs/missing_model/diffusion_best.pth`,
+`outputs/missing_model/recovery_best.pth`, and `outputs/missing_model/best.pth`. The default configuration uses 100
+diffusion steps and 5 DDIM sampling steps. Five steps keep differentiable sampling practical; the checkpoint records
+this value and evaluation automatically uses the same value. Change it consistently with `--ddim_steps` only before
+starting a new full training run.
 
-Diffusion checkpoints trained before the high-noise conditional branch was introduced are structurally loadable but
-must not be reused as final recoverers, because they did not receive high-noise identity supervision. Re-run the full
-missing-model training while reusing the existing palm and vein encoder checkpoints.
+Missing-model checkpoints trained before differentiable DDIM recovery fine-tuning must not be reused. Re-run all
+three missing-model stages while reusing the existing palm and vein encoder checkpoints.
 
-To fine-tune fusion directly from an existing diffusion checkpoint without retraining the recoverers:
+To resume only the DDIM recovery stage from a completed DDPM checkpoint:
+
+```bash
+python train_missing_model.py \
+  --stage recovery \
+  --diffusion_ckpt outputs/missing_model/diffusion_best.pth \
+  --recovery_ckpt outputs/missing_model/recovery_best.pth
+```
+
+To train only fusion from a completed recovery checkpoint:
 
 ```bash
 python train_missing_model.py \
   --stage fusion \
-  --diffusion_ckpt outputs/missing_model/best.pth \
-  --save_path outputs/missing_model/best_sampled.pth
+  --recovery_ckpt outputs/missing_model/recovery_best.pth \
+  --save_path outputs/missing_model/best.pth
 ```
 
-The fusion stage performs full DDIM sampling online under `no_grad`, so it is slower than ordinary classifier
-fine-tuning but does not backpropagate through the sampling trajectory. It freezes the complete-modality fusion
-branch and trains only a zero-initialized residual over the real available modality, the classifier, and the missing
-gates. Training and testing use the fixed default seed `42`. Use a different output path when reusing an existing
-checkpoint so that the source checkpoint remains available for comparison.
+The recovery stage backpropagates through the full DDIM trajectory and is therefore the most memory-intensive stage;
+the default batch size is 8. The fusion stage freezes both recoverers, so it does not retain the sampling graph. It
+trains only a zero-initialized residual over the real available modality, the classifier, and the missing gates.
+Training and testing use the fixed default seed `42`.
 
 ## Test
 
@@ -126,7 +134,7 @@ Run the missing-modality diagnostics with the same DDIM samples used by the norm
 
 ```bash
 python test_missing_model.py \
-  --ckpt outputs/missing_model/best_safe_residual.pth \
+  --ckpt outputs/missing_model/best.pth \
   --seed 42 \
   --diagnostics
 ```

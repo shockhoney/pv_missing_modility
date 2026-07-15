@@ -115,13 +115,11 @@ class MissingModalityRecognizer(nn.Module):
         vein_teacher=None,
         gate_init=0.0,
         diffusion_steps=100,
-        ddim_steps=20,
+        ddim_steps=5,
         diffusion_base_channels=64,
         diffusion_time_dim=128,
         diffusion_dropout=0.0,
         diffusion_stats_momentum=0.99,
-        high_noise_min_ratio=0.8,
-        high_noise_max_ratio=0.95,
     ):
         super().__init__()
         if dim % 2 != 0:
@@ -143,8 +141,6 @@ class MissingModalityRecognizer(nn.Module):
             time_dim=diffusion_time_dim,
             dropout=diffusion_dropout,
             stats_momentum=diffusion_stats_momentum,
-            high_noise_min_ratio=high_noise_min_ratio,
-            high_noise_max_ratio=high_noise_max_ratio,
         )
         self.p2v = ConditionalFeatureDiffusion(**diffusion_kwargs)
         self.v2p = ConditionalFeatureDiffusion(**diffusion_kwargs)
@@ -195,47 +191,32 @@ class MissingModalityRecognizer(nn.Module):
     def _compose(self, shared, specific):
         return torch.cat([shared, specific], dim=1)
 
-    def recover_modalities(self, encoded, training_recovery=False, directions=("p2v", "v2p")):
+    def diffusion_loss(self, encoded):
+        return 0.5 * (
+            self.p2v.training_loss(encoded["palm_map"], encoded["vein_map"])
+            + self.v2p.training_loss(encoded["vein_map"], encoded["palm_map"])
+        )
+
+    def recover_modalities(self, encoded, directions=("p2v", "v2p")):
         directions = set(directions)
-        zero = encoded["palm_map"].new_zeros(())
-        recovery = {"diffusion_loss": zero, "reconstruction_loss": zero}
+        recovery = {}
 
         if "p2v" in directions:
-            result = (
-                self.p2v.training_recovery(encoded["palm_map"], encoded["vein_map"])
-                if training_recovery
-                else {"feature": self.p2v.sample(encoded["palm_map"])}
-            )
-            recovered_vein_map = result["feature"]
-            recovery["diffusion_loss"] = recovery["diffusion_loss"] + result.get("diffusion_loss", zero)
-            recovery["reconstruction_loss"] = recovery["reconstruction_loss"] + result.get(
-                "reconstruction_loss", zero
-            )
+            recovered_vein_map = self.p2v.sample(encoded["palm_map"])
         else:
             recovered_vein_map = encoded["vein_map"]
 
         if "v2p" in directions:
-            result = (
-                self.v2p.training_recovery(encoded["vein_map"], encoded["palm_map"])
-                if training_recovery
-                else {"feature": self.v2p.sample(encoded["vein_map"])}
-            )
-            recovered_palm_map = result["feature"]
-            recovery["diffusion_loss"] = recovery["diffusion_loss"] + result.get("diffusion_loss", zero)
-            recovery["reconstruction_loss"] = recovery["reconstruction_loss"] + result.get(
-                "reconstruction_loss", zero
-            )
+            recovered_palm_map = self.v2p.sample(encoded["vein_map"])
         else:
             recovered_palm_map = encoded["palm_map"]
-
-        if directions:
-            recovery["diffusion_loss"] = recovery["diffusion_loss"] / len(directions)
-            recovery["reconstruction_loss"] = recovery["reconstruction_loss"] / len(directions)
 
         hat_vein_shared, hat_vein_specific = self.vein_encoder.parts_from_features(recovered_vein_map)
         hat_palm_shared, hat_palm_specific = self.palm_encoder.parts_from_features(recovered_palm_map)
         recovery.update(
             {
+                "generated_palm_map": recovered_palm_map,
+                "generated_vein_map": recovered_vein_map,
                 "hat_palm_specific": hat_palm_specific,
                 "hat_vein_specific": hat_vein_specific,
                 "generated_palm": self._compose(hat_palm_shared, hat_palm_specific),
@@ -330,11 +311,6 @@ class MissingModalityRecognizer(nn.Module):
 
     def forward(self, palm, vein, labels=None, scenario=COMPLETE, mask=None):
         encoded = self.encode_modalities(palm, vein)
-        if self.training:
-            directions = ("p2v", "v2p")
-            training_recovery = True
-        else:
-            directions = self._required_directions(scenario, mask)
-            training_recovery = False
-        recovery = self.recover_modalities(encoded, training_recovery, directions)
+        directions = self._required_directions(scenario, mask)
+        recovery = self.recover_modalities(encoded, directions)
         return self.forward_from_encoded(encoded, recovery, labels, scenario, mask)

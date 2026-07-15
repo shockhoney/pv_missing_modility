@@ -20,6 +20,7 @@ from utils.scenarios import COMPLETE, PALMPRINT_MISSING, PALMVEIN_MISSING, SSFD_
 
 SCENARIOS = SSFD_SCENARIOS
 DIFFUSION_STAGE = "diffusion"
+RECOVERY_STAGE = "recovery"
 FUSION_STAGE = "fusion"
 
 
@@ -67,8 +68,6 @@ def make_model(args, num_classes, device):
         diffusion_time_dim=args.diffusion_time_dim,
         diffusion_dropout=args.diffusion_dropout,
         diffusion_stats_momentum=args.diffusion_stats_momentum,
-        high_noise_min_ratio=args.high_noise_min_ratio,
-        high_noise_max_ratio=args.high_noise_max_ratio,
     ).to(device)
 
 
@@ -117,52 +116,43 @@ def recovery_identity_loss(model, recovery, labels, ce):
         losses.append(ce(model.palm_teacher(recovery["generated_palm"], labels), labels))
     if model.vein_teacher is not None:
         losses.append(ce(model.vein_teacher(recovery["generated_vein"], labels), labels))
-    return sum(losses) / len(losses) if losses else recovery["diffusion_loss"].new_zeros(())
+    return sum(losses) / len(losses) if losses else torch.zeros((), device=labels.device)
 
 
-def batch_losses(model, palm, vein, labels, ce, args):
+def diffusion_losses(model, palm, vein, labels, ce, args):
     encoded = model.encode_modalities(palm, vein)
-    recovery = model.recover_modalities(encoded, training_recovery=True)
-    outputs = scenario_outputs(model, encoded, recovery, labels)
-    cls_loss = classification_loss(outputs, labels, ce)
-    recovery_alignment_loss = 0.5 * (
-        cosine_alignment_loss(outputs[COMPLETE]["hat_vein_specific"], outputs[COMPLETE]["vein_specific"])
-        + cosine_alignment_loss(outputs[COMPLETE]["hat_palm_specific"], outputs[COMPLETE]["palm_specific"])
+    loss = model.diffusion_loss(encoded)
+    return {"loss": loss, "diffusion": loss}
+
+
+def sampled_recovery_losses(model, palm, vein, labels, ce, args):
+    encoded = model.encode_modalities(palm, vein)
+    recovery = model.recover_modalities(encoded)
+    reconstruction = 0.5 * (
+        F.smooth_l1_loss(recovery["generated_palm_map"], encoded["palm_map"])
+        + F.smooth_l1_loss(recovery["generated_vein_map"], encoded["vein_map"])
     )
-    recovery_id_loss = recovery_identity_loss(model, recovery, labels, ce)
-    anchor = anchor_loss(model, outputs[COMPLETE], labels, ce)
-    avail_loss = 0.5 * (
-        cosine_alignment_loss(outputs[PALMPRINT_MISSING]["z"], outputs[COMPLETE]["f_vein"])
-        + cosine_alignment_loss(outputs[PALMVEIN_MISSING]["z"], outputs[COMPLETE]["f_palm"])
+    alignment = 0.5 * (
+        cosine_alignment_loss(recovery["generated_palm"], encoded["f_palm"])
+        + cosine_alignment_loss(recovery["generated_vein"], encoded["f_vein"])
     )
-    distill = missing_distillation_losses(outputs)
+    identity = recovery_identity_loss(model, recovery, labels, ce)
     loss = (
-        cls_loss
-        + args.lambda_diffusion * recovery["diffusion_loss"]
-        + args.lambda_diffusion_rec * recovery["reconstruction_loss"]
-        + args.lambda_recovery_id * recovery_id_loss
-        + args.lambda_anchor * anchor
-        + args.lambda_recovery_alignment * recovery_alignment_loss
-        + args.lambda_avail * avail_loss
-        + args.lambda_distill * distill
+        args.lambda_sample_rec * reconstruction
+        + args.lambda_sample_cos * alignment
+        + args.lambda_sample_id * identity
     )
     return {
         "loss": loss,
-        "cls": cls_loss,
-        "diffusion": recovery["diffusion_loss"],
-        "diffusion_rec": recovery["reconstruction_loss"],
-        "recovery_id": recovery_id_loss,
-        "recovery_align": recovery_alignment_loss,
-        "anchor": anchor,
-        "avail": avail_loss,
-        "distill": distill,
-        "outputs": outputs,
+        "sample_rec": reconstruction,
+        "sample_cos": alignment,
+        "sample_id": identity,
     }
 
 
 def sampled_fusion_losses(model, palm, vein, labels, ce, args):
     encoded = model.encode_modalities(palm, vein)
-    recovery = model.recover_modalities(encoded, training_recovery=False)
+    recovery = model.recover_modalities(encoded)
     outputs = scenario_outputs(model, encoded, recovery, labels)
     cls_loss = classification_loss(outputs, labels, ce)
     anchor = anchor_loss(model, outputs[COMPLETE], labels, ce)
@@ -187,6 +177,14 @@ def sampled_fusion_losses(model, palm, vein, labels, ce, args):
     }
 
 
+def configure_recovery_training(model):
+    for param in model.parameters():
+        param.requires_grad = False
+    for module in (model.p2v, model.v2p):
+        for param in module.parameters():
+            param.requires_grad = True
+
+
 def configure_fusion_stage(model):
     for param in model.parameters():
         param.requires_grad = False
@@ -206,9 +204,9 @@ def load_model_state(model, checkpoint_path, device, num_classes):
     return checkpoint
 
 
-def train_epoch(model, loader, optimizer, ce, device, args, loss_fn, loss_names, description, freeze_diffusion):
+def train_epoch(model, loader, optimizer, ce, device, args, loss_fn, loss_names, description, eval_diffusion):
     model.train()
-    if freeze_diffusion:
+    if eval_diffusion:
         model.p2v.eval()
         model.v2p.eval()
     sums = {name: 0.0 for name in loss_names}
@@ -233,16 +231,16 @@ def train_epoch(model, loader, optimizer, ce, device, args, loss_fn, loss_names,
         total += batch_size
         for name in loss_names:
             sums[name] += losses[name].item() * batch_size
-        for scenario in SCENARIOS:
-            sums[f"acc_{scenario}"] += recognition_rate(losses["outputs"][scenario]["logits"], labels) * batch_size
+        if "outputs" in losses:
+            for scenario in SCENARIOS:
+                sums[f"acc_{scenario}"] += recognition_rate(losses["outputs"][scenario]["logits"], labels) * batch_size
     if total == 0:
         raise RuntimeError(f"No finite batches were produced during {description}")
     return {key: value / total for key, value in sums.items()}
 
 
 def train_stage(model, loader, device, args, num_classes, stage, save_path):
-    is_fusion = stage == FUSION_STAGE
-    if is_fusion:
+    if stage == FUSION_STAGE:
         configure_fusion_stage(model)
         epochs = args.fusion_epochs
         base_lr = args.fusion_lr
@@ -250,23 +248,22 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
         warmup_epochs = args.fusion_warmup_epochs
         loss_fn = sampled_fusion_losses
         loss_names = ("loss", "cls", "scenario", "anchor", "distill")
+    elif stage == RECOVERY_STAGE:
+        configure_recovery_training(model)
+        epochs = args.recovery_epochs
+        base_lr = args.recovery_lr
+        min_lr = args.recovery_min_lr
+        warmup_epochs = args.recovery_warmup_epochs
+        loss_fn = sampled_recovery_losses
+        loss_names = ("loss", "sample_rec", "sample_cos", "sample_id")
     else:
+        configure_recovery_training(model)
         epochs = args.epochs
         base_lr = args.lr
         min_lr = args.min_lr
         warmup_epochs = args.warmup_epochs
-        loss_fn = batch_losses
-        loss_names = (
-            "loss",
-            "cls",
-            "diffusion",
-            "diffusion_rec",
-            "recovery_id",
-            "recovery_align",
-            "anchor",
-            "avail",
-            "distill",
-        )
+        loss_fn = diffusion_losses
+        loss_names = ("loss", "diffusion")
 
     optimizer = make_optimizer(model, base_lr, args.wd)
     ce = nn.CrossEntropyLoss()
@@ -286,14 +283,16 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
             loss_fn,
             loss_names,
             f"Train {stage}",
-            freeze_diffusion=is_fusion,
+            eval_diffusion=stage in (RECOVERY_STAGE, FUSION_STAGE),
         )
         losses = " ".join(f"{name}={stats[name]:.4f}" for name in loss_names)
-        print(
-            f"[{stage} Epoch {epoch}] {losses} "
-            f"acc_c={stats['acc_complete']:.4f} acc_pm={stats['acc_palmprint_missing']:.4f} "
-            f"acc_vm={stats['acc_palmvein_missing']:.4f} lr={lr:.6g}"
-        )
+        accuracies = ""
+        if stage == FUSION_STAGE:
+            accuracies = (
+                f" acc_c={stats['acc_complete']:.4f} acc_pm={stats['acc_palmprint_missing']:.4f}"
+                f" acc_vm={stats['acc_palmvein_missing']:.4f}"
+            )
+        print(f"[{stage} Epoch {epoch}] {losses}{accuracies} lr={lr:.6g}")
         if stats["loss"] < best:
             best = stats["loss"]
             save_checkpoint(
@@ -322,7 +321,13 @@ def train(args):
         if args.stage == DIFFUSION_STAGE:
             return
 
-    load_model_state(model, args.diffusion_ckpt, device, num_classes)
+    if args.stage in ("all", RECOVERY_STAGE):
+        load_model_state(model, args.diffusion_ckpt, device, num_classes)
+        train_stage(model, train_loader, device, args, num_classes, RECOVERY_STAGE, args.recovery_ckpt)
+        if args.stage == RECOVERY_STAGE:
+            return
+
+    load_model_state(model, args.recovery_ckpt, device, num_classes)
     train_stage(model, train_loader, device, args, num_classes, FUSION_STAGE, args.save_path)
 
 
@@ -332,11 +337,13 @@ def parse_args(argv=None):
     parser.add_argument("--palm_ckpt", default="outputs/encoders/palm_best.pth")
     parser.add_argument("--vein_ckpt", default="outputs/encoders/vein_best.pth")
     parser.add_argument("--diffusion_ckpt", default="outputs/missing_model/diffusion_best.pth")
+    parser.add_argument("--recovery_ckpt", default="outputs/missing_model/recovery_best.pth")
     parser.add_argument("--save_path", default="outputs/missing_model/best.pth")
-    parser.add_argument("--stage", choices=["all", DIFFUSION_STAGE, FUSION_STAGE], default="all")
+    parser.add_argument("--stage", choices=["all", DIFFUSION_STAGE, RECOVERY_STAGE, FUSION_STAGE], default="all")
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--recovery_epochs", type=int, default=30)
     parser.add_argument("--fusion_epochs", type=int, default=40)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -345,23 +352,21 @@ def parse_args(argv=None):
     parser.add_argument("--attn_heads", type=int, default=4)
     parser.add_argument("--channel_reduction", type=int, default=4)
     parser.add_argument("--diffusion_steps", type=int, default=100)
-    parser.add_argument("--ddim_steps", type=int, default=20)
+    parser.add_argument("--ddim_steps", type=int, default=5)
     parser.add_argument("--diffusion_base_channels", type=int, default=64)
     parser.add_argument("--diffusion_time_dim", type=int, default=128)
     parser.add_argument("--diffusion_dropout", type=float, default=0.0)
     parser.add_argument("--diffusion_stats_momentum", type=float, default=0.99)
-    parser.add_argument("--high_noise_min_ratio", type=float, default=0.8)
-    parser.add_argument("--high_noise_max_ratio", type=float, default=0.95)
-    parser.add_argument("--lambda_diffusion", type=float, default=1.0)
-    parser.add_argument("--lambda_diffusion_rec", type=float, default=0.5)
-    parser.add_argument("--lambda_recovery_id", type=float, default=0.5)
-    parser.add_argument("--lambda_recovery_alignment", type=float, default=0.1)
+    parser.add_argument("--lambda_sample_rec", type=float, default=1.0)
+    parser.add_argument("--lambda_sample_cos", type=float, default=1.0)
+    parser.add_argument("--lambda_sample_id", type=float, default=0.5)
     parser.add_argument("--lambda_anchor", type=float, default=1.0)
-    parser.add_argument("--lambda_avail", type=float, default=0.1)
     parser.add_argument("--lambda_distill", type=float, default=0.1)
     parser.add_argument("--lambda_scenario", type=float, default=0.5)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min_lr", type=float, default=0.0)
+    parser.add_argument("--recovery_lr", type=float, default=1e-5)
+    parser.add_argument("--recovery_min_lr", type=float, default=1e-6)
     parser.add_argument("--fusion_lr", type=float, default=1e-4)
     parser.add_argument("--fusion_min_lr", type=float, default=1e-6)
     parser.add_argument("--wd", type=float, default=1e-4)
@@ -369,6 +374,7 @@ def parse_args(argv=None):
     parser.add_argument("--arcface_m", type=float, default=0.25)
     parser.add_argument("--missing_gate_init", type=float, default=0.0)
     parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.add_argument("--recovery_warmup_epochs", type=int, default=2)
     parser.add_argument("--fusion_warmup_epochs", type=int, default=2)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     return parser.parse_args(argv)
