@@ -2,7 +2,40 @@
 
 This project trains palmprint and palm-vein encoders, then uses them as fixed teachers for missing-modality recognition.
 
-## Research Route
+## Residual Image-Recovery Route
+
+The strongest missing-modality route keeps both pretrained single-modality encoders frozen.  Two lightweight residual
+image adapters recover a palm-style image from an available vein image and a vein-style image from an available palm
+image.  Gallery images are passed through the same adapters, so recovered probes are compared with recovered Gallery
+templates rather than with real images from a different feature domain.  The final score is
+
+```text
+available-modality cosine score + alpha * recovery-domain cosine score
+```
+
+The two `alpha` values are selected on 48 validation identities held out from recovery learning, using disjoint
+Session 1 Gallery and Probe pairs. Test identities are never used for training or weight selection. The evaluator
+also reports available-only, recovery-only, real-missing oracle, and identity-shuffled recovery controls.  A useful
+recovery model must beat available-only recognition and deteriorate when its recovered probes are assigned to the
+wrong identities.
+
+Train and evaluate this route with:
+
+```bash
+python train_image_recovery.py
+python test_image_recovery.py --ckpt outputs/image_recovery/best.pth
+```
+
+Export generated images, target images, and signed residual visualizations with:
+
+```bash
+python export_recovery_images.py
+```
+
+The palm and vein checkpoints under `outputs/encoders/` are read-only teachers in this route.  The saved recovery
+checkpoint records their SHA-256 fingerprints, the held-out validation identities, and the selected fusion weights.
+
+## Feature-Diffusion Research Route
 
 The training route is staged so that every later target space has already been trained:
 
@@ -41,30 +74,36 @@ Generate all four paired identity-disjoint closed-set protocols with the fixed s
 python -m utils.datasets_txt
 ```
 
-Palm identities are split between training and testing with the original per-dataset train/test ratio. All paired
-samples from training identities are used to train the encoders and missing-modality model. Held-out test identities
-are split into a complete-modality Gallery and Probes using the original per-identity ratio:
+Tongji uses only Session 1 and is split into identity-disjoint train/validation/test sets. All paired samples from
+training identities are used to train the encoders and missing-modality model. Validation and test identities are
+each split into a complete-modality Gallery and Probes. Other datasets retain their original train/test ratios:
 
-| Dataset | Train / test identities | Train pairs | Gallery / Probe pairs per test identity | Total Gallery / Probes |
+| Dataset | Train / validation / test identities | Train pairs | Validation Gallery / Probes | Test Gallery / Probes |
 | --- | ---: | ---: | ---: | ---: |
-| Tongji Session 1 -> 2 | 480 / 120 | 4800 | 8 / 2 | 960 / 240 |
-| CUMT | 232 / 58 | 2320 | 8 / 2 | 464 / 116 |
-| PolyU | 417 / 83 | 5004 | 10 / 2 | 830 / 166 |
-| CASIA | 133 / 67 | 798 | 4 / 2 | 268 / 134 |
+| Tongji Session 1 only | 432 / 48 / 120 | 4320 | 384 / 96 | 960 / 240 |
+| CUMT | 232 / - / 58 | 2320 | - | 464 / 116 |
+| PolyU | 417 / - / 83 | 5004 | - | 830 / 166 |
+| CASIA | 133 / - / 67 | 798 | - | 268 / 134 |
 
-Each palmprint-palm-vein pair stays in the same split, and training identities never occur in the Gallery or Probe
-sets. Every Probe identity is enrolled in the held-out Gallery, so evaluation remains closed-set identification while
-testing generalization to unseen identities. Tongji trains on Session 1, builds the held-out test-identity Gallery
-from eight Session 1 pairs, and uses two Session 2 pairs as Probes. CUMT, PolyU, and CASIA keep their previous
-within-dataset protocols and reserve one Probe pair from each acquisition half/session.
+Each palmprint-palm-vein pair stays in one identity split, and the Tongji training, validation, and test identity sets
+are mutually disjoint. Every Probe identity is enrolled in the corresponding held-out Gallery, so validation and
+testing are closed-set identification while measuring generalization to unseen identities. For Tongji, both Gallery
+and Probe images come strictly from Session 1: eight pairs per identity form the Gallery and two disjoint pairs form
+the Probe. CUMT, PolyU, and CASIA keep their previous within-dataset protocols.
 
 Generated files:
 
 ```text
 data_txt/<dataset_name>/ssfd_train_full.txt
+data_txt/tongji/ssfd_val_gallery_full.txt
+data_txt/tongji/ssfd_val_protocol.txt
 data_txt/<dataset_name>/ssfd_gallery_full.txt
 data_txt/<dataset_name>/ssfd_test_protocol.txt
 ```
+
+Tongji additionally writes `train_identities.txt`, `val_identities.txt`, `test_identities.txt`, and `manifest.json`.
+The generator validates the 432/48/120 counts, strict identity non-overlap, Session1-only paths, paired samples,
+Gallery/Probe non-overlap, scenario completeness, and file hashes before reporting success.
 
 The Gallery file always contains complete modalities. The Probe protocol contains `complete`, `palmprint_missing`,
 and `palmvein_missing`. Training and testing default to the Tongji files under `data_txt/tongji/`; use explicit paths
@@ -72,18 +111,12 @@ to run another dataset.
 
 ## Train
 
-Download ResNet18 pretrained weights first:
-
-```powershell
-New-Item -ItemType Directory -Force pretrained
-Invoke-WebRequest -Uri "https://download.pytorch.org/models/resnet18-f37072fd.pth" -OutFile "pretrained/resnet18_imagenet1k_v1.pth"
-```
-
-Train single-modality baselines:
+The palmprint ResNet18 encoder is trained from random initialization. The palm-vein encoder loads ImageNet ResNet18
+weights from `pretrained/resnet18_imagenet1k_v1.pth` by default. Train both baselines with seed `42`:
 
 ```bash
-python train_encoder.py --modality palm
-python train_encoder.py --modality vein
+python train_encoder.py --modality palm --seed 42
+python train_encoder.py --modality vein --seed 42
 ```
 
 Train the missing-modality recognizer:
@@ -194,6 +227,9 @@ the reported operating points.
 | --- | --- |
 | `train_encoder.py` | Trains one single-modality encoder and ArcFace head. |
 | `test_encoder.py` | Evaluates a saved palm or vein baseline checkpoint. |
+| `train_image_recovery.py` | Trains residual image recoverers and selects recovery-domain fusion weights on held-out identities. |
+| `test_image_recovery.py` | Evaluates missing-modality recovery with score fusion and shuffled/oracle ablations. |
+| `models/image_recovery.py` | Defines bidirectional residual image adapters used in the recommended route. |
 | `train_missing_model.py` | Trains the missing-modality recognizer from frozen palm/vein checkpoints. |
 | `test_missing_model.py` | Evaluates the missing-modality recognizer on all protocol splits. |
 | `models/backbones.py` | Defines the ResNet18 encoder and trainable shared/specific projection heads. |

@@ -74,6 +74,8 @@ def build_model(ckpt, device):
         diffusion_time_dim=ckpt_args.get("diffusion_time_dim", 128),
         diffusion_dropout=ckpt_args.get("diffusion_dropout", 0.0),
         diffusion_stats_momentum=ckpt_args.get("diffusion_stats_momentum", 0.99),
+        diffusion_max_timestep=ckpt_args.get("diffusion_max_timestep", 49),
+        coarse_blocks=ckpt_args.get("coarse_blocks", 3),
     ).to(device)
     state = {
         key: value
@@ -142,8 +144,12 @@ def evaluate(args):
         model, gallery_loader, "Build gallery", device, gallery_keys
     )
     if args.diagnostics:
-        scale = model.fusion.available_fusion.residual_scale.detach().cpu()
-        print(f"[diagnostic] residual_scale={scale.item():.6f}, effective_scale={torch.tanh(scale).item():.6f}")
+        p2v_scale = torch.tanh(model.p2v.refinement_scale.detach()).item()
+        v2p_scale = torch.tanh(model.v2p.refinement_scale.detach()).item()
+        print(
+            f"[diagnostic] diffusion_refinement_scale: "
+            f"p2v={p2v_scale:.6f}, v2p={v2p_scale:.6f}"
+        )
 
     for split_name in SPLITS:
         loader = build_loader(args.protocol_list, split_name, img_size, args.batch_size, args.num_workers)

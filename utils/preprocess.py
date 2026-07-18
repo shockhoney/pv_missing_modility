@@ -3,6 +3,8 @@ import random
 import numpy as np
 from PIL import Image
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -60,23 +62,57 @@ class VeinIntensityJitter:
         return Image.fromarray((arr * 255).astype(np.uint8)).convert("RGB")
 
 
-def build_palm_transform(img_size, train=False):
+class PairedRandomAffine:
+    """Apply one sampled geometric transform to both registered modalities."""
+
+    def __init__(
+        self,
+        degrees=5,
+        translate=(0.02, 0.02),
+        scale=(0.97, 1.03),
+        interpolation=InterpolationMode.BILINEAR,
+    ):
+        self.degrees = (-float(degrees), float(degrees))
+        self.translate = translate
+        self.scale = scale
+        self.interpolation = interpolation
+
+    def __call__(self, palm, vein):
+        image_size = [palm.size[1], palm.size[0]]
+        angle, translations, scale, shear = transforms.RandomAffine.get_params(
+            self.degrees, self.translate, self.scale, (0.0, 0.0), image_size
+        )
+        kwargs = {
+            "angle": angle,
+            "translate": translations,
+            "scale": scale,
+            "shear": shear,
+            "interpolation": self.interpolation,
+            "fill": 0,
+        }
+        return TF.affine(palm, **kwargs), TF.affine(vein, **kwargs)
+
+
+def build_paired_geometry_transform(img_size):
+    del img_size
+    return PairedRandomAffine()
+
+
+def build_palm_transform(img_size, train=False, geometric=True):
     ops = [transforms.Grayscale(3), transforms.Resize((img_size, img_size))]
     if train:
-        ops += [
-            transforms.RandomAffine(degrees=5, translate=(0.02, 0.02), scale=(0.98, 1.02)),
-            transforms.ColorJitter(brightness=0.08, contrast=0.08),
-        ]
+        if geometric:
+            ops.append(transforms.RandomAffine(degrees=5, translate=(0.02, 0.02), scale=(0.98, 1.02)))
+        ops.append(transforms.ColorJitter(brightness=0.08, contrast=0.08))
     return transforms.Compose(ops + [transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
 
 
-def build_vein_transform(img_size, train=False):
+def build_vein_transform(img_size, train=False, geometric=True):
     ops = [transforms.Grayscale(3), transforms.Resize((img_size, img_size)), CLAHE()]
     if train:
-        ops += [
-            VeinIntensityJitter(),
-            transforms.RandomAffine(degrees=5, translate=(0.03, 0.03), scale=(0.95, 1.05)),
-        ]
+        ops.append(VeinIntensityJitter())
+        if geometric:
+            ops.append(transforms.RandomAffine(degrees=5, translate=(0.03, 0.03), scale=(0.95, 1.05)))
     return transforms.Compose(ops + [transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
 
 

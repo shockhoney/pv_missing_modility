@@ -61,6 +61,64 @@ class TimeConditionedResBlock(nn.Module):
         return hidden + self.skip(x)
 
 
+class FeatureResidualBlock(nn.Module):
+    def __init__(self, channels: int, dropout: float = 0.0):
+        super().__init__()
+        groups = _group_count(channels)
+        self.norm1 = nn.GroupNorm(groups, channels)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, channels)
+        self.dropout = nn.Dropout(dropout)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden = self.conv1(F.silu(self.norm1(x)))
+        hidden = self.conv2(self.dropout(F.silu(self.norm2(hidden))))
+        return x + hidden
+
+
+class DeterministicFeatureTranslator(nn.Module):
+    """Predicts a condition-anchored coarse target before diffusion refinement."""
+
+    def __init__(
+        self,
+        feature_channels: int,
+        hidden_channels: int = 64,
+        num_blocks: int = 3,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if num_blocks <= 0:
+            raise ValueError("num_blocks must be positive")
+        self.skip = nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=False)
+        self.global_proj = nn.Linear(hidden_channels, feature_channels)
+        self.input_proj = nn.Conv2d(feature_channels, hidden_channels, kernel_size=1)
+        self.blocks = nn.Sequential(
+            *(FeatureResidualBlock(hidden_channels, dropout) for _ in range(num_blocks))
+        )
+        self.output_norm = nn.GroupNorm(_group_count(hidden_channels), hidden_channels)
+        self.output_proj = nn.Conv2d(hidden_channels, feature_channels, kernel_size=1)
+
+        with torch.no_grad():
+            self.skip.weight.zero_()
+            diagonal = torch.arange(feature_channels)
+            self.skip.weight[diagonal, diagonal, 0, 0] = 1.0
+        nn.init.zeros_(self.global_proj.weight)
+        nn.init.zeros_(self.global_proj.bias)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, condition: torch.Tensor) -> torch.Tensor:
+        hidden = self.blocks(self.input_proj(condition))
+        spatial = self.skip(condition) + self.output_proj(F.silu(self.output_norm(hidden)))
+        condition_mean = condition.mean(dim=(2, 3))
+        structural_summary = hidden.mean(dim=(2, 3))
+        target_mean = (
+            condition_mean + self.global_proj(structural_summary)
+        ).unsqueeze(-1).unsqueeze(-1)
+        return spatial - spatial.mean(dim=(2, 3), keepdim=True) + target_mean
+
+
 class ConditionalFeatureUNet(nn.Module):
     def __init__(
         self,
@@ -77,11 +135,21 @@ class ConditionalFeatureUNet(nn.Module):
             nn.Linear(time_dim, time_dim),
         )
         self.input_proj = nn.Conv2d(feature_channels * 2, base_channels, kernel_size=3, padding=1)
+        self.condition_input = nn.Conv2d(feature_channels, base_channels, kernel_size=1, bias=False)
         self.down_block = TimeConditionedResBlock(base_channels, base_channels, time_dim, dropout)
         self.downsample = nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1)
+        self.condition_down = nn.Conv2d(
+            feature_channels,
+            base_channels * 2,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
         self.mid_block1 = TimeConditionedResBlock(base_channels * 2, base_channels * 2, time_dim, dropout)
         self.mid_block2 = TimeConditionedResBlock(base_channels * 2, base_channels * 2, time_dim, dropout)
         self.upsample_proj = nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1)
+        self.condition_up = nn.Conv2d(feature_channels, base_channels, kernel_size=1, bias=False)
         self.up_block = TimeConditionedResBlock(base_channels * 2, base_channels, time_dim, dropout)
         self.output_norm = nn.GroupNorm(_group_count(base_channels), base_channels)
         self.output_proj = nn.Conv2d(base_channels, feature_channels, kernel_size=3, padding=1)
@@ -99,11 +167,12 @@ class ConditionalFeatureUNet(nn.Module):
                 f"noisy target and condition must have identical shapes, got {noisy_target.shape} and {condition.shape}"
             )
         time_embedding = self.time_embedding(timesteps)
-        skip = self.down_block(self.input_proj(torch.cat([noisy_target, condition], dim=1)), time_embedding)
-        hidden = self.downsample(skip)
+        hidden = self.input_proj(torch.cat([noisy_target, condition], dim=1))
+        skip = self.down_block(hidden + self.condition_input(condition), time_embedding)
+        hidden = self.downsample(skip) + self.condition_down(condition)
         hidden = self.mid_block2(self.mid_block1(hidden, time_embedding), time_embedding)
         hidden = F.interpolate(hidden, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        hidden = self.upsample_proj(hidden)
+        hidden = self.upsample_proj(hidden) + self.condition_up(condition)
         hidden = self.up_block(torch.cat([hidden, skip], dim=1), time_embedding)
         return self.output_proj(F.silu(self.output_norm(hidden)))
 
@@ -119,22 +188,34 @@ class ConditionalFeatureDiffusion(nn.Module):
         dropout: float = 0.0,
         stats_momentum: float = 0.99,
         clip_value: float = 5.0,
+        max_timestep: int = 49,
+        coarse_blocks: int = 3,
     ):
         super().__init__()
         if num_steps <= 1:
             raise ValueError("num_steps must be greater than 1")
         if ddim_steps <= 0:
             raise ValueError("ddim_steps must be positive")
+        if not 0 <= max_timestep < num_steps:
+            raise ValueError("max_timestep must be in [0, num_steps)")
         self.num_steps = num_steps
         self.ddim_steps = min(ddim_steps, num_steps)
+        self.max_timestep = max_timestep
         self.stats_momentum = stats_momentum
         self.clip_value = clip_value
+        self.coarse_predictor = DeterministicFeatureTranslator(
+            feature_channels=feature_channels,
+            hidden_channels=base_channels,
+            num_blocks=coarse_blocks,
+            dropout=dropout,
+        )
         self.denoiser = ConditionalFeatureUNet(
             feature_channels=feature_channels,
             base_channels=base_channels,
             time_dim=time_dim,
             dropout=dropout,
         )
+        self.refinement_scale = nn.Parameter(torch.zeros(()))
 
         betas = cosine_beta_schedule(num_steps)
         alphas = 1.0 - betas
@@ -192,36 +273,66 @@ class ConditionalFeatureDiffusion(nn.Module):
         noisy_target: torch.Tensor,
         timesteps: torch.Tensor,
         predicted_noise: torch.Tensor,
+        clip: bool = False,
     ) -> torch.Tensor:
         clean = (
             noisy_target - _extract(self.sqrt_one_minus_alpha_bars, timesteps, noisy_target) * predicted_noise
         ) / _extract(self.sqrt_alpha_bars, timesteps, noisy_target).clamp_min(1e-6)
-        return clean.clamp(-self.clip_value, self.clip_value)
+        return clean.clamp(-self.clip_value, self.clip_value) if clip else clean
 
-    def training_loss(self, condition: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        self._update_statistics(condition.detach(), target.detach())
+    def training_outputs(
+        self,
+        condition: torch.Tensor,
+        target: torch.Tensor,
+        update_statistics: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        if update_statistics:
+            self._update_statistics(condition.detach(), target.detach())
         condition_normalized = self._normalize_condition(condition)
         target_normalized = self._normalize_target(target)
+        coarse_normalized = self.coarse_predictor(condition_normalized)
+        residual_target = target_normalized - coarse_normalized
 
-        timesteps = torch.randint(0, self.num_steps, (target.size(0),), device=target.device)
-        noise = torch.randn_like(target_normalized)
-        noisy_target = self.q_sample(target_normalized, timesteps, noise)
-        predicted_noise = self.denoiser(noisy_target, condition_normalized, timesteps)
-        return F.mse_loss(predicted_noise, noise)
+        timesteps = torch.randint(0, self.max_timestep + 1, (target.size(0),), device=target.device)
+        noise = torch.randn_like(residual_target)
+        noisy_residual = self.q_sample(residual_target.detach(), timesteps, noise)
+        predicted_noise = self.denoiser(noisy_residual, condition_normalized, timesteps)
+        predicted_residual = self.predict_clean_target(noisy_residual, timesteps, predicted_noise)
+        predicted_target_normalized = coarse_normalized + predicted_residual
+        return {
+            "diffusion": F.mse_loss(predicted_noise, noise),
+            "coarse_rec": F.smooth_l1_loss(coarse_normalized, target_normalized),
+            "x0_rec": F.smooth_l1_loss(predicted_target_normalized, target_normalized),
+            "coarse_map": self._denormalize_target(coarse_normalized),
+            "predicted_map": self._denormalize_target(predicted_target_normalized),
+        }
+
+    def training_loss(self, condition: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return self.training_outputs(condition, target)["diffusion"]
+
+    def coarse_sample(self, condition: torch.Tensor) -> torch.Tensor:
+        condition_normalized = self._normalize_condition(condition)
+        coarse_normalized = self.coarse_predictor(condition_normalized)
+        return self._denormalize_target(coarse_normalized)
 
     def sample(
         self,
         condition: torch.Tensor,
         ddim_steps: int | None = None,
         initial_noise: torch.Tensor | None = None,
+        coarse_only: bool = False,
     ) -> torch.Tensor:
         condition_normalized = self._normalize_condition(condition)
-        sample = torch.randn_like(condition_normalized) if initial_noise is None else initial_noise
+        coarse_normalized = self.coarse_predictor(condition_normalized)
+        if coarse_only:
+            return self._denormalize_target(coarse_normalized)
+
+        sample = torch.zeros_like(condition_normalized) if initial_noise is None else initial_noise
         if sample.shape != condition_normalized.shape:
             raise ValueError("initial noise and condition must have identical shapes")
-        num_sampling_steps = min(ddim_steps or self.ddim_steps, self.num_steps)
+        num_sampling_steps = min(ddim_steps or self.ddim_steps, self.max_timestep + 1)
         schedule = torch.linspace(
-            self.num_steps - 1,
+            self.max_timestep,
             0,
             steps=num_sampling_steps,
             device=condition.device,
@@ -244,4 +355,5 @@ class ConditionalFeatureDiffusion(nn.Module):
             next_alpha_bar = self.alpha_bars[next_timestep].to(dtype=sample.dtype)
             sample = next_alpha_bar.sqrt() * predicted_clean + (1.0 - next_alpha_bar).sqrt() * predicted_noise
 
-        return self._denormalize_target(sample)
+        refined = coarse_normalized + torch.tanh(self.refinement_scale) * sample
+        return self._denormalize_target(refined)

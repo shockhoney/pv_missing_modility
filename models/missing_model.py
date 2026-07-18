@@ -7,11 +7,17 @@ from utils.head import ArcFace
 from utils.scenarios import COMPLETE, PALMPRINT_MISSING, PALMVEIN_MISSING
 
 
-ARCHITECTURE_VERSION = "spatial_cross_attention_v1"
+ARCHITECTURE_VERSION = "condition_anchored_residual_diffusion_v5"
+LEGACY_ARCHITECTURE_VERSION = "spatial_cross_attention_v1"
 LEGACY_GATE_KEYS = {"palm_missing_gate", "vein_missing_gate"}
 
 
-def load_missing_model_state(model, state):
+def load_missing_model_state(
+    model,
+    state,
+    allowed_missing_prefixes=(),
+    allowed_unexpected_prefixes=(),
+):
     if any(key.startswith("fusion.cross_attention.q.") for key in state):
         raise ValueError(
             "Checkpoint uses the removed vector head-gating attention. "
@@ -19,6 +25,14 @@ def load_missing_model_state(model, state):
         )
     state = {key: value for key, value in state.items() if key not in LEGACY_GATE_KEYS}
     missing, unexpected = model.load_state_dict(state, strict=False)
+    missing = [
+        key for key in missing
+        if not any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
+    ]
+    unexpected = [
+        key for key in unexpected
+        if not any(key.startswith(prefix) for prefix in allowed_unexpected_prefixes)
+    ]
     if missing or unexpected:
         raise RuntimeError(f"Invalid missing-model checkpoint. Missing={missing}, unexpected={unexpected}")
 
@@ -77,46 +91,14 @@ class ChannelAttentionFusion(nn.Module):
         return weights[:, 0] * palm_feat + weights[:, 1] * vein_feat
 
 
-class AvailableGuidedFusion(nn.Module):
-    def __init__(self, dim=256, reduction=4):
-        super().__init__()
-        hidden = max(dim // reduction, 16)
-        self.delta = nn.Sequential(
-            nn.Linear(dim * 4, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, dim),
-        )
-        self.residual_scale = nn.Parameter(torch.zeros(1))
-
-    @torch.no_grad()
-    def reset_residual_scale(self):
-        self.residual_scale.zero_()
-
-    def forward(self, available_feat, restored_feat):
-        available_feat = F.normalize(available_feat, dim=1)
-        restored_feat = F.normalize(restored_feat, dim=1)
-        cue = torch.cat(
-            [available_feat, restored_feat, available_feat * restored_feat, (available_feat - restored_feat).abs()],
-            dim=1,
-        )
-        residual = F.normalize(self.delta(cue), dim=1)
-        scale = torch.tanh(self.residual_scale)
-        return F.normalize(available_feat + scale * residual, dim=1)
-
-
 class CrossChannelFusion(nn.Module):
     def __init__(self, dim=256, heads=4, reduction=4):
         super().__init__()
         self.cross_attention = CrossModalAttention(dim, heads)
         self.channel_attention = ChannelAttentionFusion(dim, reduction)
-        self.available_fusion = AvailableGuidedFusion(dim, reduction)
         self.project = nn.Linear(dim, dim)
 
-    def forward(self, palm_feat, vein_feat, scenario=COMPLETE):
-        if scenario == PALMPRINT_MISSING:
-            return self.available_fusion(vein_feat, palm_feat)
-        if scenario == PALMVEIN_MISSING:
-            return self.available_fusion(palm_feat, vein_feat)
+    def forward(self, palm_feat, vein_feat):
         palm_feat, vein_feat = self.cross_attention(palm_feat, vein_feat)
         return F.normalize(self.project(self.channel_attention(palm_feat, vein_feat)), dim=1)
 
@@ -145,6 +127,8 @@ class MissingModalityRecognizer(nn.Module):
         diffusion_time_dim=128,
         diffusion_dropout=0.0,
         diffusion_stats_momentum=0.99,
+        diffusion_max_timestep=49,
+        coarse_blocks=3,
     ):
         super().__init__()
         if dim % 2 != 0:
@@ -168,6 +152,8 @@ class MissingModalityRecognizer(nn.Module):
             time_dim=diffusion_time_dim,
             dropout=diffusion_dropout,
             stats_momentum=diffusion_stats_momentum,
+            max_timestep=diffusion_max_timestep,
+            coarse_blocks=coarse_blocks,
         )
         self.p2v = ConditionalFeatureDiffusion(**diffusion_kwargs)
         self.v2p = ConditionalFeatureDiffusion(**diffusion_kwargs)
@@ -207,6 +193,8 @@ class MissingModalityRecognizer(nn.Module):
             "vein_map": vein_map,
             "palm_shared": palm_shared,
             "palm_specific": palm_specific,
+            "base_palm": self.palm_encoder.embedding_from_features(palm_map),
+            "base_vein": self.vein_encoder.embedding_from_features(vein_map),
             "vein_shared": vein_shared,
             "vein_specific": vein_specific,
             "f_palm": self._compose(palm_shared, palm_specific),
@@ -216,23 +204,41 @@ class MissingModalityRecognizer(nn.Module):
     def _compose(self, shared, specific):
         return torch.cat([shared, specific], dim=1)
 
-    def diffusion_loss(self, encoded):
-        return 0.5 * (
-            self.p2v.training_loss(encoded["palm_map"], encoded["vein_map"])
-            + self.v2p.training_loss(encoded["vein_map"], encoded["palm_map"])
-        )
+    def diffusion_training_outputs(self, encoded, update_statistics=True):
+        return {
+            "p2v": self.p2v.training_outputs(
+                encoded["palm_map"],
+                encoded["vein_map"],
+                update_statistics=update_statistics,
+            ),
+            "v2p": self.v2p.training_outputs(
+                encoded["vein_map"],
+                encoded["palm_map"],
+                update_statistics=update_statistics,
+            ),
+        }
 
-    def recover_modalities(self, encoded, directions=("p2v", "v2p")):
+    def diffusion_loss(self, encoded, update_statistics=True):
+        outputs = self.diffusion_training_outputs(encoded, update_statistics=update_statistics)
+        return 0.5 * (outputs["p2v"]["diffusion"] + outputs["v2p"]["diffusion"])
+
+    def recover_modalities(self, encoded, directions=("p2v", "v2p"), coarse_only=False):
         directions = set(directions)
         recovery = {}
 
         if "p2v" in directions:
-            recovered_vein_map = self.p2v.sample(encoded["palm_map"])
+            recovered_vein_map = self.p2v.sample(
+                encoded["palm_map"],
+                coarse_only=coarse_only,
+            )
         else:
             recovered_vein_map = encoded["vein_map"]
 
         if "v2p" in directions:
-            recovered_palm_map = self.v2p.sample(encoded["vein_map"])
+            recovered_palm_map = self.v2p.sample(
+                encoded["vein_map"],
+                coarse_only=coarse_only,
+            )
         else:
             recovered_palm_map = encoded["palm_map"]
 
@@ -242,6 +248,8 @@ class MissingModalityRecognizer(nn.Module):
             {
                 "generated_palm_map": recovered_palm_map,
                 "generated_vein_map": recovered_vein_map,
+                "generated_base_palm": self.palm_encoder.embedding_from_features(recovered_palm_map),
+                "generated_base_vein": self.vein_encoder.embedding_from_features(recovered_vein_map),
                 "hat_palm_specific": hat_palm_specific,
                 "hat_vein_specific": hat_vein_specific,
                 "generated_palm": self._compose(hat_palm_shared, hat_palm_specific),
@@ -270,21 +278,14 @@ class MissingModalityRecognizer(nn.Module):
             return PALMVEIN_MISSING
         raise ValueError("Mixed modality scenarios in one batch are not supported; use scenario-grouped batches")
 
-    def _select_features(self, feats, scenario, mask):
-        if mask is not None:
-            mask = mask.to(feats["f_palm"].device).bool()
-            palm_exists = mask[:, 0:1]
-            vein_exists = mask[:, 1:2]
-            return (
-                torch.where(palm_exists, feats["f_palm"], feats["hat_palm"]),
-                torch.where(vein_exists, feats["f_vein"], feats["hat_vein"]),
-            )
+    @staticmethod
+    def _select_maps(encoded, recovery, scenario):
         if scenario == COMPLETE:
-            return feats["f_palm"], feats["f_vein"]
+            return encoded["palm_map"], encoded["vein_map"]
         if scenario == PALMPRINT_MISSING:
-            return feats["hat_palm"], feats["f_vein"]
+            return recovery["generated_palm_map"], encoded["vein_map"]
         if scenario == PALMVEIN_MISSING:
-            return feats["f_palm"], feats["hat_vein"]
+            return encoded["palm_map"], recovery["generated_vein_map"]
         raise ValueError(f"Unsupported scenario: {scenario}")
 
     def _teacher_logits(self, teacher, feature):
@@ -301,11 +302,8 @@ class MissingModalityRecognizer(nn.Module):
     def forward_from_encoded(self, encoded, recovery, labels=None, scenario=COMPLETE, mask=None):
         feats = {**encoded, **recovery}
         scenario = self._scenario_from_mask(mask, scenario)
-        if scenario == COMPLETE:
-            z = self.fusion(encoded["palm_map"], encoded["vein_map"], scenario=COMPLETE)
-        else:
-            use_palm, use_vein = self._select_features(feats, scenario, mask)
-            z = self.fusion(use_palm, use_vein, scenario=scenario)
+        palm_map, vein_map = self._select_maps(encoded, recovery, scenario)
+        z = self.fusion(palm_map, vein_map)
 
         fusion_logits_raw = self.classifier(z)
         fusion_logits = self.classifier(z, labels) if labels is not None else fusion_logits_raw

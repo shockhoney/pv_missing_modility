@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from models.missing_model import (
     ARCHITECTURE_VERSION,
+    LEGACY_ARCHITECTURE_VERSION,
     MissingModalityRecognizer,
     cosine_alignment_loss,
     load_missing_model_state,
@@ -15,8 +16,12 @@ from models.missing_model import (
 from utils.checkpoint import load_encoder_teacher_from_checkpoint, save_checkpoint
 from utils.checkpoint_io import file_sha256, safe_torch_load
 from utils.datasets_txt import MissingPairTxtDataset, _sample_key, infer_num_classes
-from utils.evaluation import recognition_rate
-from utils.preprocess import build_palm_transform, build_vein_transform
+from utils.evaluation import gallery_probe_metrics, recognition_rate
+from utils.preprocess import (
+    build_paired_geometry_transform,
+    build_palm_transform,
+    build_vein_transform,
+)
 from utils.runtime import build_data_loader, cosine_annealing_lr, resolve_device, set_optimizer_lr, set_random_seed
 from utils.scenarios import COMPLETE, PALMPRINT_MISSING, PALMVEIN_MISSING, SSFD_SCENARIOS
 
@@ -43,6 +48,9 @@ CHECKPOINT_CONFIG_KEYS = (
     "diffusion_time_dim",
     "diffusion_dropout",
     "diffusion_stats_momentum",
+    "diffusion_max_timestep",
+    "coarse_blocks",
+    "recovery_val_stride",
     "arcface_s",
     "arcface_m",
     "palm_teacher_s",
@@ -100,13 +108,27 @@ def validate_encoder_checkpoint(checkpoint, modality, args, num_classes):
     )
 
 
-def make_loader(list_path, args, train=False):
+def make_loader(
+    list_path,
+    args,
+    train=False,
+    augment=None,
+    paired_augment=False,
+    include_labels=None,
+    exclude_labels=None,
+):
+    augment = train if augment is None else augment
+    if paired_augment and not (train and augment):
+        raise ValueError("Paired augmentation is only valid for augmented training loaders")
+    if include_labels is not None and exclude_labels is not None:
+        raise ValueError("include_labels and exclude_labels are mutually exclusive")
     dataset = MissingPairTxtDataset(
         list_path,
-        build_palm_transform(args.input_size, train=train),
-        build_vein_transform(args.input_size, train=train),
+        build_palm_transform(args.input_size, train=augment, geometric=not paired_augment),
+        build_vein_transform(args.input_size, train=augment, geometric=not paired_augment),
+        paired_transform=build_paired_geometry_transform(args.input_size) if paired_augment else None,
     )
-    if train:
+    if train or include_labels is not None or exclude_labels is not None:
         if not dataset.samples:
             raise ValueError("Missing-model train_list is empty")
         labels = sorted({sample["label"] for sample in dataset.samples})
@@ -130,7 +152,26 @@ def make_loader(list_path, args, train=False):
                 raise ValueError(f"Identity {palm_identity!r} maps to multiple labels")
             if label_to_identity.setdefault(label, palm_identity) != palm_identity:
                 raise ValueError(f"Label {label} maps to multiple identities")
+    if include_labels is not None:
+        include_labels = set(include_labels)
+        dataset.samples = [sample for sample in dataset.samples if sample["label"] in include_labels]
+    elif exclude_labels is not None:
+        exclude_labels = set(exclude_labels)
+        dataset.samples = [sample for sample in dataset.samples if sample["label"] not in exclude_labels]
+    if not dataset.samples:
+        raise ValueError("Dataset is empty after applying the identity filter")
     return build_data_loader(dataset, args.batch_size, args.num_workers, train=train)
+
+
+def recovery_validation_labels(list_path, stride):
+    if stride < 2:
+        raise ValueError("recovery_val_stride must be at least 2")
+    dataset = MissingPairTxtDataset(list_path)
+    labels = sorted({sample["label"] for sample in dataset.samples})
+    selected = set(labels[stride - 1 :: stride])
+    if len(selected) < 2 or len(selected) == len(labels):
+        raise ValueError("Recovery validation split must contain at least two held-out identities")
+    return selected
 
 
 def make_optimizer(model, lr, weight_decay):
@@ -171,6 +212,8 @@ def make_model(args, num_classes, device):
         diffusion_time_dim=args.diffusion_time_dim,
         diffusion_dropout=args.diffusion_dropout,
         diffusion_stats_momentum=args.diffusion_stats_momentum,
+        diffusion_max_timestep=args.diffusion_max_timestep,
+        coarse_blocks=args.coarse_blocks,
     ).to(device)
 
 
@@ -180,6 +223,24 @@ def distillation_loss(student_logits, teacher_logits):
         F.softmax(teacher_logits.detach(), dim=1),
         reduction="batchmean",
     )
+
+
+def supervised_contrastive_alignment_loss(query, target, labels, temperature):
+    query = F.normalize(query, dim=1)
+    target = F.normalize(target.detach(), dim=1)
+    logits = query @ target.t() / temperature
+    positive_mask = labels[:, None].eq(labels[None, :])
+    numerator = torch.logsumexp(logits.masked_fill(~positive_mask, -torch.inf), dim=1)
+    denominator = torch.logsumexp(logits, dim=1)
+    forward = (denominator - numerator).mean()
+
+    reverse_logits = target @ query.t() / temperature
+    reverse_numerator = torch.logsumexp(
+        reverse_logits.masked_fill(~positive_mask, -torch.inf),
+        dim=1,
+    )
+    reverse_denominator = torch.logsumexp(reverse_logits, dim=1)
+    return 0.5 * (forward + (reverse_denominator - reverse_numerator).mean())
 
 
 def missing_distillation_loss(output):
@@ -212,9 +273,9 @@ def missing_distillation_losses(outputs):
 def recovery_identity_loss(model, recovery, labels, ce):
     losses = []
     if model.palm_teacher is not None:
-        losses.append(ce(model.palm_teacher(recovery["generated_palm"], labels), labels))
+        losses.append(ce(model.palm_teacher(recovery["generated_base_palm"], labels), labels))
     if model.vein_teacher is not None:
-        losses.append(ce(model.vein_teacher(recovery["generated_vein"], labels), labels))
+        losses.append(ce(model.vein_teacher(recovery["generated_base_vein"], labels), labels))
     return sum(losses) / len(losses) if losses else torch.zeros((), device=labels.device)
 
 
@@ -304,35 +365,166 @@ def complete_fusion_losses(model, palm, vein, labels, ce, args):
     }
 
 
+def modality_cycle_losses(model, encoded, generated_palm_map, generated_vein_map):
+    cycle_vein_map = model.p2v.coarse_sample(generated_palm_map)
+    cycle_palm_map = model.v2p.coarse_sample(generated_vein_map)
+    cycle_rec = 0.5 * (
+        F.smooth_l1_loss(cycle_palm_map, encoded["palm_map"])
+        + F.smooth_l1_loss(cycle_vein_map, encoded["vein_map"])
+    )
+    cycle_cos = 0.5 * (
+        cosine_alignment_loss(
+            model.palm_encoder.embedding_from_features(cycle_palm_map),
+            encoded["base_palm"],
+        )
+        + cosine_alignment_loss(
+            model.vein_encoder.embedding_from_features(cycle_vein_map),
+            encoded["base_vein"],
+        )
+    )
+    return cycle_rec, cycle_cos
+
+
 def diffusion_losses(model, palm, vein, labels, ce, args):
     encoded = model.encode_modalities(palm, vein)
-    loss = model.diffusion_loss(encoded)
-    return {"loss": loss, "diffusion": loss}
+    outputs = model.diffusion_training_outputs(encoded)
+    p2v = outputs["p2v"]
+    v2p = outputs["v2p"]
+
+    coarse_vein = model.vein_encoder.embedding_from_features(p2v["coarse_map"])
+    coarse_palm = model.palm_encoder.embedding_from_features(v2p["coarse_map"])
+    predicted_vein = model.vein_encoder.embedding_from_features(p2v["predicted_map"])
+    predicted_palm = model.palm_encoder.embedding_from_features(v2p["predicted_map"])
+
+    diffusion = 0.5 * (p2v["diffusion"] + v2p["diffusion"])
+    coarse_rec = 0.5 * (p2v["coarse_rec"] + v2p["coarse_rec"])
+    x0_rec = 0.5 * (p2v["x0_rec"] + v2p["x0_rec"])
+    coarse_cos = 0.5 * (
+        cosine_alignment_loss(coarse_vein, encoded["base_vein"])
+        + cosine_alignment_loss(coarse_palm, encoded["base_palm"])
+    )
+    x0_cos = 0.5 * (
+        cosine_alignment_loss(predicted_vein, encoded["base_vein"])
+        + cosine_alignment_loss(predicted_palm, encoded["base_palm"])
+    )
+    cycle_rec, cycle_cos = modality_cycle_losses(
+        model,
+        encoded,
+        v2p["coarse_map"],
+        p2v["coarse_map"],
+    )
+    contrast = 0.25 * (
+        supervised_contrastive_alignment_loss(
+            coarse_vein, encoded["base_vein"], labels, args.contrast_temperature
+        )
+        + supervised_contrastive_alignment_loss(
+            coarse_palm, encoded["base_palm"], labels, args.contrast_temperature
+        )
+        + supervised_contrastive_alignment_loss(
+            predicted_vein, encoded["base_vein"], labels, args.contrast_temperature
+        )
+        + supervised_contrastive_alignment_loss(
+            predicted_palm, encoded["base_palm"], labels, args.contrast_temperature
+        )
+    )
+    identity = 0.25 * (
+        ce(model.vein_teacher(coarse_vein, labels), labels)
+        + ce(model.palm_teacher(coarse_palm, labels), labels)
+        + ce(model.vein_teacher(predicted_vein, labels), labels)
+        + ce(model.palm_teacher(predicted_palm, labels), labels)
+    )
+    loss = (
+        args.lambda_diffusion * diffusion
+        + args.lambda_coarse_rec * coarse_rec
+        + args.lambda_x0_rec * x0_rec
+        + args.lambda_coarse_cos * coarse_cos
+        + args.lambda_x0_cos * x0_cos
+        + args.lambda_diffusion_contrast * contrast
+        + args.lambda_diffusion_id * identity
+        + args.lambda_cycle_rec * cycle_rec
+        + args.lambda_cycle_cos * cycle_cos
+    )
+    return {
+        "loss": loss,
+        "diffusion": diffusion,
+        "coarse_rec": coarse_rec,
+        "x0_rec": x0_rec,
+        "coarse_cos": coarse_cos,
+        "x0_cos": x0_cos,
+        "cycle_rec": cycle_rec,
+        "cycle_cos": cycle_cos,
+        "contrast": contrast,
+        "identity": identity,
+        "accuracy_logits": {
+            "p2v_coarse": model.vein_teacher(coarse_vein),
+            "v2p_coarse": model.palm_teacher(coarse_palm),
+            "p2v_x0": model.vein_teacher(predicted_vein),
+            "v2p_x0": model.palm_teacher(predicted_palm),
+        },
+    }
 
 
-def sampled_recovery_losses(model, palm, vein, labels, ce, args):
-    encoded = model.encode_modalities(palm, vein)
-    recovery = model.recover_modalities(encoded)
+def recovery_supervision_losses(model, encoded, recovery, labels, ce, args):
     reconstruction = 0.5 * (
         F.smooth_l1_loss(recovery["generated_palm_map"], encoded["palm_map"])
         + F.smooth_l1_loss(recovery["generated_vein_map"], encoded["vein_map"])
     )
     alignment = 0.5 * (
-        cosine_alignment_loss(recovery["generated_palm"], encoded["f_palm"])
-        + cosine_alignment_loss(recovery["generated_vein"], encoded["f_vein"])
+        cosine_alignment_loss(recovery["generated_base_palm"], encoded["base_palm"])
+        + cosine_alignment_loss(recovery["generated_base_vein"], encoded["base_vein"])
     )
     identity = recovery_identity_loss(model, recovery, labels, ce)
+    contrast = 0.5 * (
+        supervised_contrastive_alignment_loss(
+            recovery["generated_base_palm"],
+            encoded["base_palm"],
+            labels,
+            args.contrast_temperature,
+        )
+        + supervised_contrastive_alignment_loss(
+            recovery["generated_base_vein"],
+            encoded["base_vein"],
+            labels,
+            args.contrast_temperature,
+        )
+    )
+    diffusion = model.diffusion_loss(encoded, update_statistics=False)
+    cycle_rec, cycle_cos = modality_cycle_losses(
+        model,
+        encoded,
+        recovery["generated_palm_map"],
+        recovery["generated_vein_map"],
+    )
     loss = (
         args.lambda_sample_rec * reconstruction
         + args.lambda_sample_cos * alignment
         + args.lambda_sample_id * identity
+        + args.lambda_sample_contrast * contrast
+        + args.lambda_recovery_diffusion * diffusion
+        + args.lambda_cycle_rec * cycle_rec
+        + args.lambda_cycle_cos * cycle_cos
     )
     return {
         "loss": loss,
         "sample_rec": reconstruction,
         "sample_cos": alignment,
         "sample_id": identity,
+        "sample_contrast": contrast,
+        "diffusion": diffusion,
+        "cycle_rec": cycle_rec,
+        "cycle_cos": cycle_cos,
     }
+
+
+def sampled_recovery_losses(model, palm, vein, labels, ce, args):
+    encoded = model.encode_modalities(palm, vein)
+    recovery = model.recover_modalities(encoded)
+    losses = recovery_supervision_losses(model, encoded, recovery, labels, ce, args)
+    losses["accuracy_logits"] = {
+        "p2v_recovered": model.vein_teacher(recovery["generated_base_vein"]),
+        "v2p_recovered": model.palm_teacher(recovery["generated_base_palm"]),
+    }
+    return losses
 
 
 def sampled_fusion_losses(model, palm, vein, labels, ce, args):
@@ -345,18 +537,25 @@ def sampled_fusion_losses(model, palm, vein, labels, ce, args):
         + cosine_alignment_loss(outputs[PALMVEIN_MISSING]["z"], outputs[COMPLETE]["z"])
     )
     distill = missing_distillation_losses(outputs)
+    restoration = recovery_supervision_losses(model, encoded, recovery, labels, ce, args)
     loss = (
         cls_loss
         + args.lambda_scenario * scenario_alignment
         + args.lambda_distill * distill
+        + args.lambda_fusion_recovery * restoration["loss"]
     )
     return {
         "loss": loss,
         "cls": cls_loss,
         "scenario": scenario_alignment,
         "distill": distill,
+        "recovery": restoration["loss"],
         "outputs": outputs,
-        "accuracy_logits": {scenario: outputs[scenario]["fusion_logits"] for scenario in SCENARIOS},
+        "accuracy_logits": {
+            **{scenario: outputs[scenario]["fusion_logits"] for scenario in SCENARIOS},
+            "p2v_recovered": model.vein_teacher(recovery["generated_base_vein"]),
+            "v2p_recovered": model.palm_teacher(recovery["generated_base_palm"]),
+        },
     }
 
 
@@ -393,21 +592,22 @@ def configure_complete_fusion_training(model):
 
 
 def configure_fusion_stage(model):
-    for param in model.parameters():
-        param.requires_grad = False
-    model.fusion.available_fusion.reset_residual_scale()
-    for param in model.fusion.available_fusion.parameters():
-        param.requires_grad = True
+    configure_recovery_training(model)
 
 
 def load_model_state(model, checkpoint_path, device, num_classes, expected_stage, args):
     checkpoint = safe_torch_load(checkpoint_path, device)
     if checkpoint.get("num_classes") != num_classes:
         raise ValueError("Missing-model checkpoint class count does not match train_list")
-    if checkpoint.get("architecture_version") != ARCHITECTURE_VERSION:
+    checkpoint_architecture = checkpoint.get("architecture_version")
+    legacy_base_stage = (
+        checkpoint_architecture == LEGACY_ARCHITECTURE_VERSION
+        and expected_stage in (ALIGNMENT_STAGE, COMPLETE_FUSION_STAGE)
+    )
+    if checkpoint_architecture != ARCHITECTURE_VERSION and not legacy_base_stage:
         raise ValueError(
             f"Checkpoint architecture must be {ARCHITECTURE_VERSION!r}; "
-            "reuse the encoder checkpoints and retrain the missing-model stages"
+            "only legacy alignment/complete-fusion checkpoints can be migrated"
         )
     if checkpoint.get("training_stage") != expected_stage:
         raise ValueError(
@@ -417,7 +617,8 @@ def load_model_state(model, checkpoint_path, device, num_classes, expected_stage
     mismatches = [
         key
         for key in CHECKPOINT_CONFIG_KEYS
-        if checkpoint_args.get(key) != getattr(args, key, None)
+        if (not legacy_base_stage or key in checkpoint_args)
+        and checkpoint_args.get(key) != getattr(args, key, None)
     ]
     if mismatches:
         details = ", ".join(
@@ -425,11 +626,39 @@ def load_model_state(model, checkpoint_path, device, num_classes, expected_stage
             for key in mismatches
         )
         raise ValueError(f"Checkpoint configuration mismatch ({details})")
-    load_missing_model_state(model, checkpoint["model"])
+    if legacy_base_stage:
+        load_missing_model_state(
+            model,
+            checkpoint["model"],
+            allowed_missing_prefixes=(
+                "p2v.coarse_predictor.",
+                "v2p.coarse_predictor.",
+                "p2v.refinement_scale",
+                "v2p.refinement_scale",
+                "p2v.denoiser.condition_",
+                "v2p.denoiser.condition_",
+            ),
+            allowed_unexpected_prefixes=("fusion.available_fusion.",),
+        )
+        print(f"[Info] migrated legacy {expected_stage} checkpoint to {ARCHITECTURE_VERSION}")
+    else:
+        load_missing_model_state(model, checkpoint["model"])
     return checkpoint
 
 
-def train_epoch(model, loader, optimizer, ce, device, args, loss_fn, loss_names, description, eval_diffusion):
+def train_epoch(
+    model,
+    loader,
+    optimizer,
+    ce,
+    device,
+    args,
+    loss_fn,
+    loss_names,
+    description,
+    eval_diffusion,
+    grad_clip,
+):
     model.train()
     if eval_diffusion:
         model.p2v.eval()
@@ -448,7 +677,7 @@ def train_epoch(model, loader, optimizer, ce, device, args, loss_fn, loss_names,
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.grad_clip)
+        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
         optimizer.step()
 
         batch_size = labels.size(0)
@@ -463,7 +692,78 @@ def train_epoch(model, loader, optimizer, ce, device, args, loss_fn, loss_names,
     return {key: value / total for key, value in sums.items()}
 
 
-def train_stage(model, loader, device, args, num_classes, stage, save_path):
+@torch.no_grad()
+def evaluate_recovery_validation(model, loader, device, coarse_only):
+    model.eval()
+    collected = {
+        key: []
+        for key in (
+            "labels",
+            "palm",
+            "vein",
+            "generated_palm",
+            "generated_vein",
+            "complete_z",
+            PALMPRINT_MISSING,
+            PALMVEIN_MISSING,
+        )
+    }
+    for palm, vein, labels, _ in tqdm(loader, desc="Validate recovery", dynamic_ncols=True):
+        palm = palm.to(device, non_blocking=True)
+        vein = vein.to(device, non_blocking=True)
+        encoded = model.encode_modalities(palm, vein)
+        recovery = model.recover_modalities(encoded, coarse_only=coarse_only)
+        values = {
+            "labels": labels,
+            "palm": encoded["base_palm"],
+            "vein": encoded["base_vein"],
+            "generated_palm": recovery["generated_base_palm"],
+            "generated_vein": recovery["generated_base_vein"],
+            "complete_z": model.forward_from_encoded(
+                encoded, recovery, scenario=COMPLETE
+            )["z"],
+            PALMPRINT_MISSING: model.forward_from_encoded(
+                encoded, recovery, scenario=PALMPRINT_MISSING
+            )["z"],
+            PALMVEIN_MISSING: model.forward_from_encoded(
+                encoded, recovery, scenario=PALMVEIN_MISSING
+            )["z"],
+        }
+        for key, value in values.items():
+            collected[key].append(value.detach().cpu())
+
+    collected = {key: torch.cat(values) for key, values in collected.items()}
+    labels = collected["labels"].long()
+    gallery_mask = torch.zeros(labels.numel(), dtype=torch.bool)
+    for label in labels.unique(sorted=True):
+        indices = torch.nonzero(labels == label, as_tuple=False).flatten()
+        probe_count = max(1, indices.numel() // 5)
+        if indices.numel() <= probe_count:
+            raise ValueError("Each recovery-validation identity needs gallery and probe samples")
+        gallery_mask[indices[:-probe_count]] = True
+    probe_mask = ~gallery_mask
+
+    def top1(gallery_key, probe_key):
+        metrics = gallery_probe_metrics(
+            collected[gallery_key][gallery_mask],
+            labels[gallery_mask],
+            collected[probe_key][probe_mask],
+            labels[probe_mask],
+            topk=(1,),
+            far_points=(),
+        )
+        return metrics["topk"][1]
+
+    return {
+        "p2v_top1": top1("vein", "generated_vein"),
+        "v2p_top1": top1("palm", "generated_palm"),
+        "palmprint_missing_top1": top1("complete_z", PALMPRINT_MISSING),
+        "palmvein_missing_top1": top1("complete_z", PALMVEIN_MISSING),
+    }
+
+
+
+def train_stage(model, loader, validation_loader, device, args, num_classes, stage, save_path):
     if stage == ALIGNMENT_STAGE:
         configure_alignment_training(model)
         epochs = args.alignment_epochs
@@ -480,6 +780,7 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
             "norm_balance",
             "specific",
         )
+        grad_clip = args.grad_clip
     elif stage == COMPLETE_FUSION_STAGE:
         configure_complete_fusion_training(model)
         epochs = args.complete_fusion_epochs
@@ -488,6 +789,7 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
         warmup_epochs = args.complete_fusion_warmup_epochs
         loss_fn = complete_fusion_losses
         loss_names = ("loss", "complete_cls")
+        grad_clip = args.grad_clip
     elif stage == FUSION_STAGE:
         configure_fusion_stage(model)
         epochs = args.fusion_epochs
@@ -495,7 +797,8 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
         min_lr = args.fusion_min_lr
         warmup_epochs = args.fusion_warmup_epochs
         loss_fn = sampled_fusion_losses
-        loss_names = ("loss", "cls", "scenario", "distill")
+        loss_names = ("loss", "cls", "scenario", "distill", "recovery")
+        grad_clip = args.fusion_grad_clip
     elif stage == RECOVERY_STAGE:
         configure_recovery_training(model)
         epochs = args.recovery_epochs
@@ -503,7 +806,17 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
         min_lr = args.recovery_min_lr
         warmup_epochs = args.recovery_warmup_epochs
         loss_fn = sampled_recovery_losses
-        loss_names = ("loss", "sample_rec", "sample_cos", "sample_id")
+        loss_names = (
+            "loss",
+            "sample_rec",
+            "sample_cos",
+            "sample_id",
+            "sample_contrast",
+            "diffusion",
+            "cycle_rec",
+            "cycle_cos",
+        )
+        grad_clip = args.recovery_grad_clip
     else:
         configure_recovery_training(model)
         epochs = args.epochs
@@ -511,11 +824,24 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
         min_lr = args.min_lr
         warmup_epochs = args.warmup_epochs
         loss_fn = diffusion_losses
-        loss_names = ("loss", "diffusion")
+        loss_names = (
+            "loss",
+            "diffusion",
+            "coarse_rec",
+            "x0_rec",
+            "coarse_cos",
+            "x0_cos",
+            "cycle_rec",
+            "cycle_cos",
+            "contrast",
+            "identity",
+        )
+        grad_clip = args.diffusion_grad_clip
 
     optimizer = make_optimizer(model, base_lr, args.wd)
     ce = nn.CrossEntropyLoss()
-    best = float("inf")
+    use_validation = validation_loader is not None
+    best = -float("inf") if use_validation else float("inf")
     print(f"[Info] start {stage} stage: epochs={epochs}, trainable_params={sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     for epoch in range(1, epochs + 1):
@@ -532,14 +858,32 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
             loss_names,
             f"Train {stage}",
             eval_diffusion=stage in (RECOVERY_STAGE, FUSION_STAGE),
+            grad_clip=grad_clip,
         )
         losses = " ".join(f"{name}={stats[name]:.4f}" for name in loss_names)
         accuracies = "".join(
             f" {name}={stats[name]:.4f}" for name in sorted(stats) if name.startswith("acc_")
         )
         print(f"[{stage} Epoch {epoch}] {losses}{accuracies} lr={lr:.6g}")
-        if stats["loss"] < best:
-            best = stats["loss"]
+        validation = None
+        if use_validation:
+            validation = evaluate_recovery_validation(
+                model,
+                validation_loader,
+                device,
+                coarse_only=stage == DIFFUSION_STAGE,
+            )
+            validation_text = " ".join(
+                f"{name}={value * 100:.2f}%" for name, value in validation.items()
+            )
+            print(f"[{stage} Validation Epoch {epoch}] {validation_text}")
+            score = min(validation["p2v_top1"], validation["v2p_top1"])
+            improved = score > best
+        else:
+            score = stats["loss"]
+            improved = score < best
+        if improved:
+            best = score
             save_checkpoint(
                 save_path,
                 {
@@ -547,12 +891,15 @@ def train_stage(model, loader, device, args, num_classes, stage, save_path):
                     "model": model.state_dict(),
                     "args": vars(args),
                     "num_classes": num_classes,
-                    "best_loss": best,
+                    "best_loss": stats["loss"],
+                    "best_selection_score": best,
+                    "validation": validation,
                     "training_stage": stage,
                     "architecture_version": ARCHITECTURE_VERSION,
                 },
             )
-            print(f"[Info] saved {save_path} by {stage}_train_loss")
+            selection = "heldout_identity_validation" if use_validation else "train_loss"
+            print(f"[Info] saved {save_path} by {stage}_{selection}")
 
 
 def train(args):
@@ -560,7 +907,6 @@ def train(args):
     set_random_seed(args.seed)
     set_input_fingerprints(args)
     num_classes = infer_num_classes(args.train_list)
-    train_loader = make_loader(args.train_list, args, train=True)
     model = make_model(args, num_classes, device)
     stage_paths = {
         ALIGNMENT_STAGE: args.alignment_ckpt,
@@ -570,8 +916,41 @@ def train(args):
         FUSION_STAGE: args.save_path,
     }
     stages = STAGE_ORDER if args.stage == "all" else (args.stage,)
+    needs_recovery_validation = any(
+        stage in (DIFFUSION_STAGE, RECOVERY_STAGE, FUSION_STAGE) for stage in stages
+    )
+    validation_labels = (
+        recovery_validation_labels(args.train_list, args.recovery_val_stride)
+        if needs_recovery_validation
+        else set()
+    )
+    if validation_labels:
+        print(
+            f"[Info] recovery split: train_identities={num_classes - len(validation_labels)}, "
+            f"heldout_validation_identities={len(validation_labels)}"
+        )
     for stage in stages:
         stage_index = STAGE_ORDER.index(stage)
+        map_supervision = stage in (DIFFUSION_STAGE, RECOVERY_STAGE, FUSION_STAGE)
+        train_loader = make_loader(
+            args.train_list,
+            args,
+            train=True,
+            augment=True,
+            paired_augment=map_supervision,
+            exclude_labels=validation_labels if map_supervision else None,
+        )
+        validation_loader = (
+            make_loader(
+                args.train_list,
+                args,
+                train=False,
+                augment=False,
+                include_labels=validation_labels,
+            )
+            if map_supervision
+            else None
+        )
         if stage_index > 0:
             previous_stage = STAGE_ORDER[stage_index - 1]
             load_model_state(
@@ -582,7 +961,16 @@ def train(args):
                 expected_stage=previous_stage,
                 args=args,
             )
-        train_stage(model, train_loader, device, args, num_classes, stage, stage_paths[stage])
+        train_stage(
+            model,
+            train_loader,
+            validation_loader,
+            device,
+            args,
+            num_classes,
+            stage,
+            stage_paths[stage],
+        )
 
 
 def parse_args(argv=None):
@@ -602,7 +990,7 @@ def parse_args(argv=None):
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--recovery_epochs", type=int, default=30)
     parser.add_argument("--fusion_epochs", type=int, default=40)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -616,9 +1004,24 @@ def parse_args(argv=None):
     parser.add_argument("--diffusion_time_dim", type=int, default=128)
     parser.add_argument("--diffusion_dropout", type=float, default=0.0)
     parser.add_argument("--diffusion_stats_momentum", type=float, default=0.99)
+    parser.add_argument("--diffusion_max_timestep", type=int, default=49)
+    parser.add_argument("--coarse_blocks", type=int, default=1)
+    parser.add_argument("--recovery_val_stride", type=int, default=10)
+    parser.add_argument("--lambda_diffusion", type=float, default=1.0)
+    parser.add_argument("--lambda_coarse_rec", type=float, default=0.5)
+    parser.add_argument("--lambda_x0_rec", type=float, default=0.5)
+    parser.add_argument("--lambda_coarse_cos", type=float, default=2.0)
+    parser.add_argument("--lambda_x0_cos", type=float, default=0.5)
+    parser.add_argument("--lambda_diffusion_contrast", type=float, default=0.05)
+    parser.add_argument("--lambda_diffusion_id", type=float, default=0.02)
+    parser.add_argument("--lambda_cycle_rec", type=float, default=0.5)
+    parser.add_argument("--lambda_cycle_cos", type=float, default=1.0)
     parser.add_argument("--lambda_sample_rec", type=float, default=1.0)
     parser.add_argument("--lambda_sample_cos", type=float, default=1.0)
-    parser.add_argument("--lambda_sample_id", type=float, default=0.5)
+    parser.add_argument("--lambda_sample_id", type=float, default=0.02)
+    parser.add_argument("--lambda_sample_contrast", type=float, default=0.05)
+    parser.add_argument("--lambda_recovery_diffusion", type=float, default=0.5)
+    parser.add_argument("--contrast_temperature", type=float, default=0.07)
     parser.add_argument("--lambda_shared_cls", type=float, default=1.0)
     parser.add_argument("--lambda_shared", type=float, default=1.0)
     parser.add_argument("--lambda_orthogonal", type=float, default=0.1)
@@ -627,13 +1030,14 @@ def parse_args(argv=None):
     parser.add_argument("--specific_margin", type=float, default=0.0)
     parser.add_argument("--lambda_distill", type=float, default=0.1)
     parser.add_argument("--lambda_scenario", type=float, default=0.5)
+    parser.add_argument("--lambda_fusion_recovery", type=float, default=0.5)
     parser.add_argument("--alignment_lr", type=float, default=1e-4)
     parser.add_argument("--alignment_min_lr", type=float, default=1e-6)
     parser.add_argument("--complete_fusion_lr", type=float, default=1e-4)
     parser.add_argument("--complete_fusion_min_lr", type=float, default=1e-6)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min_lr", type=float, default=0.0)
-    parser.add_argument("--recovery_lr", type=float, default=1e-5)
+    parser.add_argument("--recovery_lr", type=float, default=1e-4)
     parser.add_argument("--recovery_min_lr", type=float, default=1e-6)
     parser.add_argument("--fusion_lr", type=float, default=1e-4)
     parser.add_argument("--fusion_min_lr", type=float, default=1e-6)
@@ -646,9 +1050,16 @@ def parse_args(argv=None):
     parser.add_argument("--recovery_warmup_epochs", type=int, default=2)
     parser.add_argument("--fusion_warmup_epochs", type=int, default=2)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--diffusion_grad_clip", type=float, default=5.0)
+    parser.add_argument("--recovery_grad_clip", type=float, default=10.0)
+    parser.add_argument("--fusion_grad_clip", type=float, default=10.0)
     args = parser.parse_args(argv)
     if not -1.0 <= args.specific_margin <= 1.0:
         parser.error("--specific_margin must be in [-1, 1]")
+    if not 0 <= args.diffusion_max_timestep < args.diffusion_steps:
+        parser.error("--diffusion_max_timestep must be in [0, diffusion_steps)")
+    if args.contrast_temperature <= 0:
+        parser.error("--contrast_temperature must be positive")
     return args
 
 

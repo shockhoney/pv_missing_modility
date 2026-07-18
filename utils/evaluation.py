@@ -1,7 +1,95 @@
+import math
 import warnings
+from numbers import Integral, Real
 
 import torch
 import torch.nn.functional as F
+
+
+def _as_label_vector(values, name, device=None, allow_empty=False):
+    try:
+        raw = torch.as_tensor(values, device=device)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a one-dimensional integer label vector") from error
+    if raw.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    if not allow_empty and raw.numel() == 0:
+        raise ValueError(f"{name} must not be empty")
+    if raw.dtype == torch.bool or raw.is_complex():
+        raise ValueError(f"{name} must contain integer labels")
+    if raw.is_floating_point():
+        if not torch.isfinite(raw).all():
+            raise ValueError(f"{name} must contain only finite labels")
+        if not torch.equal(raw, raw.round()):
+            raise ValueError(f"{name} must contain integer-valued labels")
+    return raw.to(dtype=torch.long)
+
+
+def _as_score_matrix(values, name="scores", device=None):
+    try:
+        scores = torch.as_tensor(values, dtype=torch.float32, device=device)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a numeric two-dimensional matrix") from error
+    if scores.ndim != 2 or scores.size(0) == 0 or scores.size(1) == 0:
+        raise ValueError(f"{name} must be a non-empty [num_probes, num_candidates] matrix")
+    if not torch.isfinite(scores).all():
+        raise ValueError(f"{name} must contain only finite values")
+    return scores
+
+
+def _validate_topk(topk):
+    try:
+        values = tuple(topk)
+    except TypeError as error:
+        raise ValueError("topk must be an iterable of positive integers") from error
+    validated = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
+            raise ValueError("Top-k values must be positive integers")
+        validated.append(int(value))
+    validated = tuple(sorted(set(validated)))
+    if not validated:
+        raise ValueError("At least one positive Top-k value is required")
+    return validated
+
+
+def _validate_far_points(far_points):
+    try:
+        values = tuple(far_points)
+    except TypeError as error:
+        raise ValueError("far_points must be an iterable of finite values in [0, 1]") from error
+    validated = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError("FAR operating points must be finite real values in [0, 1]")
+        value = float(value)
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("FAR operating points must be finite real values in [0, 1]")
+        if value not in validated:
+            validated.append(value)
+    if not validated:
+        raise ValueError("At least one FAR operating point is required")
+    return tuple(validated)
+
+
+def _validate_score_matrix_inputs(scores, candidate_labels, probe_labels):
+    scores = _as_score_matrix(scores)
+    candidate_labels = _as_label_vector(
+        candidate_labels, "candidate_labels", device=scores.device
+    )
+    probe_labels = _as_label_vector(probe_labels, "probe_labels", device=scores.device)
+    if scores.size(0) != probe_labels.numel():
+        raise ValueError("Scores rows must match the number of probe labels")
+    if scores.size(1) != candidate_labels.numel():
+        raise ValueError("Candidate labels must match the score-matrix columns")
+    if candidate_labels.unique().numel() != candidate_labels.numel():
+        raise ValueError("Candidate labels must be unique")
+    if candidate_labels.numel() < 2:
+        raise ValueError("At least two candidate identities are required for verification metrics")
+    genuine_counts = probe_labels[:, None].eq(candidate_labels[None, :]).sum(dim=1)
+    if not torch.all(genuine_counts == 1):
+        raise ValueError("Every probe identity must occur exactly once in the candidate labels")
+    return scores, candidate_labels, probe_labels
 
 
 def count_correct_predictions(logits, labels):
@@ -21,23 +109,25 @@ def recognition_rate(logits, labels):
 
 
 def build_gallery_templates(embeddings, labels):
-    embeddings = torch.as_tensor(embeddings, dtype=torch.float32)
-    labels = torch.as_tensor(labels, dtype=torch.long)
-    if embeddings.ndim != 2 or embeddings.size(0) != labels.numel():
-        raise ValueError("Gallery embeddings must be [N, D] with one label per sample")
+    embeddings = _as_score_matrix(embeddings, "gallery_embeddings")
+    labels = _as_label_vector(labels, "gallery_labels", device=embeddings.device)
+    if embeddings.size(0) != labels.numel():
+        raise ValueError("Gallery embeddings must have one label per sample")
     gallery_labels = labels.unique(sorted=True)
-    if gallery_labels.numel() == 0:
-        raise ValueError("Gallery is empty")
     templates = torch.stack([embeddings[labels == label].mean(dim=0) for label in gallery_labels])
+    if torch.any(templates.norm(dim=1) <= 0):
+        raise ValueError("Every gallery identity template must have non-zero norm")
     return F.normalize(templates, dim=1), gallery_labels
 
 
 def gallery_probe_scores(gallery_embeddings, gallery_labels, probe_embeddings):
     templates, template_labels = build_gallery_templates(gallery_embeddings, gallery_labels)
-    probes = F.normalize(torch.as_tensor(probe_embeddings, dtype=torch.float32), dim=1)
-    if probes.ndim != 2 or probes.size(1) != templates.size(1):
+    probes = _as_score_matrix(probe_embeddings, "probe_embeddings", device=templates.device)
+    if probes.size(1) != templates.size(1):
         raise ValueError("Probe and gallery embedding dimensions must match")
-    return probes @ templates.t(), template_labels
+    if torch.any(probes.norm(dim=1) <= 0):
+        raise ValueError("Every probe embedding must have non-zero norm")
+    return F.normalize(probes, dim=1) @ templates.t(), template_labels
 
 
 def _verification_curve(genuine_scores, impostor_scores):
@@ -90,25 +180,44 @@ def gallery_probe_metrics(
     far_points=(1e-3, 1e-4),
 ):
     scores, template_labels = gallery_probe_scores(gallery_embeddings, gallery_labels, probe_embeddings)
-    probe_labels = torch.as_tensor(probe_labels, dtype=torch.long)
-    if scores.size(0) != probe_labels.numel():
-        raise ValueError("Probe embeddings and labels must have the same length")
+    return score_matrix_metrics(
+        scores,
+        template_labels,
+        probe_labels,
+        topk=topk,
+        far_points=far_points,
+    )
+
+
+def score_matrix_metrics(
+    scores,
+    candidate_labels,
+    probe_labels,
+    topk=(1, 5),
+    far_points=(1e-3, 1e-4),
+    warn_far_resolution=True,
+):
+    """Evaluate a precomputed probe-by-identity score matrix.
+
+    This is useful when the final score combines several embedding domains and
+    therefore cannot be represented by one concatenated cosine embedding.
+    """
+    scores, template_labels, probe_labels = _validate_score_matrix_inputs(
+        scores, candidate_labels, probe_labels
+    )
+    if not isinstance(warn_far_resolution, bool):
+        raise ValueError("warn_far_resolution must be a bool")
 
     genuine_mask = probe_labels[:, None].eq(template_labels[None, :])
-    if not torch.all(genuine_mask.sum(dim=1) == 1):
-        raise ValueError("Every probe identity must occur exactly once in the gallery templates")
     genuine_scores = scores[genuine_mask]
     impostor_scores = scores[~genuine_mask]
     far, tar = _verification_curve(genuine_scores, impostor_scores)
 
-    far_points = tuple(float(point) for point in far_points)
-    for point in far_points:
-        if not 0.0 <= point <= 1.0:
-            raise ValueError("FAR operating points must be in [0, 1]")
+    far_points = _validate_far_points(far_points)
     far_count_resolution = 1.0 / impostor_scores.numel()
     minimum_nonzero_far = float(far[far > 0].min().item())
     for point in far_points:
-        if point + 1e-12 < minimum_nonzero_far:
+        if warn_far_resolution and point + 1e-12 < minimum_nonzero_far:
             warnings.warn(
                 f"FAR={point:g} is below the minimum positive empirical FAR {minimum_nonzero_far:g} "
                 f"(count resolution {far_count_resolution:g}); "
@@ -117,9 +226,7 @@ def gallery_probe_metrics(
                 stacklevel=2,
             )
 
-    topk = tuple(sorted(set(int(k) for k in topk if int(k) > 0)))
-    if not topk:
-        raise ValueError("At least one positive Top-k value is required")
+    topk = _validate_topk(topk)
     max_k = min(max(topk), template_labels.numel())
     ranked_labels = template_labels[scores.topk(max_k, dim=1).indices]
     topk_accuracy = {
