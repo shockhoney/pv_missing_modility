@@ -228,12 +228,12 @@ def parse_args(argv=None):
     tokens = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser("Train palm/vein baseline encoder")
     parser.add_argument("--modality", choices=["palm", "vein"], default="palm")
-    parser.add_argument("--train_list", default="data_txt/tongji/ssfd_train_full.txt")
+    parser.add_argument("--train_list", default="data_txt/cumt/ssfd_train_full.txt")
     parser.add_argument(
-        "--val_gallery_list", default="data_txt/tongji/ssfd_val_gallery_full.txt"
+        "--val_gallery_list", default="data_txt/cumt/ssfd_val_gallery_full.txt"
     )
     parser.add_argument(
-        "--val_protocol_list", default="data_txt/tongji/ssfd_val_protocol.txt"
+        "--val_protocol_list", default="data_txt/cumt/ssfd_val_protocol.txt"
     )
     parser.add_argument("--save_dir", default="outputs/encoders")
     parser.add_argument("--epochs", type=int, default=200)

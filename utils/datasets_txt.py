@@ -16,6 +16,7 @@ from utils.scenarios import COMPLETE, PALMPRINT_MISSING, PALMVEIN_MISSING
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 NA_TOKEN = "NA"
+IDENTITY_TRAIN_FRACTION = 0.8
 SSFD_PROTOCOL_FILES = {
     "ssfd_train_full": "ssfd_train_full.txt",
     "ssfd_gallery_full": "ssfd_gallery_full.txt",
@@ -172,11 +173,18 @@ def _cross_session_gallery_probe(gallery_samples, probe_samples, dataset, class_
 
 
 def _split_identity_ids(class_ids, dataset: str, seed: int, config):
-    train_fraction = config["gallery_count"] / (config["gallery_count"] + config["probe_count"])
-    num_train = round(len(class_ids) * train_fraction)
+    if len(class_ids) % 5:
+        raise RuntimeError(
+            f"{dataset} has {len(class_ids)} identities, which cannot be split exactly 8:2"
+        )
+    num_train = int(len(class_ids) * IDENTITY_TRAIN_FRACTION)
     shuffled = list(class_ids)
     _identity_rng(seed, dataset, "identity-split").shuffle(shuffled)
-    return sorted(shuffled[:num_train]), sorted(shuffled[num_train:])
+    train_ids = sorted(shuffled[:num_train])
+    test_ids = sorted(shuffled[num_train:])
+    if set(train_ids) & set(test_ids) or set(train_ids) | set(test_ids) != set(class_ids):
+        raise RuntimeError(f"{dataset} identity split is not disjoint and exhaustive")
+    return train_ids, test_ids
 
 
 def _line(palm: str, vein: str, label: int, palm_exists: int, vein_exists: int, split: str) -> str:
@@ -217,6 +225,7 @@ TONGJI_GALLERY_PER_IDENTITY = 8
 TONGJI_PROBE_PER_IDENTITY = 2
 TONGJI_PROTOCOL_FILES = {
     "train": "ssfd_train_full.txt",
+    "trainval": "ssfd_trainval_full.txt",
     "val_gallery": "ssfd_val_gallery_full.txt",
     "val_protocol": "ssfd_val_protocol.txt",
     "test_gallery": "ssfd_gallery_full.txt",
@@ -513,6 +522,7 @@ def validate_tongji_session1_protocol(
         raise RuntimeError("Validation and test identities overlap")
     if len(set().union(*map(set, identities.values()))) != 600:
         raise RuntimeError("Train/validation/test identity union does not contain 600 identities")
+    trainval_identities = sorted([*identities["train"], *identities["val"]])
 
     records = {
         name: _read_tongji_records(output / filename)
@@ -520,6 +530,7 @@ def validate_tongji_session1_protocol(
     }
     expected_rows = {
         "train": 4320,
+        "trainval": 4800,
         "val_gallery": 384,
         "val_protocol": 288,
         "test_gallery": 960,
@@ -531,6 +542,14 @@ def validate_tongji_session1_protocol(
 
     train_samples, train_scenarios = _validate_tongji_partition(
         records["train"], identities["train"], 10, {"train"}, palm_root, vein_root
+    )
+    trainval_samples, trainval_scenarios = _validate_tongji_partition(
+        records["trainval"],
+        trainval_identities,
+        10,
+        {"train"},
+        palm_root,
+        vein_root,
     )
     val_gallery, val_gallery_scenarios = _validate_tongji_partition(
         records["val_gallery"],
@@ -567,6 +586,7 @@ def validate_tongji_session1_protocol(
 
     for scenario_map in (
         train_scenarios,
+        trainval_scenarios,
         val_gallery_scenarios,
         test_gallery_scenarios,
     ):
@@ -586,6 +606,8 @@ def validate_tongji_session1_protocol(
             raise RuntimeError(f"{split_name} Gallery and Probe samples overlap")
     if sum(map(len, train_samples.values())) != 4320:
         raise RuntimeError("Training logical sample count is incorrect")
+    if sum(map(len, trainval_samples.values())) != 4800:
+        raise RuntimeError("Merged training logical sample count is incorrect")
 
     manifest_path = output / "manifest.json"
     if manifest_path.is_file():
@@ -601,9 +623,11 @@ def validate_tongji_session1_protocol(
         "session": "session1_only",
         "num_classes_total": 600,
         "num_train_identities": 432,
+        "num_trainval_identities": 480,
         "num_val_identities": 48,
         "num_test_identities": 120,
         "num_train_pairs": 4320,
+        "num_trainval_pairs": 4800,
         "num_val_gallery_pairs": 384,
         "num_val_probe_pairs": 96,
         "num_test_gallery_pairs": 960,
@@ -617,6 +641,7 @@ def build_tongji_session1_protocol(
 ):
     pairs = _collect_tongji_session1_pairs(root_dir)
     identities = _split_tongji_identities(sorted(pairs), seed)
+    trainval_identities = sorted([*identities["train"], *identities["val"]])
     validation_gallery, validation_probe = {}, {}
     test_gallery, test_probe = {}, {}
     for identity in identities["val"]:
@@ -630,6 +655,7 @@ def build_tongji_session1_protocol(
 
     payload = {
         "train": _tongji_complete_lines(pairs, identities["train"], "train"),
+        "trainval": _tongji_complete_lines(pairs, trainval_identities, "train"),
         "val_gallery": _tongji_complete_lines(
             validation_gallery, identities["val"], "gallery"
         ),
@@ -656,6 +682,7 @@ def build_tongji_session1_protocol(
         "identity_counts": TONGJI_IDENTITY_COUNTS,
         "samples_per_identity": {
             "train": 10,
+            "trainval": 10,
             "validation_gallery": 8,
             "validation_probe": 2,
             "test_gallery": 8,
@@ -722,6 +749,15 @@ def build_ssfd_protocols(root_dir: str, output_dir: str, dataset: str, seed: int
         }
     gallery_pairs = {class_id: test_pairs[class_id]["gallery"] for class_id in test_ids}
     probe_pairs = {class_id: test_pairs[class_id]["probe"] for class_id in test_ids}
+    if set(gallery_pairs) != set(test_ids) or set(probe_pairs) != set(test_ids):
+        raise RuntimeError(f"{dataset} is not a closed-set Gallery/Probe protocol")
+    for class_id in test_ids:
+        gallery_keys = {sample[0] for sample in gallery_pairs[class_id]}
+        probe_keys = {sample[0] for sample in probe_pairs[class_id]}
+        if gallery_keys & probe_keys:
+            raise RuntimeError(
+                f"{dataset} identity {class_id} has overlapping Gallery/Probe samples"
+            )
     payload = {
         "ssfd_train_full": _full_protocol(pairs, train_ids, "train"),
         "ssfd_gallery_full": _full_protocol(gallery_pairs, test_ids, "gallery"),
@@ -734,6 +770,7 @@ def build_ssfd_protocols(root_dir: str, output_dir: str, dataset: str, seed: int
     return {
         "dataset": dataset.lower(),
         "seed": seed,
+        "identity_split": "train_80_test_20_disjoint_closed_set",
         "num_classes_total": len(class_ids),
         "num_train_identities": len(train_ids),
         "num_test_identities": len(test_ids),

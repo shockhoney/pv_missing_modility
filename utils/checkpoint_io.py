@@ -49,3 +49,18 @@ def save_checkpoint(path, payload):
     if directory:
         os.makedirs(directory, exist_ok=True)
     torch.save(payload, path)
+
+
+def save_checkpoint_atomic(path, payload):
+    """Write a checkpoint completely before atomically replacing its target."""
+
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temporary = f"{path}.tmp-{os.getpid()}"
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
