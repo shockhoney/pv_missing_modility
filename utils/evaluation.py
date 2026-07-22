@@ -100,14 +100,6 @@ def count_correct_predictions(logits, labels):
     return int((logits.argmax(1) == labels).sum().item())
 
 
-def recognition_rate(logits, labels):
-    logits = torch.as_tensor(logits)
-    labels = torch.as_tensor(labels)
-    if labels.numel() == 0:
-        return 0.0
-    return count_correct_predictions(logits, labels) / labels.numel()
-
-
 def build_gallery_templates(embeddings, labels):
     embeddings = _as_score_matrix(embeddings, "gallery_embeddings")
     labels = _as_label_vector(labels, "gallery_labels", device=embeddings.device)

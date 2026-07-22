@@ -1,4 +1,4 @@
-"""Distribution-aligned recovery of cross-modally shared identity features."""
+"""Gallery-conditioned selective prototype recovery for missing modalities."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-ARCHITECTURE_VERSION = "regularized_shared_identity_recovery_v1"
+ARCHITECTURE_VERSION = "gallery_conditioned_selective_prototype_recovery_v6"
 
 
 def _inverse_sqrt(matrix: torch.Tensor, eigen_floor: torch.Tensor) -> torch.Tensor:
@@ -81,9 +81,6 @@ class RegularizedSharedIdentityProjector(nn.Module):
         return (features - mean) @ projection[:, :dimensions]
 
 
-TRAINABLE_ARCHITECTURE_VERSION = "trainable_probabilistic_shared_recovery_v2"
-
-
 def _zero_linear(linear: nn.Linear) -> None:
     nn.init.zeros_(linear.weight)
     if linear.bias is not None:
@@ -155,179 +152,19 @@ class TrainableSharedProjector(nn.Module):
         )
 
 
-class ProbabilisticFeatureRecoverer(nn.Module):
-    """Predict a target-modality conditional mean and diagonal uncertainty."""
-
-    def __init__(
-        self,
-        shared_dim: int = 192,
-        target_dim: int = 256,
-        hidden_dim: int = 256,
-        dropout: float = 0.1,
-        min_logvar: float = -6.0,
-        max_logvar: float = 2.0,
-    ):
-        super().__init__()
-        self.shared_dim = shared_dim
-        self.target_dim = target_dim
-        self.min_logvar = min_logvar
-        self.max_logvar = max_logvar
-        self.mean_base = nn.Linear(shared_dim, target_dim)
-        self.mean_residual = nn.Sequential(
-            nn.Linear(shared_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, target_dim),
-        )
-        _zero_linear(self.mean_residual[-1])
-        self.logvar_residual = nn.Sequential(
-            nn.Linear(shared_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, target_dim),
-        )
-        _zero_linear(self.logvar_residual[-1])
-        self.logvar_bias = nn.Parameter(torch.zeros(target_dim))
-        self.register_buffer("initial_mean_weight", torch.zeros(target_dim, shared_dim))
-        self.register_buffer("initial_mean_bias", torch.zeros(target_dim))
-        self.register_buffer("initialized", torch.tensor(False, dtype=torch.bool))
-
-    @torch.no_grad()
-    def initialize_ridge(
-        self,
-        shared: torch.Tensor,
-        target: torch.Tensor,
-        ridge: float = 1e-3,
-    ) -> None:
-        if shared.ndim != 2 or target.ndim != 2:
-            raise ValueError("Ridge initialization requires two rank-2 tensors")
-        if shared.size(0) != target.size(0):
-            raise ValueError("Ridge initialization requires paired samples")
-        if shared.size(1) != self.shared_dim or target.size(1) != self.target_dim:
-            raise ValueError("Ridge initialization dimensions are incompatible")
-        shared64 = shared.detach().double()
-        target64 = target.detach().double()
-        ones = torch.ones(shared64.size(0), 1, dtype=shared64.dtype, device=shared64.device)
-        design = torch.cat([shared64, ones], dim=1)
-        regularizer = torch.eye(design.size(1), dtype=design.dtype, device=design.device)
-        regularizer[-1, -1] = 0.0
-        solution = torch.linalg.solve(
-            design.t() @ design + ridge * regularizer,
-            design.t() @ target64,
-        )
-        weight = solution[:-1].t().float().to(self.mean_base.weight)
-        bias = solution[-1].float().to(self.mean_base.bias)
-        self.mean_base.weight.copy_(weight)
-        self.mean_base.bias.copy_(bias)
-        self.initial_mean_weight.copy_(weight)
-        self.initial_mean_bias.copy_(bias)
-        prediction = F.linear(shared.to(weight), weight, bias)
-        residual_variance = (target.to(prediction) - prediction).square().mean(dim=0)
-        self.logvar_bias.copy_(residual_variance.clamp_min(1e-6).log())
-        self.initialized.fill_(True)
-
-    def forward(self, shared: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        mean = self.mean_base(shared) + self.mean_residual(shared)
-        logvar = self.logvar_bias + self.logvar_residual(shared)
-        return mean, logvar.clamp(self.min_logvar, self.max_logvar)
-
-    def anchor_loss(self) -> torch.Tensor:
-        if not bool(self.initialized.item()):
-            raise RuntimeError("Feature recoverer has not been initialized")
-        return F.mse_loss(
-            self.mean_base.weight, self.initial_mean_weight
-        ) + F.mse_loss(self.mean_base.bias, self.initial_mean_bias)
-
-
-def _reliability_inputs(
-    shared: torch.Tensor,
-    recovered_mean: torch.Tensor,
-    logvar: torch.Tensor,
-) -> torch.Tensor:
-    statistics = torch.stack(
-        [
-            logvar.mean(dim=1),
-            logvar.std(dim=1, unbiased=False),
-            recovered_mean.norm(dim=1) / recovered_mean.size(1) ** 0.5,
-        ],
-        dim=1,
+def _gallery_templates(
+    features: torch.Tensor, labels: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    labels = labels.to(device=features.device, dtype=torch.long)
+    identities = labels.unique(sorted=True)
+    templates = torch.stack(
+        [features[labels == identity].mean(dim=0) for identity in identities]
     )
-    return torch.cat(
-        [shared, F.normalize(recovered_mean, dim=1), statistics],
-        dim=1,
-    )
-
-
-class ReliabilityHead(nn.Module):
-    def __init__(
-        self,
-        shared_dim: int = 192,
-        target_dim: int = 256,
-        hidden_dim: int = 128,
-    ):
-        super().__init__()
-        input_dim = shared_dim + target_dim + 3
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.constant_(self.net[-1].bias, 1.0)
-
-    def forward(
-        self,
-        shared: torch.Tensor,
-        recovered_mean: torch.Tensor,
-        logvar: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.sigmoid(
-            self.net(_reliability_inputs(shared, recovered_mean, logvar))
-        ).squeeze(1)
-
-
-class DynamicScoreGate(nn.Module):
-    """Produce candidate-independent branch weights for one missing probe."""
-
-    NUM_BRANCHES = 4
-
-    def __init__(
-        self,
-        shared_dim: int = 192,
-        target_dim: int = 256,
-        hidden_dim: int = 128,
-    ):
-        super().__init__()
-        input_dim = shared_dim + target_dim + 3
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, self.NUM_BRANCHES),
-        )
-        nn.init.zeros_(self.net[-1].weight)
-        with torch.no_grad():
-            self.net[-1].bias.copy_(torch.tensor([0.0, 1.0, -1.0, -2.0]))
-
-    def forward(
-        self,
-        shared: torch.Tensor,
-        recovered_mean: torch.Tensor,
-        logvar: torch.Tensor,
-        reliability: torch.Tensor,
-    ) -> torch.Tensor:
-        logits = self.net(_reliability_inputs(shared, recovered_mean, logvar))
-        weights = logits.softmax(dim=1)
-        reliability_scale = torch.cat(
-            [torch.ones_like(weights[:, :3]), reliability.unsqueeze(1)], dim=1
-        )
-        scaled = weights * reliability_scale
-        return scaled / scaled.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    return F.normalize(templates, dim=1), identities
 
 
 class TrainableSharedFeatureRecovery(nn.Module):
-    """Bidirectional probabilistic feature recovery with dynamic score gating."""
+    """Recover a target-modality prototype from the enrolled closed-set gallery."""
 
     BRANCHES = ("available", "shared_same", "shared_cross", "recovered")
 
@@ -335,79 +172,42 @@ class TrainableSharedFeatureRecovery(nn.Module):
         self,
         input_dim: int = 256,
         shared_dim: int = 192,
-        hidden_dim: int = 256,
-        gate_hidden_dim: int = 128,
         dropout: float = 0.1,
         unit_input: bool = False,
     ):
         super().__init__()
+        self.input_dim = input_dim
+        self.shared_dim = shared_dim
         projector_kwargs = dict(
             input_dim=input_dim,
             shared_dim=shared_dim,
             dropout=dropout,
             unit_input=unit_input,
         )
-        self.input_dim = input_dim
-        self.shared_dim = shared_dim
-        self.register_buffer("palm_refiner_enabled", torch.tensor(True, dtype=torch.bool))
-        self.register_buffer("vein_refiner_enabled", torch.tensor(True, dtype=torch.bool))
         self.palm_projector = TrainableSharedProjector(**projector_kwargs)
         self.vein_projector = TrainableSharedProjector(**projector_kwargs)
-        recovery_kwargs = dict(
-            shared_dim=shared_dim,
-            target_dim=input_dim,
-            hidden_dim=hidden_dim,
-            dropout=dropout,
-        )
-        self.p2v = ProbabilisticFeatureRecoverer(**recovery_kwargs)
-        self.v2p = ProbabilisticFeatureRecoverer(**recovery_kwargs)
-        head_kwargs = dict(
-            shared_dim=shared_dim,
-            target_dim=input_dim,
-            hidden_dim=gate_hidden_dim,
-        )
-        self.p2v_reliability = ReliabilityHead(**head_kwargs)
-        self.v2p_reliability = ReliabilityHead(**head_kwargs)
-        self.p2v_gate = DynamicScoreGate(**head_kwargs)
-        self.v2p_gate = DynamicScoreGate(**head_kwargs)
+        self.register_buffer("palm_refiner_enabled", torch.tensor(True, dtype=torch.bool))
+        self.register_buffer("vein_refiner_enabled", torch.tensor(True, dtype=torch.bool))
+        self.register_buffer("p2v_base_weights", torch.tensor([0.0, 1.0, 0.0]))
+        self.register_buffer("v2p_base_weights", torch.tensor([0.0, 1.0, 0.0]))
+        self.register_buffer("p2v_temperature", torch.tensor(0.05))
+        self.register_buffer("v2p_temperature", torch.tensor(0.01))
+        self.register_buffer("p2v_recovery_alpha", torch.tensor(0.29))
+        self.register_buffer("v2p_recovery_alpha", torch.tensor(0.10))
+        self.register_buffer("p2v_margin_floor", torch.tensor(0.0))
+        self.register_buffer("v2p_margin_floor", torch.tensor(0.0))
+        self.register_buffer("p2v_margin_ceiling", torch.tensor(0.2))
+        self.register_buffer("v2p_margin_ceiling", torch.tensor(0.2))
+        self.register_buffer("p2v_margin_slope", torch.tensor(0.01))
+        self.register_buffer("v2p_margin_slope", torch.tensor(0.01))
 
     @torch.no_grad()
     def initialize_from_cca(
         self,
         projector: RegularizedSharedIdentityProjector,
-        palm_features: torch.Tensor,
-        vein_features: torch.Tensor,
-        ridge: float = 1e-3,
-        reliability_temperature: float = 0.1,
     ) -> None:
-        if reliability_temperature <= 0:
-            raise ValueError("reliability_temperature must be positive")
         self.palm_projector.initialize_from_cca(projector, "palm")
         self.vein_projector.initialize_from_cca(projector, "vein")
-        palm_shared = self.palm_projector(palm_features)
-        vein_shared = self.vein_projector(vein_features)
-        self.p2v.initialize_ridge(palm_shared, vein_features, ridge)
-        self.v2p.initialize_ridge(vein_shared, palm_features, ridge)
-        p2v_mean = self.p2v.mean_base(palm_shared)
-        v2p_mean = self.v2p.mean_base(vein_shared)
-        reliability_pairs = (
-            (self.p2v_reliability, p2v_mean, vein_features),
-            (self.v2p_reliability, v2p_mean, palm_features),
-        )
-        for head, recovered, target in reliability_pairs:
-            cosine_error = 1.0 - F.cosine_similarity(recovered, target, dim=1)
-            initial_reliability = torch.exp(
-                -cosine_error / reliability_temperature
-            ).mean().clamp(1e-4, 1.0 - 1e-4)
-            head.net[-1].bias.fill_(torch.logit(initial_reliability).item())
-        # Start from the reliable CCA branches.  The learned recovery branch
-        # must earn weight through its sample-level reliability estimate.
-        self.p2v_gate.net[-1].bias.copy_(
-            torch.tensor([-4.0, 1.1, 0.0, -2.5], device=palm_features.device)
-        )
-        self.v2p_gate.net[-1].bias.copy_(
-            torch.tensor([-4.0, 1.5, -4.0, -2.5], device=palm_features.device)
-        )
 
     def project(self, features: torch.Tensor, modality: str) -> torch.Tensor:
         if modality == "palm":
@@ -416,37 +216,151 @@ class TrainableSharedFeatureRecovery(nn.Module):
             return self.vein_projector(features)
         raise ValueError(f"Unsupported modality: {modality}")
 
-    def recover(
+    @torch.no_grad()
+    def set_calibration(
+        self,
+        available_modality: str,
+        base_weights: torch.Tensor,
+        temperature: float,
+        recovery_alpha: float,
+        margin_floor: float = 0.0,
+        margin_ceiling: float = 0.2,
+        margin_slope: float = 0.01,
+    ) -> None:
+        if base_weights.shape != (3,) or torch.any(base_weights < 0):
+            raise ValueError("base_weights must be a non-negative length-3 tensor")
+        if not torch.isclose(base_weights.sum(), base_weights.new_tensor(1.0)):
+            raise ValueError("base_weights must sum to one")
+        if temperature <= 0 or not 0 <= recovery_alpha <= 1:
+            raise ValueError("temperature and recovery_alpha are invalid")
+        if margin_floor < 0 or margin_ceiling <= margin_floor or margin_slope <= 0:
+            raise ValueError("margin band gate settings are invalid")
+        if available_modality == "palm":
+            weights, temp, alpha, floor, ceiling, slope = (
+                self.p2v_base_weights,
+                self.p2v_temperature,
+                self.p2v_recovery_alpha,
+                self.p2v_margin_floor,
+                self.p2v_margin_ceiling,
+                self.p2v_margin_slope,
+            )
+        elif available_modality == "vein":
+            weights, temp, alpha, floor, ceiling, slope = (
+                self.v2p_base_weights,
+                self.v2p_temperature,
+                self.v2p_recovery_alpha,
+                self.v2p_margin_floor,
+                self.v2p_margin_ceiling,
+                self.v2p_margin_slope,
+            )
+        else:
+            raise ValueError(f"Unsupported modality: {available_modality}")
+        weights.copy_(base_weights.to(weights))
+        temp.fill_(temperature)
+        alpha.fill_(recovery_alpha)
+        floor.fill_(margin_floor)
+        ceiling.fill_(margin_ceiling)
+        slope.fill_(margin_slope)
+
+    def calibration(self, available_modality: str) -> dict[str, torch.Tensor]:
+        if available_modality == "palm":
+            return {
+                "base_weights": self.p2v_base_weights,
+                "temperature": self.p2v_temperature,
+                "recovery_alpha": self.p2v_recovery_alpha,
+                "margin_floor": self.p2v_margin_floor,
+                "margin_ceiling": self.p2v_margin_ceiling,
+                "margin_slope": self.p2v_margin_slope,
+            }
+        if available_modality == "vein":
+            return {
+                "base_weights": self.v2p_base_weights,
+                "temperature": self.v2p_temperature,
+                "recovery_alpha": self.v2p_recovery_alpha,
+                "margin_floor": self.v2p_margin_floor,
+                "margin_ceiling": self.v2p_margin_ceiling,
+                "margin_slope": self.v2p_margin_slope,
+            }
+        raise ValueError(f"Unsupported modality: {available_modality}")
+
+    def recover_with_gallery(
         self,
         available_features: torch.Tensor,
         available_modality: str,
-    ) -> dict[str, torch.Tensor]:
-        shared = self.project(available_features, available_modality)
-        if available_modality == "palm":
-            mean, logvar = self.p2v(shared)
-            reliability = self.p2v_reliability(shared, mean, logvar)
-            weights = self.p2v_gate(shared, mean, logvar, reliability)
-            target_modality = "vein"
-        elif available_modality == "vein":
-            mean, logvar = self.v2p(shared)
-            reliability = self.v2p_reliability(shared, mean, logvar)
-            weights = self.v2p_gate(shared, mean, logvar, reliability)
-            target_modality = "palm"
-        else:
+        gallery_available: torch.Tensor,
+        gallery_target: torch.Tensor,
+        gallery_labels: torch.Tensor,
+    ) -> dict[str, torch.Tensor | str]:
+        target_modality = "vein" if available_modality == "palm" else "palm"
+        if available_modality not in ("palm", "vein"):
             raise ValueError(f"Unsupported modality: {available_modality}")
+        available_templates, labels = _gallery_templates(
+            gallery_available, gallery_labels
+        )
+        target_templates, target_labels = _gallery_templates(
+            gallery_target, gallery_labels
+        )
+        if not torch.equal(labels, target_labels):
+            raise ValueError("Gallery identity order differs across modalities")
+        available_shared = self.project(available_features, available_modality)
+        same_templates, same_labels = _gallery_templates(
+            self.project(gallery_available, available_modality), gallery_labels
+        )
+        cross_templates, cross_labels = _gallery_templates(
+            self.project(gallery_target, target_modality), gallery_labels
+        )
+        if not (
+            torch.equal(labels, same_labels) and torch.equal(labels, cross_labels)
+        ):
+            raise ValueError("Gallery identity order differs across score branches")
+        branches = torch.stack(
+            [
+                F.normalize(available_features, dim=1) @ available_templates.t(),
+                available_shared @ same_templates.t(),
+                available_shared @ cross_templates.t(),
+            ],
+            dim=2,
+        )
+        calibration = self.calibration(available_modality)
+        base_scores = (
+            branches * calibration["base_weights"].unsqueeze(0).unsqueeze(0)
+        ).sum(dim=2)
+        posterior = torch.softmax(
+            base_scores / calibration["temperature"].clamp_min(1e-6), dim=1
+        )
+        recovered_feature = F.normalize(posterior @ target_templates, dim=1)
+        recovered_scores = recovered_feature @ target_templates.t()
+        posterior_confidence = posterior.max(dim=1).values
+        top_two = base_scores.topk(k=2, dim=1).values
+        recovery_reliability = top_two[:, 0] - top_two[:, 1]
+        slope = calibration["margin_slope"].clamp_min(1e-6)
+        above_floor = torch.sigmoid(
+            (recovery_reliability - calibration["margin_floor"]) / slope
+        )
+        below_ceiling = torch.sigmoid(
+            (calibration["margin_ceiling"] - recovery_reliability) / slope
+        )
+        recovery_gate = calibration["recovery_alpha"] * above_floor * below_ceiling
+        fused_scores = (1.0 - recovery_gate.unsqueeze(1)) * base_scores + (
+            recovery_gate.unsqueeze(1) * recovered_scores
+        )
         return {
-            "shared": shared,
-            "mean": mean,
-            "logvar": logvar,
-            "reliability": reliability,
-            "weights": weights,
+            "shared": available_shared,
+            "mean": recovered_feature,
+            "posterior": posterior,
+            "posterior_confidence": posterior_confidence,
+            "recovery_reliability": recovery_reliability,
+            "recovery_gate": recovery_gate,
+            "base_weights": calibration["base_weights"].expand(
+                available_features.size(0), -1
+            ),
+            "base_branch_scores": branches,
+            "base_scores": base_scores,
+            "recovered_scores": recovered_scores,
+            "fused_scores": fused_scores,
+            "candidate_labels": labels,
             "target_modality": target_modality,
         }
 
     def anchor_loss(self) -> torch.Tensor:
-        return (
-            self.palm_projector.anchor_loss()
-            + self.vein_projector.anchor_loss()
-            + self.p2v.anchor_loss()
-            + self.v2p.anchor_loss()
-        )
+        return self.palm_projector.anchor_loss() + self.vein_projector.anchor_loss()

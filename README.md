@@ -1,61 +1,52 @@
 # Hetero-MMRNet
 
-Hetero-MMRNet performs palmprint/palm-vein recognition when one modality is unavailable. The two trained
-single-modality encoders remain frozen. The current route is feature-level, bidirectional probabilistic recovery; it
-does not generate palmprint or palm-vein images.
+Hetero-MMRNet performs feature-level palmprint/palm-vein recognition when one modality is unavailable. It does not generate images. The six retained single-modality checkpoints are frozen and are not modified by recovery training.
 
-## Method
+## Current recovery method
 
-Each frozen encoder produces a 256-dimensional embedding. A regularized CCA model initializes two conservative
-256-to-192 shared-identity projectors. Zero-initialized residual refiners can be trained by backpropagation, but a
-direction keeps its refiner only when its identity-disjoint validation EER strictly improves over the CCA
-initialization.
+Each encoder outputs a 256-dimensional embedding. Two CCA-initialized 256-to-192 projectors preserve the identity evidence that is shared within each modality. The method does not attempt to hallucinate an unidentifiable 64-dimensional private component from the other modality.
 
-For each available modality, a probabilistic recoverer maps the 192-dimensional shared feature to a conditional
-256-dimensional target-modality mean and diagonal log-variance. Training uses Gaussian NLL, cosine reconstruction,
-supervised contrastive identity loss, all-training-identity hard negatives, shared-space cycle consistency,
-reliability calibration, and a More-vs-Fewer safety loss. The frozen encoders are never updated.
+The final method is `gallery_conditioned_selective_prototype_recovery_v6`:
 
-At inference, four candidate-independent score branches are computed: available modality, same-modality shared
-identity, cross-modality shared identity, and recovered target feature. A sample-level gate fuses them; the recovered
-branch is additionally multiplied by predicted reliability and all weights are renormalized. Consequently, a
-plausible-looking but unreliable 256-dimensional recovery can be suppressed instead of being forced into matching.
-The recovered vector is a conditional estimate, not the unknowable true modality-specific feature.
+1. The available 192-dimensional shared feature is compared with enrolled identities in the available-modality gallery.
+2. A temperature-calibrated identity posterior weights the complete target-modality gallery templates, producing a recovered 256-dimensional target prototype.
+3. The available-branch top-1/top-2 cosine margin `m` controls a band-pass gate:
 
-Training is split into shared-space warmup, probabilistic recovery, and joint gating stages. Checkpoint selection uses
-only the lexicographic pair of worst-direction and mean validation EER. The fixed test identities are absent from the
-trainer. The legacy closed-form CCA checkpoint remains at `outputs/shared_feature_recovery/best.pth`; v2 uses a
-separate directory.
+   ```text
+   q = alpha * sigmoid((m - floor) / slope) * sigmoid((ceiling - m) / slope)
+   ```
 
-## Results
+   Very ambiguous samples are rejected by the lower boundary, moderately ambiguous samples receive recovered evidence, and already-easy samples are protected by the upper boundary.
+4. Final scores are `(1-q) * base_score + q * recovered_score`. The evaluator always reports a strict `fusion without recovery` ablation beside `fusion with recovery`.
 
-The table below places the independently evaluated frozen single-modality encoders and the latest fixed 480-train /
-120-test recovery protocol on the same unchanged Tongji Session-1 Gallery/Probe test set. Each row has 120 Gallery
-identities, 240 Probes, 240 genuine scores, and 28,560 impostor scores.
+This is a closed-set method: recovery uses the enrolled complete gallery. It must not be described as open-set reconstruction of the true missing private feature.
 
-| Missing modality | Available test input | Method / protocol | EER ↓ | TAR@FAR=1e-3 ↑ | TAR@FAR=1e-4 ↑ | Top-1 ↑ | Top-5 ↑ |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Palmprint | Palm-vein only | Frozen palm-vein encoder (single-modality baseline) | 2.08% | 86.25% | 76.67% | 96.67% | 99.58% |
-| Palmprint | Palm-vein only | **Latest probabilistic recovery + gated fusion (480/120)** | **0.71%** | **95.83%** | **90.00%** | **99.58%** | **100.00%** |
-| Palm-vein | Palmprint only | Frozen palmprint encoder (single-modality baseline) | 1.83% | 89.17% | 76.25% | 96.67% | 98.75% |
-| Palm-vein | Palmprint only | **Latest probabilistic recovery + gated fusion (480/120)** | **0.42%** | **98.75%** | **98.33%** | **99.58%** | **100.00%** |
+## Final identity-disjoint test results
 
-Relative to the corresponding single-modality encoder, the latest method reduces EER by 1.38/1.41 percentage points
-and improves TAR@FAR=1e-4 by 13.33/22.08 points for palmprint/palm-vein missing, respectively.
+EER values are percentages. `Base` is the final shared branch with recovery disabled; `v6` adds the selectively gated recovered target-prototype evidence.
 
-The single encoders remain the original 432-train/48-validation checkpoints; the 480-identity merge applies only to
-the recovery module, which was trained for the predeclared 21 epochs without validation selection.
+| Dataset | Missing modality | Base EER | v6 EER | Recovery gain | TAR@1e-3 | TAR@1e-4 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Tongji | Palmprint | 0.7283 | **0.1155** | **0.6127 pp** | 99.58 | 95.42 |
+| Tongji | Palm-vein | 0.4167 | **0.0210** | **0.3957 pp** | 100.00 | 98.75 |
+| CUMT | Palmprint | 1.0133 | **0.6503** | **0.3630 pp** | 98.28 | 96.55* |
+| CUMT | Palm-vein | 1.9208 | **1.4065** | **0.5142 pp** | 96.55 | 93.10* |
+| PolyU | Palmprint | 0.5000 | **0.3737** | **0.1263 pp** | 96.00 | 61.00 |
+| PolyU | Palm-vein | 0.3384 | **0.0859** | **0.2525 pp** | 100.00 | 99.00 |
 
-Auditable sources: `single_vein_test.log`, `single_palm_test.log`, and `test_metrics.json` under
-`outputs/shared_feature_recovery/trainable_v2_trainval_480/`.
+`*` CUMT has only 6,612 impostor scores, so FAR=1e-4 is below the empirical count resolution; the reported value is the FAR=0 operating point.
 
-Research-integrity note: the direction-level rollback was introduced after an earlier fixed-test development run had
-been inspected. Treat the table as development evidence, not a pristine confirmatory test. Publication claims should
-be reconfirmed on a new identity-disjoint holdout or external dataset.
+All six recovery-enabled EERs are lower than the no-recovery ablation. PolyU palmprint-missing has a real tradeoff: EER and TAR@1e-3 improve, but TAR@1e-4 falls from 82.00% to 61.00%. Do not claim universal low-FAR improvement for that direction.
+
+Auditable metrics:
+
+```text
+outputs/shared_feature_recovery/recovery_v6/tongji/test_metrics.json
+outputs/shared_feature_recovery/recovery_v6/cumt/test_metrics.json
+outputs/shared_feature_recovery/recovery_v6/polyu/test_metrics.json
+```
 
 ## Environment
-
-The project is run in the `pvmd` Conda environment:
 
 ```bash
 cd /root/autodl-tmp/pv_missing_modility
@@ -63,173 +54,84 @@ conda activate pvmd
 pip install -r requirements.txt
 ```
 
-Local data, generated protocols, pretrained weights, checkpoints, and logs are kept under ignored directories such
-as `data/`, `data_txt/`, `pretrained/`, `outputs/`, and `runs/`.
+## Protocols and frozen encoders
 
-## Protocol
-
-Protocol rows have the following format:
+Protocol rows use:
 
 ```text
 palm_path vein_path label palm_exists vein_exists split
 ```
 
-Generate the paired, identity-disjoint protocols with the fixed seed `2026`:
+Tongji uses the merged 480-identity training set and a disjoint 120-identity test set. CUMT and PolyU use identity-disjoint 8:2 train/test protocols. Recovery-only calibration splits are stored under `data_txt/<dataset>/`; official test identities are never used by the trainer.
 
-```bash
-python -m utils.datasets_txt
-```
-
-Tongji uses Session 1 only and splits identities into 432 training, 48 validation, and 120 test subjects. For each
-validation or test identity, eight pairs form the complete-modality Gallery and two disjoint pairs form the Probe.
-The Probe protocol contains `complete`, `palmprint_missing`, and `palmvein_missing` scenarios.
-
-Generated files used by the feature-recovery route are:
-
-```text
-data_txt/tongji/ssfd_train_full.txt
-data_txt/tongji/ssfd_trainval_full.txt
-data_txt/tongji/ssfd_val_gallery_full.txt
-data_txt/tongji/ssfd_val_protocol.txt
-data_txt/tongji/ssfd_gallery_full.txt
-data_txt/tongji/ssfd_test_protocol.txt
-```
-
-The protocol generator validates identity counts, split non-overlap, Session-1-only paths, paired samples,
-Gallery/Probe non-overlap, scenario completeness, and file hashes.
-
-## Train single-modality encoders
-
-The existing single-modality implementation and checkpoints are independent of feature recovery. To train them from
-scratch if needed:
-
-```bash
-python train_encoder.py --modality palm --seed 42
-python train_encoder.py --modality vein --seed 42
-```
-
-Their default checkpoints are:
+Frozen checkpoints:
 
 ```text
 outputs/encoders/palm_best.pth
 outputs/encoders/vein_best.pth
+outputs/encoders/identity_8_2/cumt/{palm,vein}_best.pth
+outputs/encoders/identity_8_2/polyu/{palm,vein}_best.pth
 ```
 
-## Train probabilistic feature recovery
+## Train recovery
 
-Train with the frozen encoder feature caches and validation-EER-only selection:
+Training has two explicit stages. First calibrate on a training-identity holdout; then combine those calibration values with the shared projectors fitted on the complete training set. The frozen encoders are only used to build fingerprinted feature caches.
+
+Tongji calibration example:
 
 ```bash
 python train_shared_feature_recovery.py --device cuda \
-  --shared_dimensions 192 --epochs 120 \
-  --shared_warmup_epochs 20 --recovery_end_epoch 70 \
-  --batch_identities 32 --instances_per_identity 2 \
-  --save_dir outputs/shared_feature_recovery/trainable_v2
+  --train_list data_txt/tongji/ssfd_train_full.txt \
+  --val_gallery_list data_txt/tongji/ssfd_val_gallery_full.txt \
+  --val_protocol_list data_txt/tongji/ssfd_val_protocol.txt \
+  --palm_ckpt outputs/encoders/palm_best.pth \
+  --vein_ckpt outputs/encoders/vein_best.pth \
+  --save_dir outputs/shared_feature_recovery/recovery_v6/tongji_validation
 ```
 
-The first run fingerprints the protocols and encoders and creates reusable caches under
-`outputs/shared_feature_recovery/cache/`. Checkpoints are written atomically to:
+Final full-training checkpoint example:
+
+```bash
+python train_shared_feature_recovery.py --device cuda --fixed_full_train \
+  --train_list data_txt/tongji/ssfd_trainval_full.txt \
+  --palm_ckpt outputs/encoders/palm_best.pth \
+  --vein_ckpt outputs/encoders/vein_best.pth \
+  --calibration_ckpt outputs/shared_feature_recovery/recovery_v6/tongji_validation/best.pth \
+  --save_dir outputs/shared_feature_recovery/recovery_v6/tongji
+```
+
+The retained final checkpoints are:
 
 ```text
-outputs/shared_feature_recovery/trainable_v2/best.pth
-outputs/shared_feature_recovery/trainable_v2/last.pth
+outputs/shared_feature_recovery/recovery_v6/tongji/best.pth
+outputs/shared_feature_recovery/recovery_v6/cumt/best.pth
+outputs/shared_feature_recovery/recovery_v6/polyu/best.pth
 ```
-
-`best.pth` contains the validation-selected model; `last.pth` also contains optimizer state for `--resume`. Both
-record architecture/configuration, validation history, gate statistics, rollback decisions, cache metadata, and
-SHA-256 fingerprints. The trainer has no test-list argument.
-
-For a fixed train+validation merge with no validation-based model selection:
-
-```bash
-python train_shared_feature_recovery.py --device cuda \
-  --fixed_full_train --train_list data_txt/tongji/ssfd_trainval_full.txt \
-  --epochs 21 \
-  --save_dir outputs/shared_feature_recovery/trainable_v2_trainval_480 \
-  --cache_dir outputs/shared_feature_recovery/cache_trainval_480
-```
-
-This mode retains the original stage-2 learning-rate schedule, applies the prevalidated directional policy after the
-20-epoch warmup, and fixes epoch 21 as the checkpoint. Its checkpoint contains no validation results or fingerprints.
 
 ## Evaluate
 
-Evaluate the unchanged single-modality baselines:
-
-```bash
-python test_encoder.py --modality palm --ckpt outputs/encoders/palm_best.pth
-python test_encoder.py --modality vein --ckpt outputs/encoders/vein_best.pth
-```
-
-Evaluate both missing-modality directions using the validation-selected v2 checkpoint:
+Tongji example:
 
 ```bash
 python test_shared_feature_recovery.py \
-  --recovery_ckpt outputs/shared_feature_recovery/trainable_v2/best.pth \
-  --output outputs/shared_feature_recovery/trainable_v2/test_metrics.json
+  --gallery_list data_txt/tongji/ssfd_gallery_full.txt \
+  --protocol_list data_txt/tongji/ssfd_test_protocol.txt \
+  --palm_ckpt outputs/encoders/palm_best.pth \
+  --vein_ckpt outputs/encoders/vein_best.pth \
+  --recovery_ckpt outputs/shared_feature_recovery/recovery_v6/tongji/best.pth \
+  --output outputs/shared_feature_recovery/recovery_v6/tongji/test_metrics.json
 ```
 
-Evaluate the fixed merged-training checkpoint:
-
-```bash
-python test_shared_feature_recovery.py \
-  --recovery_ckpt outputs/shared_feature_recovery/trainable_v2_trainval_480/best.pth \
-  --output outputs/shared_feature_recovery/trainable_v2_trainval_480/test_metrics.json
-```
-
-The evaluator verifies encoder fingerprints and architecture version, computes all four score branches and dynamic
-fusion, and records checkpoint/test-protocol hashes. Each scenario reports EER, TAR at FAR `1e-3` and `1e-4`, Top-1,
-Top-5, reliability distribution, predictive variance, and average branch weights.
-
-## Generate publication figures
-
-Generate the three legacy closed-form test-set figures used for analysis:
-
-```bash
-python visualize_shared_feature_recovery.py
-```
-
-The command reuses the frozen encoders, fitted projector, validation-selected fusion weights, and unchanged Tongji
-test protocol. It exports 400-DPI PNG and vector PDF versions under:
-
-```text
-outputs/shared_feature_recovery/figures/figure2_low_far_roc.{png,pdf}
-outputs/shared_feature_recovery/figures/figure3_hard_negative_margin.{png,pdf}
-outputs/shared_feature_recovery/figures/figure4_shared_identity_space.{png,pdf}
-```
-
-Figure 2 contains empirical low-FAR verification curves. Figure 3 compares each Probe's genuine-minus-hardest-
-impostor margin before and after score fusion. Figure 4 shows fitted and unseen-test canonical component
-correlations together with identity margins before and after the shared projection.
-
-The same directory contains `figure_source_data.npz` and `figure_manifest.json`, which record the plotted arrays,
-metric summaries, source fingerprints, and figure hashes. Test features are used only for visualization and are
-never used to refit the projector or select a fusion parameter.
-
-An additional direct cross-modal template-alignment diagnostic can be exported with:
-
-```bash
-python visualize_shared_feature_recovery.py --include_alignment_diagnostic
-```
-
-This diagnostic is intentionally separate from the main figures because direct target-modality matching is not the
-validation-selected recognition rule.
+The evaluator verifies encoder/checkpoint fingerprints and reports every branch, recovery-disabled fusion, recovery-enabled fusion, posterior entropy, reliability margin, gate distribution, and gate activation fractions.
 
 ## File map
 
 | File | Role |
 | --- | --- |
-| `train_encoder.py` | Trains one single-modality encoder and ArcFace head. |
-| `test_encoder.py` | Evaluates a saved palmprint or palm-vein encoder. |
-| `models/backbones.py` | Defines the ResNet18 encoders. |
-| `models/shared_feature_recovery.py` | Implements CCA initialization, trainable residual projectors, probabilistic 192-to-256 recovery, reliability, and dynamic gating. |
-| `train_shared_feature_recovery.py` | Runs cached backpropagation training with either validation selection or a fixed no-validation full-training policy. |
-| `test_shared_feature_recovery.py` | Evaluates both missing-modality scenarios on the fixed test split. |
-| `visualize_shared_feature_recovery.py` | Exports publication figures and their auditable source data. |
-| `utils/feature_extraction.py` | Extracts frozen features and validates fingerprinted reusable caches. |
-| `utils/datasets_txt.py` | Generates and loads the paired missing-modality protocols. |
-| `utils/evaluation.py` | Builds Gallery templates and computes verification/identification metrics. |
-| `utils/checkpoint.py` | Restores frozen encoders from their checkpoints. |
-| `utils/checkpoint_io.py` | Provides checkpoint I/O and SHA-256 fingerprinting. |
-| `utils/preprocess.py` | Defines palmprint and palm-vein transforms. |
-| `utils/scenarios.py` | Defines the shared missing-modality scenario names. |
+| `models/shared_feature_recovery.py` | Shared projectors, closed-set target-prototype recovery, and band-pass sample gate. |
+| `train_shared_feature_recovery.py` | Frozen-feature projector training and identity-holdout calibration. |
+| `test_shared_feature_recovery.py` | Strict recovery/no-recovery evaluation for both missing directions. |
+| `train_encoder.py`, `test_encoder.py` | Independent single-modality baseline code; unchanged by recovery work. |
+| `utils/feature_extraction.py` | Fingerprinted frozen-feature caches. |
+| `utils/evaluation.py` | Gallery templates and verification/identification metrics. |
+| `utils/checkpoint_io.py` | Atomic checkpoint I/O and SHA-256 fingerprints. |

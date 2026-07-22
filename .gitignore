@@ -4,7 +4,7 @@ data_txt/
 
 # python cache
 __pycache__/
-utils/__pycache__/
+*.py[cod]
 
 # local tooling
 .vscode/
@@ -20,12 +20,5 @@ runs_all/
 *.ckpt
 events.out.tfevents.*
 
-# local experiment scripts
-comparative_experiment/
-sem_CKD_student_mobilefacenet.py
-test-copy.py
-
-documents/
-tools/
-!requirements.txt
-.codex
+# local agent state
+.codex/

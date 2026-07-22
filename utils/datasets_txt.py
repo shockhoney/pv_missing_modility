@@ -50,15 +50,6 @@ DATASET_CONFIGS = {
         "class_count": 500,
         "session_split": True,
     },
-    "casia": {
-        "root_dir": "data/CASIA",
-        "palm_dir": "vi",
-        "vein_dir": "ir",
-        "gallery_count": 4,
-        "probe_count": 2,
-        "class_count": 200,
-        "session_split": True,
-    },
 }
 
 
@@ -836,57 +827,6 @@ class MissingPairTxtDataset:
             vein = self.transform_vein(vein)
         mask = torch.tensor([sample["palm_exists"], sample["vein_exists"]], dtype=torch.float32)
         return palm, vein, sample["label"], mask
-
-
-class CrossModalRecoveryDataset:
-    """Return real images and target-preprocessed cross-modal recovery inputs.
-
-    A vein image is transformed with the palm pipeline before vein-to-palm
-    recovery, while a palm image is transformed with the vein pipeline before
-    palm-to-vein recovery. Missing paths remain black tensors and are excluded
-    according to the availability mask by the caller.
-    """
-
-    def __init__(
-        self,
-        list_file: Optional[str],
-        transform_palm,
-        transform_vein,
-        split_filter: Optional[str] = None,
-        samples=None,
-    ):
-        if samples is not None and list_file is not None:
-            raise ValueError("Pass either list_file or samples, not both")
-        self.samples = (
-            list(samples)
-            if samples is not None
-            else _read_protocol(list_file, split_filter)
-        )
-        self.transform_palm = transform_palm
-        self.transform_vein = transform_vein
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        palm_image = _load(sample["palm_path"], sample["palm_exists"], "RGB")
-        vein_image = _load(sample["vein_path"], sample["vein_exists"], "RGB")
-        palm = self.transform_palm(palm_image)
-        vein = self.transform_vein(vein_image)
-        vein_as_palm = self.transform_palm(vein_image)
-        palm_as_vein = self.transform_vein(palm_image)
-        return {
-            "palm": palm,
-            "vein": vein,
-            "vein_as_palm": vein_as_palm,
-            "palm_as_vein": palm_as_vein,
-            "label": sample["label"],
-            "mask": torch.tensor(
-                [sample["palm_exists"], sample["vein_exists"]],
-                dtype=torch.float32,
-            ),
-        }
 
 
 class SingleModalityFromPairDataset:

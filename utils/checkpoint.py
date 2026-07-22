@@ -1,6 +1,5 @@
 from models.backbones import build_encoder
-from utils.head import ArcFace
-from utils.checkpoint_io import safe_torch_load, save_checkpoint
+from utils.checkpoint_io import safe_torch_load
 
 
 def _encoder_from_checkpoint(ckpt, modality, embedding_size, device):
@@ -15,39 +14,3 @@ def _encoder_from_checkpoint(ckpt, modality, embedding_size, device):
 def load_encoder_from_checkpoint(ckpt_path, modality, embedding_size, device):
     checkpoint = safe_torch_load(ckpt_path, device)
     return _encoder_from_checkpoint(checkpoint, modality, embedding_size, device)
-
-
-def _arcface_from_checkpoint(ckpt, embedding_size, device):
-    state = ckpt.get("classifier")
-    if state is None:
-        raise ValueError("Checkpoint does not contain an ArcFace classifier.")
-    if state["weight"].shape[1] != embedding_size:
-        raise ValueError("Classifier embedding dimension does not match the requested encoder dimension.")
-
-    args = ckpt.get("args", {})
-    classifier = ArcFace(
-        embedding_size,
-        ckpt.get("num_classes", state["weight"].shape[0]),
-        args.get("arcface_s", 32.0),
-        args.get("arcface_m", 0.25),
-    ).to(device)
-    classifier.load_state_dict(state)
-    classifier.eval()
-    return classifier
-
-
-def load_arcface_from_checkpoint(ckpt_path, embedding_size, device):
-    ckpt = safe_torch_load(ckpt_path, device)
-    classifier = _arcface_from_checkpoint(ckpt, embedding_size, device)
-    for param in classifier.parameters():
-        param.requires_grad = False
-    return classifier
-
-
-def load_encoder_teacher_from_checkpoint(ckpt_path, modality, embedding_size, device):
-    checkpoint = safe_torch_load(ckpt_path, device)
-    encoder = _encoder_from_checkpoint(checkpoint, modality, embedding_size, device)
-    classifier = _arcface_from_checkpoint(checkpoint, embedding_size, device)
-    for param in classifier.parameters():
-        param.requires_grad = False
-    return encoder, classifier, checkpoint

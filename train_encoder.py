@@ -7,8 +7,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from models.backbones import build_encoder
-from utils.checkpoint import save_checkpoint
-from utils.checkpoint_io import file_sha256
+from utils.checkpoint_io import file_sha256, save_checkpoint
 from utils.datasets_txt import SingleModalityFromPairDataset, infer_num_classes
 from utils.evaluation import count_correct_predictions, gallery_probe_metrics
 from utils.head import ArcFace
