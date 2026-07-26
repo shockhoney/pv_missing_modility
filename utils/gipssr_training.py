@@ -1,10 +1,9 @@
-"""Shared data loading, metrics, and orchestration for staged DCCA training."""
+"""Training data, metrics, and orchestration for GIPSSR-Net."""
 
 from __future__ import annotations
 
 import argparse
 import copy
-import json
 import math
 import os
 import time
@@ -12,13 +11,13 @@ import time
 import torch
 import torch.nn.functional as F
 
-from models.dcca_specformer import ARCHITECTURE_VERSION
+from models.gipssr import ARCHITECTURE_VERSION, METHOD_NAME, MODULE_NAMES
 from utils.checkpoint import load_encoder_from_checkpoint
 from utils.checkpoint_io import file_sha256, safe_torch_load, save_checkpoint_atomic
 from utils.evaluation import score_matrix_metrics
 from utils.runtime import resolve_device, set_random_seed
 from utils.scenarios import PALMPRINT_MISSING, PALMVEIN_MISSING
-from utils.spatial_feature_extraction import load_or_extract_paired_spatial_cache
+from utils.gipssr_feature_extraction import load_or_extract_paired_spatial_cache
 
 
 DIRECTIONS = (
@@ -132,14 +131,10 @@ def metrics_for_output(model, output, probe_labels):
         },
         "fused_without_recovery": score_metrics(output["base_scores"], labels, probe_labels),
         "fused": score_metrics(output["fused_scores"], labels, probe_labels),
-        "recovery_gate": distribution_summary(output["recovery_gate"]),
-        "learned_gate": distribution_summary(output["learned_gate"]),
         "posterior_confidence": distribution_summary(output["posterior_confidence"]),
         "posterior_entropy": distribution_summary(output["posterior_entropy"]),
         "predicted_variance": distribution_summary(output["log_variance"].exp()),
         "base_weights": output["base_weights"][0].detach().cpu().tolist(),
-        "temperature": float(output["temperature"].item()),
-        "fallback_model": None,
     }
 
 
@@ -223,6 +218,11 @@ def train(args):
         selection_checkpoint = safe_torch_load(args.selection_ckpt, "cpu")
         if selection_checkpoint.get("architecture_version") != ARCHITECTURE_VERSION:
             raise ValueError(f"selection_ckpt architecture is not {ARCHITECTURE_VERSION}")
+        selected_ablation = selection_checkpoint.get("args", {}).get("ablation", "full")
+        if selected_ablation != args.ablation:
+            raise ValueError(
+                f"selection_ckpt ablation {selected_ablation!r} does not match {args.ablation!r}"
+            )
         epochs = int(selection_checkpoint["best_epoch"])
         schedule_epochs = int(selection_checkpoint["args"]["epochs"])
         print(f"[Selection] epochs={epochs}; no fallback or deployment blend")
@@ -271,7 +271,7 @@ def train(args):
             validation_text = " ".join(
                 f"{scenario}:EER={record['validation'][scenario]['fused']['eer']*100:.4f}%/"
                 f"base={record['validation'][scenario]['fused_without_recovery']['eer']*100:.4f}%/"
-                f"gate={record['validation'][scenario]['recovery_gate']['mean']:.3f}"
+                f"recovery_weight={record['validation'][scenario]['recovery_weight']['mean']:.3f}"
                 for scenario, _, _ in DIRECTIONS
             )
         print(
@@ -288,6 +288,9 @@ def train(args):
     }
     payload = {
         "architecture_version": ARCHITECTURE_VERSION,
+        "method_name": METHOD_NAME,
+        "modules": MODULE_NAMES,
+        "ablation": args.ablation,
         "training_stage": "fixed_full_train" if args.fixed_full_train else "identity_validation_selection",
         "model": cpu_state_dict(model),
         "args": vars(args),
@@ -298,11 +301,12 @@ def train(args):
             "transformer_layers": args.transformer_layers,
             "transformer_heads": args.transformer_heads,
             "dropout": args.dropout,
-            "max_gate": args.max_gate,
+            "max_recovery_weight": args.max_recovery_weight,
             "min_recovery_weight": getattr(args, "min_recovery_weight", 0.15),
             "retrieval_dropout": getattr(args, "retrieval_dropout", 0.10),
             "branch_floor": getattr(args, "branch_floor", 0.0),
             "branches": list(model.BRANCHES),
+            "ablation": args.ablation,
         },
         "epoch": epochs,
         "best_epoch": best_epoch,
@@ -317,33 +321,20 @@ def train(args):
     }
     output = os.path.join(args.save_dir, "best.pth")
     save_checkpoint_atomic(output, payload)
-    with open(os.path.join(args.save_dir, "training_summary.json"), "w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "architecture_version": ARCHITECTURE_VERSION,
-                "best_epoch": best_epoch,
-                "fallback_model": None,
-                "validation": best_validation,
-                "history": history,
-            },
-            handle,
-            indent=2,
-            sort_keys=True,
-        )
     print(f"[Done] saved={output}")
     return output
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser("Train DCCA-SpecFormer missing-modality recovery")
+    parser = argparse.ArgumentParser("Train GIPSSR-Net missing-modality recovery")
     parser.add_argument("--train_list", default="data_txt/tongji/ssfd_train_full.txt")
     parser.add_argument("--val_gallery_list", default="data_txt/tongji/ssfd_val_gallery_full.txt")
     parser.add_argument("--val_protocol_list", default="data_txt/tongji/ssfd_val_protocol.txt")
     parser.add_argument("--palm_ckpt", default="outputs/encoders/palm_best.pth")
     parser.add_argument("--vein_ckpt", default="outputs/encoders/vein_best.pth")
     parser.add_argument("--selection_ckpt", default=None)
-    parser.add_argument("--save_dir", default="outputs/dcca_specformer/hiasr_v10/tongji_validation")
-    parser.add_argument("--cache_dir", default="outputs/dcca_specformer/cache/tongji_validation")
+    parser.add_argument("--save_dir", default="outputs/gipssr/ablations/checkpoints/tongji/seed_42/full_validation")
+    parser.add_argument("--cache_dir", default="outputs/gipssr/cache/tongji_validation")
     parser.add_argument("--fixed_full_train", action="store_true")
     parser.add_argument("--force_recache", action="store_true")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
@@ -355,8 +346,8 @@ def parse_args(argv=None):
     parser.add_argument("--transformer_layers", type=int, default=2)
     parser.add_argument("--transformer_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--max_gate", type=float, default=1.0)
-    parser.add_argument("--epochs", type=int, default=24)
+    parser.add_argument("--max_recovery_weight", type=float, default=0.75)
+    parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--eval_every", type=int, default=1)
     parser.add_argument("--batch_identities", type=int, default=32)
     parser.add_argument("--instances_per_identity", type=int, default=2)
@@ -364,14 +355,14 @@ def parse_args(argv=None):
     parser.add_argument("--episodic_gallery_fraction", type=float, default=0.5)
     parser.add_argument("--memory_batch_size", type=int, default=256)
     parser.add_argument("--extract_batch_size", type=int, default=128)
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--min_learning_rate", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--gradient_clip", type=float, default=1.0)
     parser.add_argument("--contrastive_temperature", type=float, default=0.07)
     parser.add_argument("--identity_temperature", type=float, default=0.05)
-    parser.add_argument("--gate_target_temperature", type=float, default=0.05)
+    parser.add_argument("--evidence_target_temperature", type=float, default=0.05)
     parser.add_argument("--hard_margin", type=float, default=0.1)
     parser.add_argument("--cca_dimensions", type=int, default=64)
     parser.add_argument("--cca_ridge", type=float, default=1e-3)
@@ -389,7 +380,7 @@ def parse_args(argv=None):
     parser.add_argument("--identity_weight", type=float, default=0.5)
     parser.add_argument("--rank_weight", type=float, default=1.0)
     parser.add_argument("--safe_weight", type=float, default=1.0)
-    parser.add_argument("--gate_weight", type=float, default=0.2)
+    parser.add_argument("--evidence_weight", type=float, default=0.2)
     parser.add_argument("--anchor_weight", type=float, default=0.2)
     return parser.parse_args(argv)
 

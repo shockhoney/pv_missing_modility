@@ -1,4 +1,4 @@
-"""Train the internal stable recovery initialization used by HIASR."""
+"""Train the reusable stage-1 initialization for GIPSSR-Net."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import math
 import torch
 import torch.nn.functional as F
 
-from utils import dcca_training_support as training
-from models.recovery_backbone import INTERNAL_BACKBONE_VERSION, StableRecoveryBackbone
+from utils import gipssr_training as training
+from models.gipssr_stage1 import STAGE1_ARCHITECTURE_VERSION, GIPSSRStage1
 from utils.analytic_cca import RegularizedSharedIdentityProjector
 from utils.stable_differentiable_cca import deep_cca_loss, nr_dcca_loss
 
@@ -39,17 +39,17 @@ def low_far_pauc_loss(
     return torch.stack(losses).mean()
 
 
-def configure_stage(model: StableRecoveryBackbone, shared_only: bool) -> None:
+def configure_stage(model: GIPSSRStage1, shared_only: bool) -> None:
     for parameter in model.parameters():
         parameter.requires_grad_(not shared_only)
     if shared_only:
-        for projector in (model.palm_projector, model.vein_projector):
-            for parameter in projector.refiner.parameters():
+        for igdca in (model.palm_igdca, model.vein_igdca):
+            for parameter in igdca.refiner.parameters():
                 parameter.requires_grad_(True)
         model.identity_proxies.requires_grad_(True)
         model.recovery_stage_ready.fill_(False)
     else:
-        for module in (model.palm_projector, model.vein_projector):
+        for module in (model.palm_igdca, model.vein_igdca):
             for parameter in module.parameters():
                 parameter.requires_grad_(False)
         model.identity_proxies.requires_grad_(False)
@@ -74,24 +74,46 @@ def directional_losses(
     cycle = (
         1.0 - F.cosine_similarity(output["cycle"], source_embedding, dim=1)
     ).mean()
-    identity = F.cross_entropy(
-        output["recovered_scores"] / args.identity_temperature, target_indices
+    identity = 0.5 * (
+        F.cross_entropy(
+            output["recovered_scores"] / args.identity_temperature,
+            target_indices,
+        )
+        + F.cross_entropy(
+            output["fused_scores"] / args.identity_temperature,
+            target_indices,
+        )
     )
     base_margin = training.hard_margin(output["base_scores"], target_indices)
     recovered_margin = training.hard_margin(output["recovered_scores"], target_indices)
     fused_margin = training.hard_margin(output["fused_scores"], target_indices)
     rank = F.relu(args.hard_margin - fused_margin).mean()
     safe = F.relu(base_margin.detach() - fused_margin).mean()
-    target_gate = torch.sigmoid(
-        (recovered_margin.detach() - base_margin.detach())
-        / args.gate_target_temperature
+    calibrated = output["calibrated_branch_scores"]
+    row = torch.arange(calibrated.size(0), device=calibrated.device)
+    positives = calibrated[row, target_indices]
+    negative_mask = F.one_hot(target_indices, calibrated.size(1)).bool().unsqueeze(2)
+    negatives = calibrated.masked_fill(
+        negative_mask, torch.finfo(calibrated.dtype).min
+    ).max(dim=1).values
+    branch_margins = positives - negatives
+    target_weights = torch.softmax(
+        branch_margins.detach() / args.evidence_target_temperature, dim=1
     )
-    normalized_gate = (
-        output["learned_gate"] - args.min_recovery_weight
-    ) / (args.max_gate - args.min_recovery_weight)
-    gate = F.binary_cross_entropy(
-        normalized_gate.clamp(1e-5, 1.0 - 1e-5), target_gate
+    weight_alignment = F.kl_div(
+        output["branch_weights"].clamp_min(1e-8).log(),
+        target_weights,
+        reduction="batchmean",
     )
+    target_uncertainty = torch.sigmoid(
+        -branch_margins.detach() / args.evidence_target_temperature
+    )
+    predicted_uncertainty = output["fusion_uncertainty"]
+    predicted_uncertainty = predicted_uncertainty / (1.0 + predicted_uncertainty)
+    uncertainty_calibration = F.smooth_l1_loss(
+        predicted_uncertainty, target_uncertainty
+    )
+    evidence_calibration = weight_alignment + 0.25 * uncertainty_calibration
     pauc = 0.5 * (
         low_far_pauc_loss(
             output["fused_scores"],
@@ -112,7 +134,7 @@ def directional_losses(
         "identity": identity,
         "rank": rank,
         "safe": safe,
-        "gate": gate,
+        "evidence_calibration": evidence_calibration,
         "pauc": pauc,
     }
 
@@ -131,7 +153,7 @@ def _empty_totals():
             "identity",
             "rank",
             "safe",
-            "gate",
+            "evidence_calibration",
             "pauc",
             "anchor",
             "retrieval_dropout",
@@ -171,8 +193,8 @@ def train_shared_stage(model, training_set, optimizer, args, generator):
     ):
         indices = indices_cpu.to(training_set["palm"].device)
         labels = training_set["labels"][indices]
-        palm_raw = model.palm_projector.forward_raw(training_set["palm"][indices])
-        vein_raw = model.vein_projector.forward_raw(training_set["vein"][indices])
+        palm_raw = model.palm_igdca.forward_raw(training_set["palm"][indices])
+        vein_raw = model.vein_igdca.forward_raw(training_set["vein"][indices])
         palm_shared = F.normalize(palm_raw, dim=1)
         vein_shared = F.normalize(vein_raw, dim=1)
         paired_labels = torch.cat([labels, labels])
@@ -206,14 +228,14 @@ def train_shared_stage(model, training_set, optimizer, args, generator):
         if args.nr_weight > 0 and step % args.nr_interval == 0:
             nr = 0.5 * (
                 nr_dcca_loss(
-                    model.palm_projector,
+                    model.palm_igdca,
                     training_set["palm"][indices],
                     noise_scale=args.nr_noise_scale,
                     ridge=args.cca_ridge,
                     topk=args.nr_dimensions,
                 )
                 + nr_dcca_loss(
-                    model.vein_projector,
+                    model.vein_igdca,
                     training_set["vein"][indices],
                     noise_scale=args.nr_noise_scale,
                     ridge=args.cca_ridge,
@@ -292,12 +314,14 @@ def train_recovery_stage(model, training_set, optimizer, epoch, args, generator)
             training_set["vein_spatial"][indices],
             "vein",
         )
+        palm_specific = palm.get("hierarchical_specific", palm["specific"])
+        vein_specific = vein.get("hierarchical_specific", vein["specific"])
         specific_metric = 0.5 * (
             training.supervised_contrastive_loss(
-                palm["specific"], labels, args.contrastive_temperature
+                palm_specific, labels, args.contrastive_temperature
             )
             + training.supervised_contrastive_loss(
-                vein["specific"], labels, args.contrastive_temperature
+                vein_specific, labels, args.contrastive_temperature
             )
         )
         outputs = {
@@ -337,7 +361,7 @@ def train_recovery_stage(model, training_set, optimizer, epoch, args, generator)
             + args.identity_weight * directional["identity"]
             + args.rank_weight * directional["rank"]
             + args.safe_weight * directional["safe"]
-            + args.gate_weight * directional["gate"]
+            + args.evidence_weight * directional["evidence_calibration"]
             + args.pauc_weight * directional["pauc"]
         )
         optimizer.zero_grad(set_to_none=True)
@@ -367,17 +391,18 @@ def train_epoch(model, training_set, optimizer, epoch, args, generator):
 
 
 def build_model(args, training_set, device):
-    model = StableRecoveryBackbone(
+    model = GIPSSRStage1(
         input_dim=args.embedding_size,
         shared_dim=args.shared_dimensions,
         specific_dim=args.specific_dimensions,
         transformer_layers=args.transformer_layers,
         transformer_heads=args.transformer_heads,
         dropout=args.dropout,
-        max_gate=args.max_gate,
+        max_recovery_weight=args.max_recovery_weight,
         min_recovery_weight=args.min_recovery_weight,
         retrieval_dropout=args.retrieval_dropout,
         branch_floor=args.branch_floor,
+        ablation=args.ablation,
     ).to(device)
     cca = RegularizedSharedIdentityProjector(
         args.embedding_size, unit_input=False
@@ -445,6 +470,11 @@ def validation_rank(results):
 
 def parse_args(argv=None):
     extra = argparse.ArgumentParser(add_help=False)
+    extra.add_argument(
+        "--ablation",
+        choices=("full", "without_igdca", "without_sgssd", "without_giprd", "without_cuef_calibration", "without_cuef_conflict", "without_cuef_uncertainty"),
+        default="full",
+    )
     extra.add_argument("--shared_stage_epochs", type=int, default=2)
     extra.add_argument("--minimum_recovery_epochs", type=int, default=4)
     extra.add_argument("--proxy_weight", type=float, default=0.5)
@@ -456,15 +486,20 @@ def parse_args(argv=None):
     extra.add_argument("--pauc_temperature", type=float, default=0.05)
     extra.add_argument("--retrieval_dropout", type=float, default=0.10)
     extra.add_argument("--min_recovery_weight", type=float, default=0.15)
-    extra.add_argument("--branch_floor", type=float, default=0.0)
+    extra.add_argument("--branch_floor", type=float, default=0.02)
     values, remaining = extra.parse_known_args(argv)
     args = training.parse_args(remaining)
     for name, value in vars(values).items():
         setattr(args, name, value)
-    if "--max_gate" not in remaining:
-        args.max_gate = 0.75
     if "--safe_weight" not in remaining:
         args.safe_weight = 0.25
+    if args.ablation == "without_igdca":
+        args.shared_stage_epochs = 0
+        args.proxy_weight = 0.0
+        args.pair_alignment_weight = 0.0
+        args.dcca_weight = 0.0
+        args.nr_weight = 0.0
+        args.anchor_weight = 0.0
     if args.epochs <= args.shared_stage_epochs:
         raise ValueError("epochs must exceed shared_stage_epochs")
     return args
@@ -472,7 +507,7 @@ def parse_args(argv=None):
 
 base_metrics_for_output = training.metrics_for_output
 base_validation_rank = training.validation_rank
-training.ARCHITECTURE_VERSION = INTERNAL_BACKBONE_VERSION
+training.ARCHITECTURE_VERSION = STAGE1_ARCHITECTURE_VERSION
 training.build_model = build_model
 training.train_epoch = train_epoch
 training.metrics_for_output = metrics_for_output

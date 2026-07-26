@@ -1,4 +1,4 @@
-"""Internal stable recovery backbone used by the final HIASR model."""
+"""Stage-1 shared alignment and recovery initialization for GIPSSR-Net."""
 
 from __future__ import annotations
 
@@ -8,56 +8,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.dcca_specformer_components import (
-    RecoveryBackbone,
-    _templates,
-)
+from models.cuef import ConflictAwareUncertaintyEvidentialFusion
+from models.gipssr_components import GIPSSRCore, _templates
 
 
-INTERNAL_BACKBONE_VERSION = "internal_stable_recovery_backbone_v1"
+STAGE1_ARCHITECTURE_VERSION = "gipssr_cuef_stage1_v2"
 
 
-class BalancedFusionGate(nn.Module):
-    """Keep both shared and recovered-specific evidence active for every sample."""
-
-    def __init__(
-        self,
-        dropout: float,
-        min_recovery_weight: float = 0.15,
-        max_recovery_weight: float = 0.75,
-        initial_recovery_weight: float = 0.30,
-    ):
-        super().__init__()
-        if not 0.0 < min_recovery_weight < max_recovery_weight < 1.0:
-            raise ValueError("Recovery bounds must satisfy 0 < min < max < 1")
-        self.min_recovery_weight = float(min_recovery_weight)
-        if not min_recovery_weight < initial_recovery_weight < max_recovery_weight:
-            raise ValueError("Initial recovery weight must be inside its bounds")
-        self.max_recovery_weight = float(max_recovery_weight)
-        self.net = nn.Sequential(
-            nn.Linear(10, 32),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 16),
-            nn.GELU(),
-            nn.Linear(16, 1),
-        )
-        nn.init.zeros_(self.net[-1].weight)
-        probability = (initial_recovery_weight - min_recovery_weight) / (
-            max_recovery_weight - min_recovery_weight
-        )
-        nn.init.constant_(
-            self.net[-1].bias, math.log(probability / (1.0 - probability))
-        )
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        probability = torch.sigmoid(self.net(features).squeeze(1))
-        width = self.max_recovery_weight - self.min_recovery_weight
-        return self.min_recovery_weight + width * probability
-
-
-class StableRecoveryBackbone(RecoveryBackbone):
-    """Trainable shared alignment plus bounded Transformer recovery fusion."""
+class GIPSSRStage1(GIPSSRCore):
+    """IGDCA shared alignment plus bounded Transformer recovery fusion."""
 
     def __init__(
         self,
@@ -67,11 +26,12 @@ class StableRecoveryBackbone(RecoveryBackbone):
         transformer_layers: int = 2,
         transformer_heads: int = 4,
         dropout: float = 0.1,
-        max_gate: float = 0.75,
+        max_recovery_weight: float = 0.75,
         min_recovery_weight: float = 0.15,
         retrieval_dropout: float = 0.10,
-        branch_floor: float = 0.0,
+        branch_floor: float = 0.02,
         max_proxy_identities: int = 512,
+        ablation: str = "full",
     ):
         if not 0.0 <= retrieval_dropout < 1.0:
             raise ValueError("retrieval_dropout must be in [0, 1)")
@@ -84,14 +44,17 @@ class StableRecoveryBackbone(RecoveryBackbone):
             transformer_layers=transformer_layers,
             transformer_heads=transformer_heads,
             dropout=dropout,
+            ablation=ablation,
         )
         self.retrieval_dropout = float(retrieval_dropout)
         self.branch_floor = float(branch_floor)
         self.max_proxy_identities = int(max_proxy_identities)
-        self.safe_gate = BalancedFusionGate(
+        self.cuef = ConflictAwareUncertaintyEvidentialFusion(
             dropout=dropout,
             min_recovery_weight=min_recovery_weight,
-            max_recovery_weight=max_gate,
+            max_recovery_weight=max_recovery_weight,
+            base_branch_floor=branch_floor,
+            ablation=ablation,
         )
         self.identity_proxies = nn.Parameter(
             torch.empty(max_proxy_identities, shared_dim)
@@ -120,11 +83,11 @@ class StableRecoveryBackbone(RecoveryBackbone):
 
     @property
     def min_recovery_weight(self) -> float:
-        return self.safe_gate.min_recovery_weight
+        return self.cuef.min_recovery_weight
 
     @property
     def max_recovery_weight(self) -> float:
-        return self.safe_gate.max_recovery_weight
+        return self.cuef.max_recovery_weight
 
     @torch.no_grad()
     def initialize_identity_proxies(
@@ -139,8 +102,11 @@ class StableRecoveryBackbone(RecoveryBackbone):
         self.active_identity_labels.fill_(-1)
         self.active_identity_labels[: identities.numel()].copy_(identities)
         self.active_identity_count.fill_(identities.numel())
-        palm_shared = self.palm_projector(palm)
-        vein_shared = self.vein_projector(vein)
+        if self.ablation == "without_igdca":
+            self.identity_proxies[: identities.numel()].zero_()
+            return
+        palm_shared = self.palm_igdca(palm)
+        vein_shared = self.vein_igdca(vein)
         joint = F.normalize(palm_shared + vein_shared, dim=1)
         templates, template_labels = _templates(joint, labels)
         if not torch.equal(template_labels, identities):
@@ -166,9 +132,25 @@ class StableRecoveryBackbone(RecoveryBackbone):
     ) -> torch.Tensor:
         return F.normalize(self.cycle_heads[direction](recovered_target), dim=1)
 
-    def _balanced_base_weights(self, direction: int) -> torch.Tensor:
-        probabilities = torch.softmax(self.base_weight_logits[direction], dim=0)
-        return self.branch_floor + (1.0 - 3.0 * self.branch_floor) * probabilities
+    def fuse_score_branches(
+        self,
+        base_branch_scores: torch.Tensor,
+        recovered_scores: torch.Tensor,
+        log_variance: torch.Tensor,
+        direction: int,
+    ) -> dict[str, torch.Tensor]:
+        branches = torch.cat(
+            [base_branch_scores, recovered_scores.unsqueeze(2)], dim=2
+        )
+        external_uncertainty = branches.new_zeros(
+            branches.size(0), branches.size(2)
+        )
+        external_uncertainty[:, 3] = log_variance.exp()
+        return self.cuef(
+            branches,
+            direction,
+            external_uncertainty=external_uncertainty,
+        )
 
     def score_from_encoding(
         self,
@@ -186,10 +168,9 @@ class StableRecoveryBackbone(RecoveryBackbone):
             ],
             dim=2,
         )
-        base_weights = self._balanced_base_weights(direction)
-        base_scores = (branches * base_weights.view(1, 1, 3)).sum(dim=2)
-        temperature = self.log_temperatures[direction].exp().clamp(0.003, 0.2)
-        posterior = torch.softmax(base_scores / temperature, dim=1)
+        retrieval_fusion = self.cuef(branches, direction)
+        base_scores = retrieval_fusion["fused_scores"]
+        posterior = torch.softmax(base_scores / 0.05, dim=1)
         posterior_used = posterior
         retrieval_drop_mask = torch.zeros(
             posterior.size(0), dtype=torch.bool, device=posterior.device
@@ -213,46 +194,19 @@ class StableRecoveryBackbone(RecoveryBackbone):
             direction,
         )
         recovered_scores = recovered @ memory[f"{target_modality}_embedding"].t()
+        fusion = self.fuse_score_branches(
+            branches, recovered_scores, log_variance, direction
+        )
+        branch_weights = fusion["weights"]
+        recovery_weight = branch_weights[:, 3]
+        shared_weight = 1.0 - recovery_weight
+        base_weights = branch_weights[:, :3] / shared_weight.unsqueeze(1).clamp_min(1e-8)
+        fused_scores = fusion["fused_scores"]
         posterior_entropy = -(
             posterior * posterior.clamp_min(1e-12).log()
         ).sum(dim=1) / math.log(posterior.size(1))
         top_two = base_scores.topk(k=2, dim=1).values
         margin = top_two[:, 0] - top_two[:, 1]
-        standardized_margin = margin / base_scores.std(
-            dim=1, unbiased=False
-        ).clamp_min(1e-3)
-        base_top = base_scores.max(dim=1)
-        recovered_top = recovered_scores.max(dim=1)
-        agreement = base_top.indices.eq(recovered_top.indices).float()
-        direction_features = F.one_hot(
-            torch.full(
-                (base_scores.size(0),),
-                direction,
-                device=base_scores.device,
-                dtype=torch.long,
-            ),
-            num_classes=2,
-        ).to(base_scores)
-        gate_features = torch.cat(
-            [
-                posterior_entropy.unsqueeze(1),
-                posterior.max(dim=1).values.unsqueeze(1),
-                standardized_margin.unsqueeze(1),
-                base_top.values.unsqueeze(1),
-                recovered_top.values.unsqueeze(1),
-                (recovered_top.values - base_top.values).unsqueeze(1),
-                agreement.unsqueeze(1),
-                log_variance.exp().unsqueeze(1),
-                direction_features,
-            ],
-            dim=1,
-        )
-        recovery_weight = self.safe_gate(gate_features)
-        shared_weight = 1.0 - recovery_weight
-        fused_scores = (
-            shared_weight.unsqueeze(1) * base_scores
-            + recovery_weight.unsqueeze(1) * recovered_scores
-        )
         cycle = self.cycle_reconstruct(recovered, direction)
         return {
             "shared": available["shared"],
@@ -268,17 +222,21 @@ class StableRecoveryBackbone(RecoveryBackbone):
             "recovery_reliability": margin,
             "retrieval_drop_mask": retrieval_drop_mask,
             "retrieval_dropout_fraction": retrieval_drop_mask.float().mean(),
-            "gate_features": gate_features,
-            "learned_gate": recovery_weight,
-            "recovery_gate": recovery_weight,
             "recovery_weight": recovery_weight,
             "shared_weight": shared_weight,
-            "base_weights": base_weights.expand(base_scores.size(0), -1),
+            "base_weights": base_weights,
+            "branch_weights": branch_weights,
             "base_branch_scores": branches,
+            "calibrated_branch_scores": fusion["calibrated_scores"],
             "base_scores": base_scores,
             "recovered_scores": recovered_scores,
             "fused_scores": fused_scores,
+            "fusion_evidence": fusion["evidence"],
+            "fusion_uncertainty": fusion["uncertainty"],
+            "fusion_conflict": fusion["conflict"],
+            "fusion_conflict_scale": fusion["conflict_scale"],
+            "calibration_scale": fusion["calibration_scale"],
+            "retrieval_weights": retrieval_fusion["weights"],
             "candidate_labels": labels,
             "target_modality": target_modality,
-            "temperature": temperature,
         }

@@ -1,110 +1,90 @@
-# Trainable missing-modality recovery
+# GIPSSR-Net: trainable missing-modality recovery and CUEF fusion
 
-The only retained model is `hiasr_identity_prior_state_space_v10` (HIASR). The
-palmprint and palm-vein encoders stay frozen; every recovery component is optimized
-by backpropagation.
+This repository retains one method: `gipssr_cuef_state_space_recovery_v3` (GIPSSR-Net, Gallery Identity-Prior State-Space Recovery Network). Palmprint and palm-vein encoders are frozen; every shared-space, recovery, refinement, uncertainty, and score-fusion parameter is optimized by backpropagation.
 
-HIASR combines a differentiable-DCCA shared space with shared-guided multi-scale
-spatial disentanglement, a four-direction selective state-space mixer, independent
-Top-5 gallery identity priors, and two-stage specific-to-identity reconstruction.
-Training uses cross-modal identity proxies, gallery retrieval/candidate dropout,
-cycle consistency, ranking, teacher-safe margin, orthogonality, and differentiable
-low-FAR pAUC losses. Fusion is sample-adaptive and bounded: recovered evidence
-always receives 15%-75% weight, so neither branch can structurally suppress the
-other. Tongji, CUMT, and PolyU use one shared configuration.
+## Method
 
-The design follows recent restoration and missing-modality directions: MambaIR
-(ECCV 2024), PLTrans (CVPR 2024), MambaIRv2 (CVPR 2025), and SimMLM (ICCV 2025).
-The implemented model is repository-native PyTorch and does not depend on a custom
-selective-scan extension.
+The retained architecture contains four paper-level components:
 
-## Main files
+- **IGDCA** — Identity-Guided Deep Correlation Alignment learns the shared cross-modal identity space with staged DCCA, identity proxies, and paired alignment.
+- **SGSSD** — Shared-Guided State-Space Disentangler learns hierarchical modality-specific tokens without replacing the frozen encoders.
+- **GIPRD** — Gallery Identity-Prior Recovery Decoder refines recovery from multiple gallery identity candidates.
+- **CUEF** — Conflict-aware Uncertainty-Calibrated Evidential Fusion uses differentiable cohort/scale calibration, fixed-size evidence tokens, Transformer conflict interaction, predicted/external uncertainty, and bounded sample-wise evidence weights.
 
-- `models/dcca_specformer.py`: final HIASR state-space recovery model.
-- `models/recovery_backbone.py`: internal stage-1 initialization used by HIASR.
-- `models/dcca_specformer_components.py`: shared recovery components.
-- `train_dcca_specformer.py`: final stage-2 backpropagation training.
-- `utils/recovery_backbone_training.py`: temporary stage-1 initialization training.
-- `test_dcca_specformer.py`: strict two-direction gallery/probe evaluation.
-- `analyze_end_to_end_dcca_specformer.py`: final result summary.
-- `tests/`: gradient, Top-K, safety, fusion-bound, and low-FAR tests.
+CUEF fuses four score branches: available-modality, same-modality shared, cross-modal shared, and recovered-modality scores. The recovered branch is constrained to 15%–75%; the three base branches retain nonzero mass. The weights are learned jointly with identity, ranking, cycle-consistency, recovery, and differentiable low-FAR pAUC objectives. There is no runtime fallback, best-of-two score choice, teacher comparison, deployment blend, or dataset-specific hyperparameter branch.
 
-## Artifacts
+## Retained code
 
-Final checkpoints and metrics are under:
+- `models/cuef.py`: CUEF calibration, evidence tokens, conflict interaction, uncertainty, and bounded fusion.
+- `models/gipssr.py`: final GIPSSR-Net with SGSSD and GIPRD.
+- `models/gipssr_components.py`: IGDCA and common recovery components.
+- `models/gipssr_stage1.py`: trainable Stage-1 shared alignment and recovery backbone.
+- `utils/gipssr_stage1_training.py`: staged shared/recovery optimization and ablations.
+- `utils/gipssr_training.py`: validation selection, full-split replay, and checkpoint metadata.
+- `train_gipssr.py`: final joint CUEF+SGSSD+GIPRD training entry point.
+- `test_gipssr.py`: strict two-direction gallery/probe evaluation with CUEF diagnostics.
+- `analyze_gipssr.py`: three-seed aggregation and closed-form artifact audit.
 
-    outputs/dcca_specformer/hiasr_v10/{tongji,cumt,polyu}/
+Frozen encoder training/evaluation remain in `train_encoder.py` and `test_encoder.py` because they are required to reproduce the input embeddings.
 
-Identity-disjoint selection artifacts use the matching dataset_validation
-directories. Frozen encoder checkpoints and reusable feature caches remain under
-outputs/encoders and outputs/dcca_specformer/cache.
+## Retained artifacts
 
-## Train
+Final checkpoints and metrics are organized as:
 
-Create the temporary internal initialization on identity-disjoint validation:
+    outputs/gipssr/ablations/checkpoints/{tongji,cumt,polyu}/seed_{42,43,44}/
+    outputs/gipssr/ablations/results/{tongji,cumt,polyu}/seed_{42,43,44}/
 
-    conda run -n pvmd python -m utils.recovery_backbone_training --device cuda \
-      --train_list data_txt/tongji/ssfd_train_full.txt \
-      --val_gallery_list data_txt/tongji/ssfd_val_gallery_full.txt \
-      --val_protocol_list data_txt/tongji/ssfd_val_protocol.txt \
-      --palm_ckpt outputs/encoders/palm_best.pth \
-      --vein_ckpt outputs/encoders/vein_best.pth \
-      --save_dir /tmp/hiasr/tongji_backbone_validation
+The consolidated paper tables and machine-readable statistics are:
 
-Replay that initialization on all training identities:
+    outputs/gipssr/ablations/report.md
+    outputs/gipssr/ablations/summary.json
 
-    conda run -n pvmd python -m utils.recovery_backbone_training --device cuda \
-      --fixed_full_train \
-      --selection_ckpt /tmp/hiasr/tongji_backbone_validation/best.pth \
-      --train_list data_txt/tongji/ssfd_train_full.txt \
-      --palm_ckpt outputs/encoders/palm_best.pth \
-      --vein_ckpt outputs/encoders/vein_best.pth \
-      --save_dir /tmp/hiasr/tongji_backbone
+Only final full/ablation replay checkpoints are retained. Validation-selection checkpoints, feature caches, smoke tests, rejected batch-global-pAUC probes, and pre-CUEF schemes are removed after audit.
 
-Train HIASR and select its epoch count on the same disjoint validation split:
+## Formal protocol
 
-    conda run -n pvmd python train_dcca_specformer.py --device cuda \
-      --warm_start_ckpt /tmp/hiasr/tongji_backbone_validation/best.pth \
-      --train_list data_txt/tongji/ssfd_train_full.txt \
-      --val_gallery_list data_txt/tongji/ssfd_val_gallery_full.txt \
-      --val_protocol_list data_txt/tongji/ssfd_val_protocol.txt \
-      --palm_ckpt outputs/encoders/palm_best.pth \
-      --vein_ckpt outputs/encoders/vein_best.pth \
-      --save_dir outputs/dcca_specformer/hiasr_v10/tongji_validation
+All datasets use seeds 42, 43, and 44 and the same model/loss hyperparameters.
 
-Replay the selected HIASR epoch count on all training identities:
+1. Train for at most 12 epochs on recovery-training identities.
+2. Select the epoch on an identity-disjoint validation protocol.
+3. Reinitialize and replay exactly the selected epoch count on the full training split.
+4. Evaluate the resulting neural model once on the fixed test protocol.
+5. Report each missing direction separately and macro-average the two directions inside each seed before computing mean ± sample standard deviation across seeds.
 
-    conda run -n pvmd python train_dcca_specformer.py --device cuda \
-      --warm_start_ckpt /tmp/hiasr/tongji_backbone/best.pth \
-      --fixed_full_train \
-      --selection_ckpt outputs/dcca_specformer/hiasr_v10/tongji_validation/best.pth \
-      --train_list data_txt/tongji/ssfd_train_full.txt \
-      --palm_ckpt outputs/encoders/palm_best.pth \
-      --vein_ckpt outputs/encoders/vein_best.pth \
-      --save_dir outputs/dcca_specformer/hiasr_v10/tongji
+CUMT has 6,612 impostor scores per direction, so its smallest positive empirical FAR is 1.5124e-4; its TAR@FAR=1e-4 value is therefore the FAR=0 operating point.
 
-The internal stage-1 artifacts are temporary and are not retained after stage 2.
+## Ablation design
 
-CUMT and PolyU use the same hyperparameters; only protocol, encoder, cache, and
-output paths change.
+Ablations remove a claimed component without a learned replacement:
 
-## Evaluate and summarize
+- `without_igdca`: remove trainable shared alignment and shared-space objectives.
+- `without_sgssd`: remove SGSSD while retaining GIPRD.
+- `without_giprd`: remove GIPRD while retaining the trained SGSSD.
+- `without_sgssd_giprd`: remove both final hierarchical modules and retain the trainable Stage-1 recovery+CUEF backbone.
+- `without_cuef_calibration`: remove differentiable cohort and scale calibration.
+- `without_cuef_conflict`: remove conflict token interaction and conflict penalty.
+- `without_cuef_uncertainty`: remove predicted/external uncertainty from evidence weighting.
+- `full`: IGDCA + SGSSD + GIPRD + CUEF.
 
-    conda run -n pvmd python test_dcca_specformer.py --device cuda \
-      --gallery_list data_txt/tongji/ssfd_gallery_full.txt \
-      --protocol_list data_txt/tongji/ssfd_test_protocol.txt \
-      --recovery_ckpt outputs/dcca_specformer/hiasr_v10/tongji/best.pth \
-      --output outputs/dcca_specformer/hiasr_v10/tongji/test_metrics.json
+Two non-trained diagnostics are derived from each full run: `single` uses only the frozen available-modality score, and `without_recovery_fusion` removes the recovered-score branch without a replacement.
 
-    conda run -n pvmd python analyze_end_to_end_dcca_specformer.py
-    conda run -n pvmd python -m unittest discover -s tests -p 'test_*.py' -v
+## Evaluate and audit
 
-The consolidated result is outputs/dcca_specformer/hiasr_v10/report.md.
+The evaluator defaults to the retained Tongji seed-42 full checkpoint:
+
+    conda run -n pvmd python test_gipssr.py
+
+Regenerate the consolidated report after all 72 trained result/checkpoint pairs exist:
+
+    conda run -n pvmd python analyze_gipssr.py
+
+The analyzer fails closed on result/checkpoint SHA-256, architecture, ablation label, fixed-full replay status, selected epoch, unique seed checkpoint, CUEF/SGSSD/GIPRD parameter structure, unexpected fusion parameters, protocol fingerprints, required diagnostics, or recovery-weight bounds.
 
 ## Design references
 
+- [Embracing Unimodal Aleatoric Uncertainty for Robust Multimodal Fusion, CVPR 2024](https://openaccess.thecvf.com/content/CVPR2024/html/Gao_Embracing_Unimodal_Aleatoric_Uncertainty_for_Robust_Multimodal_Fusion_CVPR_2024_paper.html)
+- [Conflict-Guided Evidential Multimodal Fusion, WACV 2025](https://openaccess.thecvf.com/content/WACV2025/html/Deregnaucourt_A_Conflict-Guided_Evidential_Multimodal_Fusion_for_Semantic_Segmentation_WACV_2025_paper.html)
+- [Fuzzy Multimodal Learning for Trusted Cross-modal Retrieval, CVPR 2025](https://openaccess.thecvf.com/content/CVPR2025/html/Duan_Fuzzy_Multimodal_Learning_for_Trusted_Cross-modal_Retrieval_CVPR_2025_paper.html)
+- [SURE: Robust Multimodal Fusion with Missing Modalities and Distribution Shifts, 2025](https://arxiv.org/abs/2504.13465)
 - [MambaIR, ECCV 2024](https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/02740.pdf)
-- [PLTrans, CVPR 2024](https://openaccess.thecvf.com/content/CVPR2024/html/Xie_Learning_Degradation-unaware_Representation_with_Prior-based_Latent_Transformations_for_Blind_Face_CVPR_2024_paper.html)
 - [MambaIRv2, CVPR 2025](https://openaccess.thecvf.com/content/CVPR2025/html/Guo_MambaIRv2_Attentive_State_Space_Restoration_CVPR_2025_paper.html)
-- [SimMLM, ICCV 2025](https://openaccess.thecvf.com/content/ICCV2025/papers/Li_SimMLM_A_Simple_Framework_for_Multi-modal_Learning_with_Missing_Modality_ICCV_2025_paper.pdf)
-- [Missing-modality survey, 2024](https://arxiv.org/abs/2409.07825)

@@ -1,4 +1,4 @@
-"""Frozen embedding and spatial-map extraction for SpecFormer recovery."""
+"""Frozen embedding and spatial-map extraction for GIPSSR-Net."""
 
 from __future__ import annotations
 

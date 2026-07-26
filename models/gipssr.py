@@ -1,4 +1,4 @@
-"""HIASR-Net: hierarchical identity-prior attentive state-space recovery."""
+"""GIPSSR-Net: Gallery Identity-Prior State-Space Recovery Network."""
 
 from __future__ import annotations
 
@@ -8,11 +8,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.recovery_backbone import StableRecoveryBackbone
-from models.dcca_specformer_components import _templates
+from models.gipssr_stage1 import GIPSSRStage1
+from models.gipssr_components import _templates
 
 
-ARCHITECTURE_VERSION = "hiasr_identity_prior_state_space_v10"
+ARCHITECTURE_VERSION = "gipssr_cuef_state_space_recovery_v3"
+METHOD_NAME = "GIPSSR-Net"
+MODULE_NAMES = {
+    "shared_alignment": "IGDCA",
+    "specific_disentangler": "SGSSD",
+    "recovery_decoder": "GIPRD",
+    "evidential_fusion": "CUEF",
+}
 
 
 def _zero_linear(layer: nn.Linear) -> None:
@@ -116,7 +123,7 @@ class ConditionedSelectiveScan2D(nn.Module):
 
 
 class SharedGuidedStateSpaceDisentangler(nn.Module):
-    """Shared-guided common/specific separation with role latents."""
+    """SGSSD: shared-guided state-space disentanglement with role latents."""
 
     def __init__(
         self,
@@ -220,8 +227,8 @@ class SharedGuidedStateSpaceDisentangler(nn.Module):
         }
 
 
-class HierarchicalIdentityPriorDecoder(nn.Module):
-    """Top-K candidate interaction followed by specific and identity recovery."""
+class GalleryIdentityPriorRecoveryDecoder(nn.Module):
+    """GIPRD: gallery-prior specific and identity recovery from Top-K candidates."""
 
     def __init__(
         self,
@@ -400,7 +407,7 @@ class HierarchicalIdentityPriorDecoder(nn.Module):
         }
 
 
-class DCCASpecFormerRecovery(StableRecoveryBackbone):
+class GIPSSRNet(GIPSSRStage1):
     """Identity-preserving hierarchical recovery with a trainable state-space branch."""
 
     def __init__(
@@ -411,15 +418,16 @@ class DCCASpecFormerRecovery(StableRecoveryBackbone):
         transformer_layers: int = 2,
         transformer_heads: int = 4,
         dropout: float = 0.1,
-        max_gate: float = 0.75,
+        max_recovery_weight: float = 0.75,
         min_recovery_weight: float = 0.15,
         retrieval_dropout: float = 0.10,
-        branch_floor: float = 0.0,
+        branch_floor: float = 0.02,
         max_proxy_identities: int = 512,
         topk_candidates: int = 5,
         role_queries: int = 4,
         candidate_dropout: float = 0.20,
         max_refinement: float = 0.25,
+        ablation: str = "full",
     ):
         super().__init__(
             input_dim=input_dim,
@@ -428,14 +436,15 @@ class DCCASpecFormerRecovery(StableRecoveryBackbone):
             transformer_layers=transformer_layers,
             transformer_heads=transformer_heads,
             dropout=dropout,
-            max_gate=max_gate,
+            max_recovery_weight=max_recovery_weight,
             min_recovery_weight=min_recovery_weight,
             retrieval_dropout=retrieval_dropout,
             branch_floor=branch_floor,
             max_proxy_identities=max_proxy_identities,
+            ablation=ablation,
         )
         if topk_candidates < 2:
-            raise ValueError("HIASR requires at least two independent candidates")
+            raise ValueError("GIPSSR-Net requires at least two independent candidates")
         if not 0.0 <= candidate_dropout < 1.0:
             raise ValueError("candidate_dropout must be in [0, 1)")
         if not 0.0 < max_refinement <= 1.0:
@@ -444,39 +453,58 @@ class DCCASpecFormerRecovery(StableRecoveryBackbone):
         self.role_queries = int(role_queries)
         self.candidate_dropout = float(candidate_dropout)
         self.max_refinement = float(max_refinement)
-        self.shared_disentangler = SharedGuidedStateSpaceDisentangler(
-            input_dim,
-            shared_dim,
-            specific_dim,
-            transformer_heads,
-            role_queries,
-            dropout,
-        )
-        self.hierarchical_decoder = HierarchicalIdentityPriorDecoder(
-            input_dim,
-            shared_dim,
-            specific_dim,
-            transformer_heads,
-            role_queries,
-            topk_candidates,
-            dropout,
-        )
-        self.refinement_logit = nn.Parameter(torch.tensor(math.log(0.1 / 0.9)))
+        self.sgssd = None
+        self.giprd = None
+        if ablation not in {"without_sgssd", "without_sgssd_giprd"}:
+            self.sgssd = SharedGuidedStateSpaceDisentangler(
+                input_dim,
+                shared_dim,
+                specific_dim,
+                transformer_heads,
+                role_queries,
+                dropout,
+            )
+        if ablation not in {"without_giprd", "without_sgssd_giprd"}:
+            self.giprd = GalleryIdentityPriorRecoveryDecoder(
+                input_dim,
+                shared_dim,
+                specific_dim,
+                transformer_heads,
+                role_queries,
+                topk_candidates,
+                dropout,
+            )
+            self.refinement_logit = nn.Parameter(torch.tensor(math.log(0.1 / 0.9)))
+        else:
+            self.register_parameter("refinement_logit", None)
 
     def encode(
         self, features: torch.Tensor, spatial: torch.Tensor, modality: str
     ) -> dict[str, torch.Tensor]:
         output = super().encode(features, spatial, modality)
+        if self.ablation == "without_sgssd_giprd":
+            return output
+        if self.sgssd is None:
+            batch = features.size(0)
+            zeros = features.new_zeros(batch, self.specific_dim)
+            output.update(
+                {
+                    "hierarchical_tokens": zeros.unsqueeze(1).expand(-1, self.role_queries, -1),
+                    "hierarchical_specific": zeros,
+                    "orthogonal_reference": zeros,
+                }
+            )
+            return output
         modality_index = 0 if modality == "palm" else 1
-        output.update(
-            self.shared_disentangler(spatial, output["shared"], modality_index)
-        )
+        output.update(self.sgssd(spatial, output["shared"], modality_index))
         return output
 
     @torch.no_grad()
     def build_gallery_memory(
         self, gallery: dict[str, torch.Tensor], chunk_size: int = 256
     ) -> dict[str, torch.Tensor]:
+        if self.ablation == "without_sgssd_giprd":
+            return super().build_gallery_memory(gallery, chunk_size)
         labels = gallery["labels"].long()
         memory: dict[str, torch.Tensor] = {"labels": labels.unique(sorted=True)}
         for modality in ("palm", "vein"):
@@ -511,10 +539,35 @@ class DCCASpecFormerRecovery(StableRecoveryBackbone):
         available_modality: str,
         memory: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor | str]:
-        backbone = super().score_from_encoding(
-            available, available_modality, memory
-        )
+        if self.ablation == "without_sgssd_giprd":
+            return super().score_from_encoding(
+                available, available_modality, memory
+            )
         target_modality, direction = self._direction(available_modality)
+        base_available = dict(available)
+        base_available["tokens"] = available["hierarchical_tokens"]
+        base_memory = dict(memory)
+        base_memory[f"{target_modality}_specific"] = memory[
+            f"{target_modality}_hierarchical_specific"
+        ]
+        backbone = super().score_from_encoding(
+            base_available, available_modality, base_memory
+        )
+        orthogonality = F.cosine_similarity(
+            available["orthogonal_reference"],
+            available["hierarchical_specific"],
+            dim=1,
+        ).square()
+        if self.ablation == "without_giprd":
+            batch_zeros = backbone["mean"].new_zeros(backbone["mean"].size(0))
+            backbone.update(
+                {
+                    "orthogonality": orthogonality,
+                    "candidate_keep_fraction": batch_zeros.new_zeros(()),
+                    "refinement_scale": batch_zeros,
+                }
+            )
+            return backbone
         count = min(self.topk_candidates, backbone["posterior"].size(1))
         top_values, top_indices = backbone["posterior"].topk(count, dim=1)
         target_embeddings = memory[f"{target_modality}_embedding"][top_indices]
@@ -528,7 +581,7 @@ class DCCASpecFormerRecovery(StableRecoveryBackbone):
         candidate_weights = candidate_weights / candidate_weights.sum(
             dim=1, keepdim=True
         ).clamp_min(1e-8)
-        hierarchical = self.hierarchical_decoder(
+        hierarchical = self.giprd(
             available["hierarchical_tokens"],
             available["shared"],
             available["embedding"],
@@ -539,55 +592,50 @@ class DCCASpecFormerRecovery(StableRecoveryBackbone):
             direction,
         )
         scale = self.max_refinement * torch.sigmoid(self.refinement_logit)
-        proposed = F.normalize(
+        recovered = F.normalize(
             backbone["mean"] + scale * hierarchical["embedding_delta"], dim=1
         )
-        proposed_scores = proposed @ memory[f"{target_modality}_embedding"].t()
-        backbone_top_two = backbone["recovered_scores"].topk(2, dim=1)
-        proposed_top_two = proposed_scores.topk(2, dim=1)
-        same_identity = backbone_top_two.indices[:, 0].eq(
-            proposed_top_two.indices[:, 0]
-        )
-        backbone_margin = backbone_top_two.values[:, 0] - backbone_top_two.values[:, 1]
-        proposed_margin = proposed_top_two.values[:, 0] - proposed_top_two.values[:, 1]
-        hard_safety = same_identity & proposed_margin.ge(backbone_margin)
-        soft_safety = same_identity.to(proposed) * torch.sigmoid(
-            (proposed_margin - backbone_margin) / 0.02
-        )
-        safety = hard_safety.to(proposed) + soft_safety - soft_safety.detach()
-        recovered = F.normalize(
-            backbone["mean"]
-            + safety.unsqueeze(1) * scale * hierarchical["embedding_delta"],
-            dim=1,
-        )
         recovered_scores = recovered @ memory[f"{target_modality}_embedding"].t()
-        fused_scores = (
-            backbone["shared_weight"].unsqueeze(1) * backbone["base_scores"]
-            + backbone["recovery_weight"].unsqueeze(1) * recovered_scores
+        updated_log_variance = (
+            backbone["log_variance"]
+            + 0.1 * hierarchical["log_variance_delta"]
+        ).clamp(-6.0, 2.0)
+        fusion = self.fuse_score_branches(
+            backbone["base_branch_scores"],
+            recovered_scores,
+            updated_log_variance,
+            direction,
         )
-        orthogonality = F.cosine_similarity(
-            available["orthogonal_reference"],
-            available["hierarchical_specific"],
-            dim=1,
-        ).square()
+        branch_weights = fusion["weights"]
+        recovery_weight = branch_weights[:, 3]
+        shared_weight = 1.0 - recovery_weight
+        base_weights = (
+            branch_weights[:, :3]
+            / shared_weight.unsqueeze(1).clamp_min(1e-8)
+        )
         backbone.update(
             {
                 "mean": recovered,
                 "predicted_specific": hierarchical["predicted_specific"],
                 "cycle": self.cycle_reconstruct(recovered, direction),
-                "log_variance": (
-                    backbone["log_variance"]
-                    + 0.1 * hierarchical["log_variance_delta"]
-                ).clamp(-6.0, 2.0),
+                "log_variance": updated_log_variance,
                 "recovered_scores": recovered_scores,
-                "fused_scores": fused_scores,
-                "teacher_fused_scores": backbone["fused_scores"],
+                "fused_scores": fusion["fused_scores"],
+                "calibrated_branch_scores": fusion["calibrated_scores"],
+                "branch_weights": branch_weights,
+                "base_weights": base_weights,
+                "recovery_weight": recovery_weight,
+                "shared_weight": shared_weight,
+                "fusion_evidence": fusion["evidence"],
+                "fusion_uncertainty": fusion["uncertainty"],
+                "fusion_conflict": fusion["conflict"],
+                "fusion_conflict_scale": fusion["conflict_scale"],
+                "calibration_scale": fusion["calibration_scale"],
                 "orthogonality": orthogonality,
                 "candidate_indices": top_indices,
                 "candidate_weights": candidate_weights,
                 "candidate_keep_fraction": candidate_keep.float().mean(),
-                "refinement_gate": safety * scale,
-                "refinement_active_fraction": hard_safety.float().mean(),
+                "refinement_scale": scale.expand(recovered.size(0)),
                 "hierarchical_stage_one": hierarchical["stage_one_tokens"],
                 "hierarchical_stage_two": hierarchical["stage_two_tokens"],
             }

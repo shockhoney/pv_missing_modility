@@ -1,43 +1,43 @@
-"""Train the final HIASR missing-modality recovery network by backpropagation."""
+"""Train GIPSSR-Net end to end by backpropagation."""
 
 from __future__ import annotations
 
 import argparse
 
-import torch
-import torch.nn.functional as F
 
-from utils import recovery_backbone_training as backbone
-from models.dcca_specformer import ARCHITECTURE_VERSION, DCCASpecFormerRecovery
-from utils import dcca_training_support as orchestration
+from utils import gipssr_stage1_training as stage1
+from models.gipssr import ARCHITECTURE_VERSION, GIPSSRNet
+from utils import gipssr_training as orchestration
 from utils.checkpoint_io import safe_torch_load
 
 
-INTERNAL_BACKBONE_VERSION = backbone.INTERNAL_BACKBONE_VERSION
-backbone_directional_losses = backbone.directional_losses
-backbone_metrics_for_output = backbone.metrics_for_output
+STAGE1_ARCHITECTURE_VERSION = stage1.STAGE1_ARCHITECTURE_VERSION
+stage1_directional_losses = stage1.directional_losses
+stage1_metrics_for_output = stage1.metrics_for_output
 
 
-def configure_stage(model: DCCASpecFormerRecovery, shared_only: bool) -> None:
+def configure_stage(model: GIPSSRNet, shared_only: bool) -> None:
     del shared_only
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    for module in (model.shared_disentangler, model.hierarchical_decoder):
-        for parameter in module.parameters():
-            parameter.requires_grad_(True)
-    model.refinement_logit.requires_grad_(True)
+    for module in (model.sgssd, model.giprd, model.cuef):
+        if module is not None:
+            for parameter in module.parameters():
+                parameter.requires_grad_(True)
+    if model.refinement_logit is not None:
+        model.refinement_logit.requires_grad_(True)
 
 
 def build_model(args, training_set, device):
     del training_set
-    model = DCCASpecFormerRecovery(
+    model = GIPSSRNet(
         input_dim=args.embedding_size,
         shared_dim=args.shared_dimensions,
         specific_dim=args.specific_dimensions,
         transformer_layers=args.transformer_layers,
         transformer_heads=args.transformer_heads,
         dropout=args.dropout,
-        max_gate=args.max_gate,
+        max_recovery_weight=args.max_recovery_weight,
         min_recovery_weight=args.min_recovery_weight,
         retrieval_dropout=args.retrieval_dropout,
         branch_floor=args.branch_floor,
@@ -45,14 +45,15 @@ def build_model(args, training_set, device):
         role_queries=args.role_queries,
         candidate_dropout=args.candidate_dropout,
         max_refinement=args.max_refinement,
+        ablation=args.ablation,
     ).to(device)
     checkpoint = safe_torch_load(args.warm_start_ckpt, device)
-    if checkpoint.get("architecture_version") != INTERNAL_BACKBONE_VERSION:
-        raise ValueError("warm_start_ckpt must be an internal stable-backbone checkpoint")
+    if checkpoint.get("architecture_version") != STAGE1_ARCHITECTURE_VERSION:
+        raise ValueError("warm_start_ckpt must be a GIPSSR stage-1 checkpoint")
     incompatible = model.load_state_dict(checkpoint["model"], strict=False)
     expected_prefixes = (
-        "shared_disentangler.",
-        "hierarchical_decoder.",
+        "sgssd.",
+        "giprd.",
         "refinement_logit",
     )
     unexpected_missing = [
@@ -77,22 +78,18 @@ def directional_losses(
     target_indices,
     args,
 ):
-    losses = backbone_directional_losses(
+    loss_target_encoding = dict(target_encoding)
+    if "hierarchical_specific" in target_encoding:
+        loss_target_encoding["specific"] = target_encoding["hierarchical_specific"]
+    losses = stage1_directional_losses(
         output,
         source_embedding,
-        target_encoding,
+        loss_target_encoding,
         target_embedding,
         target_indices,
         args,
     )
-    student_margin = orchestration.hard_margin(
-        output["fused_scores"], target_indices
-    )
-    teacher_margin = orchestration.hard_margin(
-        output["teacher_fused_scores"], target_indices
-    )
-    teacher_safe = F.relu(teacher_margin.detach() - student_margin).mean()
-    losses["safe"] = losses["safe"] + args.teacher_safe_weight * teacher_safe
+    losses["safe"] = losses["safe"].new_zeros(())
     losses["reconstruction"] = (
         losses["reconstruction"]
         + args.orthogonal_weight * output["orthogonality"].mean()
@@ -101,7 +98,7 @@ def directional_losses(
 
 
 def metrics_for_output(model, output, probe_labels):
-    result = backbone_metrics_for_output(model, output, probe_labels)
+    result = stage1_metrics_for_output(model, output, probe_labels)
     result.update(
         {
             "orthogonality": orchestration.distribution_summary(
@@ -110,11 +107,11 @@ def metrics_for_output(model, output, probe_labels):
             "candidate_keep_fraction": float(
                 output["candidate_keep_fraction"].item()
             ),
-            "refinement_gate": orchestration.distribution_summary(
-                output["refinement_gate"]
+            "unconditional_applied_fraction": (
+                0.0 if model.ablation == "without_giprd" else 1.0
             ),
-            "refinement_active_fraction": float(
-                output["refinement_active_fraction"].item()
+            "refinement_scale": orchestration.distribution_summary(
+                output["refinement_scale"]
             ),
             "topk_candidates": model.topk_candidates,
             "role_queries": model.role_queries,
@@ -126,34 +123,43 @@ def metrics_for_output(model, output, probe_labels):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--warm_start_ckpt", required=True)
+    parser.add_argument(
+        "--ablation",
+        choices=("full", "without_igdca", "without_sgssd", "without_giprd", "without_sgssd_giprd", "without_cuef_calibration", "without_cuef_conflict", "without_cuef_uncertainty"),
+        default="full",
+    )
     parser.add_argument("--topk_candidates", type=int, default=5)
     parser.add_argument("--role_queries", type=int, default=4)
     parser.add_argument("--candidate_dropout", type=float, default=0.20)
     parser.add_argument("--max_refinement", type=float, default=0.25)
     parser.add_argument("--orthogonal_weight", type=float, default=0.10)
-    parser.add_argument("--teacher_safe_weight", type=float, default=1.0)
     parser.add_argument("--minimum_candidate_epochs", type=int, default=2)
     values, remaining = parser.parse_known_args(argv)
-    args = backbone.parse_args(["--shared_stage_epochs", "0", *remaining])
+    args = stage1.parse_args(["--shared_stage_epochs", "0", *remaining])
     for name, value in vars(values).items():
         setattr(args, name, value)
     args.shared_stage_epochs = 0
+    if args.ablation == "without_sgssd_giprd":
+        raise ValueError(
+            "without_sgssd_giprd uses the trained GIPSSRStage1 checkpoint directly"
+        )
     args.minimum_recovery_epochs = args.minimum_candidate_epochs
+    args.safe_weight = 0.0
     if args.epochs < args.minimum_candidate_epochs:
         raise ValueError("epochs must cover minimum_candidate_epochs")
     return args
 
 
-backbone.configure_stage = configure_stage
-backbone.directional_losses = directional_losses
-backbone.metrics_for_output = metrics_for_output
-backbone.ARCHITECTURE_VERSION = ARCHITECTURE_VERSION
+stage1.configure_stage = configure_stage
+stage1.directional_losses = directional_losses
+stage1.metrics_for_output = metrics_for_output
+stage1.ARCHITECTURE_VERSION = ARCHITECTURE_VERSION
 orchestration.ARCHITECTURE_VERSION = ARCHITECTURE_VERSION
 orchestration.build_model = build_model
-orchestration.train_epoch = backbone.train_epoch
+orchestration.train_epoch = stage1.train_epoch
 orchestration.metrics_for_output = metrics_for_output
-orchestration.evaluate_model = backbone.evaluate_model
-orchestration.validation_rank = backbone.validation_rank
+orchestration.evaluate_model = stage1.evaluate_model
+orchestration.validation_rank = stage1.validation_rank
 
 
 if __name__ == "__main__":

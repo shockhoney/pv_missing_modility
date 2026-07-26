@@ -1,8 +1,6 @@
-"""Reusable neural components for staged DCCA and Transformer recovery."""
+"""Reusable IGDCA and stage-1 recovery components for GIPSSR-Net."""
 
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn as nn
@@ -28,8 +26,8 @@ def _templates(features: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tens
     return F.normalize(templates, dim=1), identities
 
 
-class DeepCCAProjector(nn.Module):
-    """CCA-initialized nonlinear projector whose complete path is trainable."""
+class IdentityGuidedDeepCorrelationAlignment(nn.Module):
+    """IGDCA: CCA-initialized, identity-guided trainable correlation alignment."""
 
     def __init__(self, input_dim: int, shared_dim: int, dropout: float):
         super().__init__()
@@ -83,7 +81,7 @@ class DeepCCAProjector(nn.Module):
         )
 
 
-class SpatialSpecificTransformer(nn.Module):
+class Stage1SpecificEncoder(nn.Module):
     """Encode the residual 7x7 spatial tokens unique to one modality."""
 
     def __init__(
@@ -136,7 +134,7 @@ class SpatialSpecificTransformer(nn.Module):
         return F.normalize(encoded[:, 0], dim=1), encoded[:, 1:]
 
 
-class TargetSpecificDecoder(nn.Module):
+class Stage1RecoveryDecoder(nn.Module):
     """Recover a distribution over the missing target representation."""
 
     def __init__(
@@ -205,7 +203,7 @@ class TargetSpecificDecoder(nn.Module):
         return recovered, predicted_specific, log_variance
 
 
-class RecoveryBackbone(nn.Module):
+class GIPSSRCore(nn.Module):
     BRANCHES = ("available", "shared_same", "shared_cross", "recovered")
 
     def __init__(
@@ -216,13 +214,17 @@ class RecoveryBackbone(nn.Module):
         transformer_layers: int = 2,
         transformer_heads: int = 4,
         dropout: float = 0.1,
+        ablation: str = "full",
     ):
         super().__init__()
+        if ablation not in {"full", "without_igdca", "without_sgssd", "without_giprd", "without_sgssd_giprd", "without_cuef_calibration", "without_cuef_conflict", "without_cuef_uncertainty"}:
+            raise ValueError(f"Unsupported ablation: {ablation}")
+        self.ablation = ablation
         self.input_dim = int(input_dim)
         self.shared_dim = int(shared_dim)
         self.specific_dim = int(specific_dim)
-        self.palm_projector = DeepCCAProjector(input_dim, shared_dim, dropout)
-        self.vein_projector = DeepCCAProjector(input_dim, shared_dim, dropout)
+        self.palm_igdca = IdentityGuidedDeepCorrelationAlignment(input_dim, shared_dim, dropout)
+        self.vein_igdca = IdentityGuidedDeepCorrelationAlignment(input_dim, shared_dim, dropout)
         specific_kwargs = dict(
             input_dim=input_dim,
             shared_dim=shared_dim,
@@ -231,9 +233,9 @@ class RecoveryBackbone(nn.Module):
             heads=transformer_heads,
             dropout=dropout,
         )
-        self.palm_specific = SpatialSpecificTransformer(**specific_kwargs)
-        self.vein_specific = SpatialSpecificTransformer(**specific_kwargs)
-        self.recovery_decoder = TargetSpecificDecoder(
+        self.palm_specific = Stage1SpecificEncoder(**specific_kwargs)
+        self.vein_specific = Stage1SpecificEncoder(**specific_kwargs)
+        self.recovery_decoder = Stage1RecoveryDecoder(
             embedding_dim=input_dim,
             shared_dim=shared_dim,
             model_dim=specific_dim,
@@ -241,24 +243,22 @@ class RecoveryBackbone(nn.Module):
             heads=transformer_heads,
             dropout=dropout,
         )
-        self.base_weight_logits = nn.Parameter(
-            torch.tensor([[-4.0, 4.0, -4.0], [-4.0, 4.0, -4.0]])
-        )
-        self.log_temperatures = nn.Parameter(torch.tensor([math.log(0.05), math.log(0.01)]))
 
     @torch.no_grad()
     def initialize_from_cca(self, projector: RegularizedSharedIdentityProjector) -> None:
-        self.palm_projector.initialize_from_cca(projector, "palm")
-        self.vein_projector.initialize_from_cca(projector, "vein")
+        if self.ablation == "without_igdca":
+            return
+        self.palm_igdca.initialize_from_cca(projector, "palm")
+        self.vein_igdca.initialize_from_cca(projector, "vein")
 
-    def projector(self, modality: str) -> DeepCCAProjector:
+    def igdca(self, modality: str) -> IdentityGuidedDeepCorrelationAlignment:
         if modality == "palm":
-            return self.palm_projector
+            return self.palm_igdca
         if modality == "vein":
-            return self.vein_projector
+            return self.vein_igdca
         raise ValueError(f"Unsupported modality: {modality}")
 
-    def specific_encoder(self, modality: str) -> SpatialSpecificTransformer:
+    def specific_encoder(self, modality: str) -> Stage1SpecificEncoder:
         if modality == "palm":
             return self.palm_specific
         if modality == "vein":
@@ -268,9 +268,13 @@ class RecoveryBackbone(nn.Module):
     def encode(
         self, features: torch.Tensor, spatial: torch.Tensor, modality: str
     ) -> dict[str, torch.Tensor]:
-        projector = self.projector(modality)
-        shared_raw = projector.forward_raw(features)
-        shared = F.normalize(shared_raw, dim=1)
+        if self.ablation == "without_igdca":
+            shared_raw = features.new_zeros(features.size(0), self.shared_dim)
+            shared = shared_raw
+        else:
+            igdca = self.igdca(modality)
+            shared_raw = igdca.forward_raw(features)
+            shared = F.normalize(shared_raw, dim=1)
         specific, tokens = self.specific_encoder(modality)(spatial, shared)
         return {
             "embedding": F.normalize(features, dim=1),
@@ -326,4 +330,6 @@ class RecoveryBackbone(nn.Module):
         return self.score_from_encoding(encoded, available_modality, memory)
 
     def anchor_loss(self) -> torch.Tensor:
-        return self.palm_projector.anchor_loss() + self.vein_projector.anchor_loss()
+        if self.ablation == "without_igdca":
+            return next(self.parameters()).new_zeros(())
+        return self.palm_igdca.anchor_loss() + self.vein_igdca.anchor_loss()

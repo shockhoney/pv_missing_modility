@@ -1,4 +1,4 @@
-"""Evaluate the final HIASR trainable missing-modality recovery model."""
+"""Evaluate GIPSSR-Net under the strict gallery/probe protocol."""
 
 from __future__ import annotations
 
@@ -8,14 +8,15 @@ import os
 
 import torch
 
-from models.dcca_specformer import ARCHITECTURE_VERSION, DCCASpecFormerRecovery
+from models.gipssr import ARCHITECTURE_VERSION, METHOD_NAME, MODULE_NAMES, GIPSSRNet
+from models.gipssr_stage1 import STAGE1_ARCHITECTURE_VERSION, GIPSSRStage1
 from utils.checkpoint import load_encoder_from_checkpoint
 from utils.checkpoint_io import file_sha256, safe_torch_load
 from utils.evaluation import format_gallery_probe_metrics, score_matrix_metrics
 from utils.feature_extraction import paired_feature_loader, single_feature_loader
 from utils.runtime import resolve_device, set_random_seed
 from utils.scenarios import PALMPRINT_MISSING, PALMVEIN_MISSING
-from utils.spatial_feature_extraction import (
+from utils.gipssr_feature_extraction import (
     extract_paired_spatial_features,
     extract_single_spatial_features,
 )
@@ -81,11 +82,10 @@ def evaluate_direction(model, memory, probes, available, args):
     print_result("fusion without recovery", base)
     print_result("fusion with recovery", fused)
     print(
-        f"[parameters] temperature={output['temperature'].item():.5f} "
+        f"[parameters] calibration_scale={output['calibration_scale'].mean().item():.5f} "
         f"shared_weight={output['shared_weight'].mean().item():.4f} "
         f"recovery_weight={output['recovery_weight'].mean().item():.4f} "
         f"bounds=[{model.min_recovery_weight:.2f}, {model.max_recovery_weight:.2f}] "
-        f"fallback_model=None"
     )
     print(
         f"[recovery contribution] EER={improvement['eer']*100:+.4f}pp "
@@ -94,18 +94,26 @@ def evaluate_direction(model, memory, probes, available, args):
         f"Top1={improvement['top1']*100:+.2f}pp"
     )
     hierarchical_diagnostics = {}
-    if "refinement_gate" in output:
+    if "refinement_scale" in output:
+        topk_candidates = (
+            int(output["candidate_indices"].size(1))
+            if "candidate_indices" in output
+            else 0
+        )
+        unconditional = float(topk_candidates > 0)
         hierarchical_diagnostics = {
-            "refinement_gate": distribution_summary(output["refinement_gate"]),
-            "refinement_active_fraction": float(output["refinement_active_fraction"].item()),
+            "refinement_scale": distribution_summary(output["refinement_scale"]),
+            "unconditional_applied_fraction": unconditional,
             "orthogonality": distribution_summary(output["orthogonality"]),
             "candidate_keep_fraction": float(output["candidate_keep_fraction"].item()),
-            "topk_candidates": int(output["candidate_indices"].size(1)),
+            "topk_candidates": topk_candidates,
         }
+        refinement_mean = hierarchical_diagnostics["refinement_scale"]["mean"]
+        orthogonality_mean = hierarchical_diagnostics["orthogonality"]["mean"]
         print(
-            f"[HIASR] active={hierarchical_diagnostics['refinement_active_fraction']:.3f} "
-            f"refinement={hierarchical_diagnostics['refinement_gate']['mean']:.5f} "
-            f"orthogonality={hierarchical_diagnostics['orthogonality']['mean']:.5f}"
+            f"[GIPSSR-Net] unconditional={unconditional:.3f} "
+            f"refinement={refinement_mean:.5f} "
+            f"orthogonality={orthogonality_mean:.5f}"
         )
     return {
         "branches": branches,
@@ -115,23 +123,36 @@ def evaluate_direction(model, memory, probes, available, args):
         "posterior_confidence": distribution_summary(output["posterior_confidence"]),
         "posterior_normalized_entropy": distribution_summary(output["posterior_entropy"]),
         "predicted_variance": distribution_summary(output["log_variance"].exp()),
-        "learned_gate": distribution_summary(output["learned_gate"]),
-        "recovery_gate": distribution_summary(output["recovery_gate"]),
         "shared_weight": distribution_summary(output["shared_weight"]),
         "recovery_weight": distribution_summary(output["recovery_weight"]),
         "recovery_weight_bounds": [
             model.min_recovery_weight, model.max_recovery_weight
         ],
-        "recovery_gate_activation": {
-            "fraction_gt_0.01": float((output["recovery_gate"] > 0.01).float().mean().item()),
-            "fraction_gt_0.05": float((output["recovery_gate"] > 0.05).float().mean().item()),
-        },
         "base_weights": {
-            name: float(output["base_weights"][0, index].item())
+            name: distribution_summary(output["base_weights"][:, index])
             for index, name in enumerate(model.BRANCHES[:3])
         },
-        "temperature": float(output["temperature"].item()),
-        "fallback_model": None,
+        "branch_weights": {
+            name: distribution_summary(output["branch_weights"][:, index])
+            for index, name in enumerate(model.BRANCHES)
+        },
+        "fusion_evidence": {
+            name: distribution_summary(output["fusion_evidence"][:, index])
+            for index, name in enumerate(model.BRANCHES)
+        },
+        "fusion_uncertainty": {
+            name: distribution_summary(output["fusion_uncertainty"][:, index])
+            for index, name in enumerate(model.BRANCHES)
+        },
+        "fusion_conflict": {
+            name: distribution_summary(output["fusion_conflict"][:, index])
+            for index, name in enumerate(model.BRANCHES)
+        },
+        "calibration_scale": {
+            name: float(output["calibration_scale"][index].item())
+            for index, name in enumerate(model.BRANCHES)
+        },
+        "fusion_conflict_scale": float(output["fusion_conflict_scale"].item()),
         "hierarchical_diagnostics": hierarchical_diagnostics,
     }
 
@@ -141,26 +162,36 @@ def evaluate(args):
     set_random_seed(args.seed)
     checkpoint = safe_torch_load(args.ckpt, device)
     saved_args = checkpoint.get("args", {})
-    if checkpoint.get("architecture_version") != ARCHITECTURE_VERSION:
-        raise ValueError(f"Checkpoint architecture is not {ARCHITECTURE_VERSION}")
+    checkpoint_architecture = checkpoint.get("architecture_version")
+    if checkpoint_architecture not in {ARCHITECTURE_VERSION, STAGE1_ARCHITECTURE_VERSION}:
+        raise ValueError(f"Unsupported checkpoint architecture: {checkpoint_architecture}")
     verify_fingerprints(checkpoint, args)
     config = checkpoint["configuration"]
-    model = DCCASpecFormerRecovery(
+    ablation = saved_args.get("ablation", checkpoint.get("ablation", "full"))
+    reported_ablation = args.ablation_label or ablation
+    common = dict(
         input_dim=int(config["input_dim"]),
         shared_dim=int(config["shared_dim"]),
         specific_dim=int(config["specific_dim"]),
         min_recovery_weight=float(saved_args.get("min_recovery_weight", 0.15)),
         retrieval_dropout=float(saved_args.get("retrieval_dropout", 0.10)),
         branch_floor=float(saved_args.get("branch_floor", 0.0)),
-        topk_candidates=int(saved_args.get("topk_candidates", 5)),
-        role_queries=int(saved_args.get("role_queries", 4)),
-        candidate_dropout=float(saved_args.get("candidate_dropout", 0.20)),
-        max_refinement=float(saved_args.get("max_refinement", 0.25)),
         transformer_layers=int(config["transformer_layers"]),
         transformer_heads=int(config["transformer_heads"]),
         dropout=float(config["dropout"]),
-        max_gate=float(config["max_gate"]),
-    ).to(device)
+        max_recovery_weight=float(config["max_recovery_weight"]),
+        ablation=ablation,
+    )
+    if checkpoint_architecture == ARCHITECTURE_VERSION:
+        model = GIPSSRNet(
+            **common,
+            topk_candidates=int(saved_args.get("topk_candidates", 5)),
+            role_queries=int(saved_args.get("role_queries", 4)),
+            candidate_dropout=float(saved_args.get("candidate_dropout", 0.20)),
+            max_refinement=float(saved_args.get("max_refinement", 0.25)),
+        ).to(device)
+    else:
+        model = GIPSSRStage1(**common).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
     input_size = int(saved_args.get("input_size", args.input_size))
@@ -174,7 +205,7 @@ def evaluate(args):
             args.gallery_list, None, input_size, args.extract_batch_size, args.num_workers
         ),
         device,
-        "Extract DCCA-SpecFormer Gallery",
+        "Extract GIPSSR-Net Gallery",
     )
     gallery = {key: value.to(device) for key, value in gallery.items()}
     gallery["labels"] = gallery["labels"].long()
@@ -195,7 +226,7 @@ def evaluate(args):
                 args.num_workers,
             ),
             device,
-            f"Extract {scenario} DCCA-SpecFormer probes",
+            f"Extract {scenario} GIPSSR-Net probes",
         )
         probes = {
             modality: embeddings.to(device),
@@ -211,6 +242,10 @@ def evaluate(args):
             json.dump(
                 {
                     "architecture_version": checkpoint["architecture_version"],
+                    "method_name": METHOD_NAME,
+                    "modules": MODULE_NAMES,
+                    "ablation": reported_ablation,
+                    "model_ablation": ablation,
                     "checkpoint_sha256": file_sha256(args.ckpt),
                     "training_stage": checkpoint.get("training_stage"),
                     "best_epoch": checkpoint.get("best_epoch"),
@@ -228,14 +263,19 @@ def evaluate(args):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser("Evaluate final HIASR recovery")
+    parser = argparse.ArgumentParser("Evaluate GIPSSR-Net recovery")
     parser.add_argument("--gallery_list", default="data_txt/tongji/ssfd_gallery_full.txt")
     parser.add_argument("--protocol_list", default="data_txt/tongji/ssfd_test_protocol.txt")
-    parser.add_argument("--recovery_ckpt", "--ckpt", dest="ckpt", default="outputs/dcca_specformer/hiasr_v10/tongji/best.pth")
+    parser.add_argument("--recovery_ckpt", "--ckpt", dest="ckpt", default="outputs/gipssr/ablations/checkpoints/tongji/seed_42/full/best.pth")
     parser.add_argument("--palm_ckpt", default="outputs/encoders/palm_best.pth")
     parser.add_argument("--vein_ckpt", default="outputs/encoders/vein_best.pth")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--ablation_label",
+        choices=("full", "without_igdca", "without_sgssd", "without_giprd", "without_sgssd_giprd", "without_cuef_calibration", "without_cuef_conflict", "without_cuef_uncertainty"),
+        default=None,
+    )
     parser.add_argument("--input_size", type=int, default=224)
     parser.add_argument("--embedding_size", type=int, default=256)
     parser.add_argument("--extract_batch_size", type=int, default=128)
@@ -243,7 +283,7 @@ def parse_args(argv=None):
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--top_k", type=int, nargs="+", default=[1, 5])
     parser.add_argument("--far_points", type=float, nargs="+", default=[1e-3, 1e-4])
-    parser.add_argument("--output", "--metrics_path", dest="metrics_path", default="outputs/dcca_specformer/hiasr_v10/tongji/test_metrics.json")
+    parser.add_argument("--output", "--metrics_path", dest="metrics_path", default="outputs/gipssr/ablations/results/tongji/seed_42/full.json")
     return parser.parse_args(argv)
 
 
