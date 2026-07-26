@@ -1,4 +1,4 @@
-"""Evaluate differentiable-CCA spatial Transformer recovery."""
+"""Evaluate the final HIASR trainable missing-modality recovery model."""
 
 from __future__ import annotations
 
@@ -93,6 +93,20 @@ def evaluate_direction(model, memory, probes, available, args):
         f"TAR@1e-4={improvement['tar_1e-4']*100:+.2f}pp "
         f"Top1={improvement['top1']*100:+.2f}pp"
     )
+    hierarchical_diagnostics = {}
+    if "refinement_gate" in output:
+        hierarchical_diagnostics = {
+            "refinement_gate": distribution_summary(output["refinement_gate"]),
+            "refinement_active_fraction": float(output["refinement_active_fraction"].item()),
+            "orthogonality": distribution_summary(output["orthogonality"]),
+            "candidate_keep_fraction": float(output["candidate_keep_fraction"].item()),
+            "topk_candidates": int(output["candidate_indices"].size(1)),
+        }
+        print(
+            f"[HIASR] active={hierarchical_diagnostics['refinement_active_fraction']:.3f} "
+            f"refinement={hierarchical_diagnostics['refinement_gate']['mean']:.5f} "
+            f"orthogonality={hierarchical_diagnostics['orthogonality']['mean']:.5f}"
+        )
     return {
         "branches": branches,
         "fused_without_recovery": base,
@@ -118,6 +132,7 @@ def evaluate_direction(model, memory, probes, available, args):
         },
         "temperature": float(output["temperature"].item()),
         "fallback_model": None,
+        "hierarchical_diagnostics": hierarchical_diagnostics,
     }
 
 
@@ -137,6 +152,10 @@ def evaluate(args):
         min_recovery_weight=float(saved_args.get("min_recovery_weight", 0.15)),
         retrieval_dropout=float(saved_args.get("retrieval_dropout", 0.10)),
         branch_floor=float(saved_args.get("branch_floor", 0.0)),
+        topk_candidates=int(saved_args.get("topk_candidates", 5)),
+        role_queries=int(saved_args.get("role_queries", 4)),
+        candidate_dropout=float(saved_args.get("candidate_dropout", 0.20)),
+        max_refinement=float(saved_args.get("max_refinement", 0.25)),
         transformer_layers=int(config["transformer_layers"]),
         transformer_heads=int(config["transformer_heads"]),
         dropout=float(config["dropout"]),
@@ -209,10 +228,10 @@ def evaluate(args):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser("Evaluate DCCA-SpecFormer recovery")
+    parser = argparse.ArgumentParser("Evaluate final HIASR recovery")
     parser.add_argument("--gallery_list", default="data_txt/tongji/ssfd_gallery_full.txt")
     parser.add_argument("--protocol_list", default="data_txt/tongji/ssfd_test_protocol.txt")
-    parser.add_argument("--recovery_ckpt", "--ckpt", dest="ckpt", default="outputs/dcca_specformer/v9_1/tongji/best.pth")
+    parser.add_argument("--recovery_ckpt", "--ckpt", dest="ckpt", default="outputs/dcca_specformer/hiasr_v10/tongji/best.pth")
     parser.add_argument("--palm_ckpt", default="outputs/encoders/palm_best.pth")
     parser.add_argument("--vein_ckpt", default="outputs/encoders/vein_best.pth")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
@@ -224,7 +243,7 @@ def parse_args(argv=None):
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--top_k", type=int, nargs="+", default=[1, 5])
     parser.add_argument("--far_points", type=float, nargs="+", default=[1e-3, 1e-4])
-    parser.add_argument("--output", "--metrics_path", dest="metrics_path", default="outputs/dcca_specformer/v9_1/tongji/test_metrics.json")
+    parser.add_argument("--output", "--metrics_path", dest="metrics_path", default="outputs/dcca_specformer/hiasr_v10/tongji/test_metrics.json")
     return parser.parse_args(argv)
 
 

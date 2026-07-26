@@ -225,7 +225,7 @@ def train(args):
             raise ValueError(f"selection_ckpt architecture is not {ARCHITECTURE_VERSION}")
         epochs = int(selection_checkpoint["best_epoch"])
         schedule_epochs = int(selection_checkpoint["args"]["epochs"])
-        print(f"[Selection] epochs={epochs}; no legacy fallback or deployment blend")
+        print(f"[Selection] epochs={epochs}; no fallback or deployment blend")
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=args.learning_rate,
@@ -342,7 +342,7 @@ def parse_args(argv=None):
     parser.add_argument("--palm_ckpt", default="outputs/encoders/palm_best.pth")
     parser.add_argument("--vein_ckpt", default="outputs/encoders/vein_best.pth")
     parser.add_argument("--selection_ckpt", default=None)
-    parser.add_argument("--save_dir", default="outputs/dcca_specformer/v9_1/tongji_validation")
+    parser.add_argument("--save_dir", default="outputs/dcca_specformer/hiasr_v10/tongji_validation")
     parser.add_argument("--cache_dir", default="outputs/dcca_specformer/cache/tongji_validation")
     parser.add_argument("--fixed_full_train", action="store_true")
     parser.add_argument("--force_recache", action="store_true")

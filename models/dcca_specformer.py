@@ -1,4 +1,4 @@
-"""Balanced staged DCCA and Transformer recovery without legacy fallback."""
+"""HIASR-Net: hierarchical identity-prior attentive state-space recovery."""
 
 from __future__ import annotations
 
@@ -8,56 +8,400 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.dcca_specformer_components import (
-    RecoveryBackbone,
-    _templates,
-)
+from models.recovery_backbone import StableRecoveryBackbone
+from models.dcca_specformer_components import _templates
 
 
-ARCHITECTURE_VERSION = "balanced_staged_dcca_specformer_v9_1"
+ARCHITECTURE_VERSION = "hiasr_identity_prior_state_space_v10"
 
 
-class BalancedFusionGate(nn.Module):
-    """Keep both shared and recovered-specific evidence active for every sample."""
+def _zero_linear(layer: nn.Linear) -> None:
+    nn.init.zeros_(layer.weight)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+
+
+class GatedFeedForward(nn.Module):
+    def __init__(self, dim: int, expansion: int, dropout: float):
+        super().__init__()
+        hidden = dim * expansion
+        self.norm = nn.LayerNorm(dim)
+        self.input = nn.Linear(dim, hidden * 2)
+        self.output = nn.Linear(hidden, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        content, gate = self.input(self.norm(values)).chunk(2, dim=-1)
+        return values + self.dropout(self.output(content * F.silu(gate)))
+
+
+class ConditionedSelectiveScan2D(nn.Module):
+    """Four-direction pure-PyTorch selective state-space mixer for 7x7 tokens."""
+
+    def __init__(self, dim: int, condition_dim: int, dropout: float):
+        super().__init__()
+        self.dim = int(dim)
+        self.norm = nn.LayerNorm(dim)
+        self.local = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        self.input_projection = nn.Linear(dim, dim * 3)
+        self.condition_projection = nn.Linear(condition_dim, dim * 2)
+        self.direction_weights = nn.Linear(condition_dim, 4)
+        self.output_projection = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        self.feed_forward = GatedFeedForward(dim, expansion=2, dropout=dropout)
+
+    def _scan(
+        self, sequence: torch.Tensor, condition: torch.Tensor
+    ) -> torch.Tensor:
+        value, decay, update = self.input_projection(sequence).chunk(3, dim=-1)
+        condition_decay, condition_update = self.condition_projection(condition).chunk(
+            2, dim=-1
+        )
+        decay = 0.5 + 0.49 * torch.sigmoid(decay + condition_decay.unsqueeze(1))
+        update = torch.sigmoid(update + condition_update.unsqueeze(1))
+        value = torch.tanh(value)
+        prefix = torch.cumprod(decay, dim=1)
+        innovations = (1.0 - decay) * value / prefix.clamp_min(1e-20)
+        state = prefix * torch.cumsum(innovations, dim=1)
+        return update * state + (1.0 - update) * value
+
+    @staticmethod
+    def _ordered_sequences(grid: torch.Tensor) -> list[torch.Tensor]:
+        row = grid.flatten(1, 2)
+        column = grid.transpose(1, 2).flatten(1, 2)
+        return [row, row.flip(1), column, column.flip(1)]
+
+    @staticmethod
+    def _restore(
+        sequence: torch.Tensor, direction: int, height: int, width: int
+    ) -> torch.Tensor:
+        if direction == 0:
+            return sequence.reshape(sequence.size(0), height, width, -1)
+        if direction == 1:
+            return sequence.flip(1).reshape(sequence.size(0), height, width, -1)
+        if direction == 2:
+            return sequence.reshape(sequence.size(0), width, height, -1).transpose(1, 2)
+        return (
+            sequence.flip(1)
+            .reshape(sequence.size(0), width, height, -1)
+            .transpose(1, 2)
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        condition: torch.Tensor,
+        height: int = 7,
+        width: int = 7,
+    ) -> torch.Tensor:
+        if tokens.size(1) != height * width:
+            raise ValueError("Selective scan expects a complete spatial token grid")
+        normalized = self.norm(tokens)
+        grid = normalized.reshape(tokens.size(0), height, width, self.dim)
+        local = self.local(grid.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        grid = grid + local
+        restored = [
+            self._restore(self._scan(sequence, condition), index, height, width)
+            for index, sequence in enumerate(self._ordered_sequences(grid))
+        ]
+        weights = torch.softmax(self.direction_weights(condition), dim=1)
+        mixed = sum(
+            weights[:, index, None, None, None] * value
+            for index, value in enumerate(restored)
+        )
+        output = tokens + self.dropout(
+            self.output_projection(mixed.flatten(1, 2))
+        )
+        return self.feed_forward(output)
+
+
+class SharedGuidedStateSpaceDisentangler(nn.Module):
+    """Shared-guided common/specific separation with role latents."""
 
     def __init__(
         self,
+        input_dim: int,
+        shared_dim: int,
+        model_dim: int,
+        heads: int,
+        role_queries: int,
         dropout: float,
-        min_recovery_weight: float = 0.15,
-        max_recovery_weight: float = 0.75,
-        initial_recovery_weight: float = 0.30,
     ):
         super().__init__()
-        if not 0.0 < min_recovery_weight < max_recovery_weight < 1.0:
-            raise ValueError("Recovery bounds must satisfy 0 < min < max < 1")
-        self.min_recovery_weight = float(min_recovery_weight)
-        if not min_recovery_weight < initial_recovery_weight < max_recovery_weight:
-            raise ValueError("Initial recovery weight must be inside its bounds")
-        self.max_recovery_weight = float(max_recovery_weight)
-        self.net = nn.Sequential(
-            nn.Linear(10, 32),
+        self.role_queries_count = int(role_queries)
+        self.spatial_projection = nn.Conv2d(input_dim, model_dim, kernel_size=1)
+        self.local_three = nn.Conv2d(
+            model_dim, model_dim, kernel_size=3, padding=1, groups=model_dim
+        )
+        self.local_dilated = nn.Conv2d(
+            model_dim,
+            model_dim,
+            kernel_size=3,
+            padding=2,
+            dilation=2,
+            groups=model_dim,
+        )
+        self.shared_projection = nn.Linear(shared_dim, model_dim)
+        self.modality_embedding = nn.Parameter(torch.empty(2, model_dim))
+        self.common_queries = nn.Parameter(torch.empty(1, role_queries, model_dim))
+        self.specific_queries = nn.Parameter(torch.empty(1, role_queries, model_dim))
+        self.shared_to_spatial = nn.MultiheadAttention(
+            model_dim, heads, dropout=dropout, batch_first=True
+        )
+        self.spatial_to_common = nn.MultiheadAttention(
+            model_dim, heads, dropout=dropout, batch_first=True
+        )
+        self.common_gate = nn.Sequential(
+            nn.Linear(model_dim * 2, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, model_dim),
+            nn.Sigmoid(),
+        )
+        self.token_norm = nn.LayerNorm(model_dim)
+        self.state_space = ConditionedSelectiveScan2D(
+            model_dim, model_dim, dropout
+        )
+        self.role_attention = nn.MultiheadAttention(
+            model_dim, heads, dropout=dropout, batch_first=True
+        )
+        role_block = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=heads,
+            dim_feedforward=model_dim * 2,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.role_mixer = nn.TransformerEncoder(
+            role_block, num_layers=1, norm=nn.LayerNorm(model_dim)
+        )
+        self.specific_head = nn.Linear(model_dim, model_dim)
+        nn.init.trunc_normal_(self.modality_embedding, std=0.02)
+        nn.init.trunc_normal_(self.common_queries, std=0.02)
+        nn.init.trunc_normal_(self.specific_queries, std=0.02)
+
+    def forward(
+        self, spatial: torch.Tensor, shared: torch.Tensor, modality_index: int
+    ) -> dict[str, torch.Tensor]:
+        projected = self.spatial_projection(
+            spatial.to(dtype=self.spatial_projection.weight.dtype)
+        )
+        projected = projected + self.local_three(projected) + self.local_dilated(projected)
+        tokens = projected.flatten(2).transpose(1, 2)
+        condition = (
+            self.shared_projection(shared)
+            + self.modality_embedding[modality_index].unsqueeze(0)
+        )
+        common_queries = self.common_queries.expand(tokens.size(0), -1, -1)
+        common_queries = common_queries + condition.unsqueeze(1)
+        common_latents, _ = self.shared_to_spatial(
+            common_queries, tokens, tokens, need_weights=False
+        )
+        common_context, _ = self.spatial_to_common(
+            tokens, common_latents, common_latents, need_weights=False
+        )
+        common_strength = self.common_gate(torch.cat([tokens, common_context], dim=-1))
+        specific_tokens = self.token_norm(tokens - common_strength * common_context)
+        specific_tokens = self.state_space(specific_tokens, condition)
+        role_queries = self.specific_queries.expand(tokens.size(0), -1, -1)
+        role_queries = role_queries + condition.unsqueeze(1)
+        role_latents, _ = self.role_attention(
+            role_queries, specific_tokens, specific_tokens, need_weights=False
+        )
+        role_latents = self.role_mixer(role_latents)
+        specific = F.normalize(self.specific_head(role_latents.mean(dim=1)), dim=1)
+        return {
+            "hierarchical_tokens": role_latents,
+            "hierarchical_specific": specific,
+            "orthogonal_reference": F.normalize(condition, dim=1),
+            "common_latents": common_latents,
+            "specific_spatial_tokens": specific_tokens,
+        }
+
+
+class HierarchicalIdentityPriorDecoder(nn.Module):
+    """Top-K candidate interaction followed by specific and identity recovery."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        shared_dim: int,
+        model_dim: int,
+        heads: int,
+        role_queries: int,
+        topk_candidates: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.model_dim = int(model_dim)
+        self.role_queries_count = int(role_queries)
+        self.topk_candidates = int(topk_candidates)
+        self.shared_projection = nn.Linear(shared_dim, model_dim)
+        self.available_projection = nn.Linear(embedding_dim, model_dim)
+        self.embedding_projection = nn.Linear(embedding_dim, model_dim)
+        self.specific_projection = nn.Linear(model_dim, model_dim)
+        self.score_projection = nn.Linear(3, model_dim)
+        self.rank_embedding = nn.Parameter(torch.empty(topk_candidates, model_dim))
+        self.direction_embedding = nn.Parameter(torch.empty(2, model_dim))
+        self.specific_queries = nn.Parameter(torch.empty(1, role_queries, model_dim))
+        self.embedding_queries = nn.Parameter(torch.empty(1, role_queries, model_dim))
+        self.stage_one_attention = nn.MultiheadAttention(
+            model_dim, heads, dropout=dropout, batch_first=True
+        )
+        self.stage_two_attention = nn.MultiheadAttention(
+            model_dim, heads, dropout=dropout, batch_first=True
+        )
+        stage_block = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=heads,
+            dim_feedforward=model_dim * 3,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.stage_one_mixer = nn.TransformerEncoder(
+            stage_block, num_layers=1, norm=nn.LayerNorm(model_dim)
+        )
+        self.stage_two_mixer = nn.TransformerEncoder(
+            stage_block, num_layers=1, norm=nn.LayerNorm(model_dim)
+        )
+        self.specific_head = nn.Linear(model_dim, model_dim)
+        self.embedding_residual = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, model_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(32, 16),
-            nn.GELU(),
-            nn.Linear(16, 1),
+            nn.Linear(model_dim * 2, embedding_dim),
         )
-        nn.init.zeros_(self.net[-1].weight)
-        probability = (initial_recovery_weight - min_recovery_weight) / (
-            max_recovery_weight - min_recovery_weight
+        self.variance_delta = nn.Linear(model_dim, 1)
+        _zero_linear(self.embedding_residual[-1])
+        _zero_linear(self.variance_delta)
+        for parameter in (
+            self.rank_embedding,
+            self.direction_embedding,
+            self.specific_queries,
+            self.embedding_queries,
+        ):
+            nn.init.trunc_normal_(parameter, std=0.02)
+
+    def _candidate_tokens(
+        self,
+        target_embeddings: torch.Tensor,
+        target_specific: torch.Tensor,
+        candidate_weights: torch.Tensor,
+        direction: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, count, _ = target_embeddings.shape
+        rank = torch.arange(count, device=target_embeddings.device)
+        rank_fraction = rank.to(target_embeddings) / max(1, count - 1)
+        score_features = torch.stack(
+            [
+                candidate_weights,
+                candidate_weights.clamp_min(1e-8).log(),
+                rank_fraction.unsqueeze(0).expand(batch, -1),
+            ],
+            dim=-1,
         )
-        nn.init.constant_(
-            self.net[-1].bias, math.log(probability / (1.0 - probability))
+        context = (
+            self.score_projection(score_features)
+            + self.rank_embedding[:count].unsqueeze(0)
+            + self.direction_embedding[direction].view(1, 1, -1)
+        )
+        return (
+            self.embedding_projection(target_embeddings) + context,
+            self.specific_projection(target_specific) + context,
         )
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        probability = torch.sigmoid(self.net(features).squeeze(1))
-        width = self.max_recovery_weight - self.min_recovery_weight
-        return self.min_recovery_weight + width * probability
+    def forward(
+        self,
+        source_role_tokens: torch.Tensor,
+        shared: torch.Tensor,
+        available_embedding: torch.Tensor,
+        target_embeddings: torch.Tensor,
+        target_specific: torch.Tensor,
+        candidate_weights: torch.Tensor,
+        candidate_keep: torch.Tensor,
+        direction: int,
+    ) -> dict[str, torch.Tensor]:
+        embedding_tokens, specific_tokens = self._candidate_tokens(
+            target_embeddings, target_specific, candidate_weights, direction
+        )
+        shared_token = self.shared_projection(shared).unsqueeze(1)
+        direction_token = self.direction_embedding[direction].view(1, 1, -1)
+        batch = shared.size(0)
+        stage_one_queries = self.specific_queries.expand(batch, -1, -1)
+        stage_one_queries = stage_one_queries + shared_token + direction_token
+        stage_one_memory = torch.cat(
+            [source_role_tokens, shared_token, specific_tokens, embedding_tokens], dim=1
+        )
+        fixed = source_role_tokens.size(1) + 1
+        candidate_padding = ~candidate_keep
+        stage_one_padding = torch.cat(
+            [
+                torch.zeros(
+                    batch,
+                    fixed,
+                    dtype=torch.bool,
+                    device=shared.device,
+                ),
+                candidate_padding,
+                candidate_padding,
+            ],
+            dim=1,
+        )
+        stage_one, _ = self.stage_one_attention(
+            stage_one_queries,
+            stage_one_memory,
+            stage_one_memory,
+            key_padding_mask=stage_one_padding,
+            need_weights=False,
+        )
+        stage_one = self.stage_one_mixer(stage_one + stage_one_queries)
+        predicted_specific = F.normalize(
+            self.specific_head(stage_one.mean(dim=1)), dim=1
+        )
+
+        available_token = self.available_projection(available_embedding).unsqueeze(1)
+        stage_two_queries = self.embedding_queries.expand(batch, -1, -1)
+        stage_two_queries = stage_two_queries + predicted_specific.unsqueeze(1)
+        stage_two_queries = stage_two_queries + direction_token
+        stage_two_memory = torch.cat(
+            [stage_one, shared_token, available_token, embedding_tokens], dim=1
+        )
+        stage_two_padding = torch.cat(
+            [
+                torch.zeros(
+                    batch,
+                    stage_one.size(1) + 2,
+                    dtype=torch.bool,
+                    device=shared.device,
+                ),
+                candidate_padding,
+            ],
+            dim=1,
+        )
+        stage_two, _ = self.stage_two_attention(
+            stage_two_queries,
+            stage_two_memory,
+            stage_two_memory,
+            key_padding_mask=stage_two_padding,
+            need_weights=False,
+        )
+        stage_two = self.stage_two_mixer(stage_two + stage_two_queries)
+        pooled = stage_two.mean(dim=1)
+        return {
+            "embedding_delta": self.embedding_residual(pooled),
+            "predicted_specific": predicted_specific,
+            "log_variance_delta": self.variance_delta(pooled).squeeze(1),
+            "stage_one_tokens": stage_one,
+            "stage_two_tokens": stage_two,
+        }
 
 
-class DCCASpecFormerRecovery(RecoveryBackbone):
-    """Trainable shared alignment plus bounded Transformer recovery fusion."""
+class DCCASpecFormerRecovery(StableRecoveryBackbone):
+    """Identity-preserving hierarchical recovery with a trainable state-space branch."""
 
     def __init__(
         self,
@@ -72,11 +416,11 @@ class DCCASpecFormerRecovery(RecoveryBackbone):
         retrieval_dropout: float = 0.10,
         branch_floor: float = 0.0,
         max_proxy_identities: int = 512,
+        topk_candidates: int = 5,
+        role_queries: int = 4,
+        candidate_dropout: float = 0.20,
+        max_refinement: float = 0.25,
     ):
-        if not 0.0 <= retrieval_dropout < 1.0:
-            raise ValueError("retrieval_dropout must be in [0, 1)")
-        if not 0.0 <= branch_floor < 1.0 / 3.0:
-            raise ValueError("branch_floor must be in [0, 1/3)")
         super().__init__(
             input_dim=input_dim,
             shared_dim=shared_dim,
@@ -84,91 +428,82 @@ class DCCASpecFormerRecovery(RecoveryBackbone):
             transformer_layers=transformer_layers,
             transformer_heads=transformer_heads,
             dropout=dropout,
-        )
-        self.retrieval_dropout = float(retrieval_dropout)
-        self.branch_floor = float(branch_floor)
-        self.max_proxy_identities = int(max_proxy_identities)
-        self.safe_gate = BalancedFusionGate(
-            dropout=dropout,
+            max_gate=max_gate,
             min_recovery_weight=min_recovery_weight,
-            max_recovery_weight=max_gate,
+            retrieval_dropout=retrieval_dropout,
+            branch_floor=branch_floor,
+            max_proxy_identities=max_proxy_identities,
         )
-        self.identity_proxies = nn.Parameter(
-            torch.empty(max_proxy_identities, shared_dim)
+        if topk_candidates < 2:
+            raise ValueError("HIASR requires at least two independent candidates")
+        if not 0.0 <= candidate_dropout < 1.0:
+            raise ValueError("candidate_dropout must be in [0, 1)")
+        if not 0.0 < max_refinement <= 1.0:
+            raise ValueError("max_refinement must be in (0, 1]")
+        self.topk_candidates = int(topk_candidates)
+        self.role_queries = int(role_queries)
+        self.candidate_dropout = float(candidate_dropout)
+        self.max_refinement = float(max_refinement)
+        self.shared_disentangler = SharedGuidedStateSpaceDisentangler(
+            input_dim,
+            shared_dim,
+            specific_dim,
+            transformer_heads,
+            role_queries,
+            dropout,
         )
-        nn.init.normal_(self.identity_proxies, std=0.02)
-        self.register_buffer(
-            "active_identity_labels",
-            torch.full((max_proxy_identities,), -1, dtype=torch.long),
+        self.hierarchical_decoder = HierarchicalIdentityPriorDecoder(
+            input_dim,
+            shared_dim,
+            specific_dim,
+            transformer_heads,
+            role_queries,
+            topk_candidates,
+            dropout,
         )
-        self.register_buffer("active_identity_count", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("recovery_stage_ready", torch.tensor(False, dtype=torch.bool))
-        hidden = max(specific_dim, input_dim // 2)
-        self.cycle_heads = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(input_dim, hidden),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(hidden, input_dim),
-                )
-                for _ in range(2)
-            ]
-        )
-        # Retrieval corruption needs a trainable residual with useful initial scale;
-        self.recovery_decoder.residual_logit.data.fill_(math.log(0.1 / 0.9))
+        self.refinement_logit = nn.Parameter(torch.tensor(math.log(0.1 / 0.9)))
 
-    @property
-    def min_recovery_weight(self) -> float:
-        return self.safe_gate.min_recovery_weight
-
-    @property
-    def max_recovery_weight(self) -> float:
-        return self.safe_gate.max_recovery_weight
+    def encode(
+        self, features: torch.Tensor, spatial: torch.Tensor, modality: str
+    ) -> dict[str, torch.Tensor]:
+        output = super().encode(features, spatial, modality)
+        modality_index = 0 if modality == "palm" else 1
+        output.update(
+            self.shared_disentangler(spatial, output["shared"], modality_index)
+        )
+        return output
 
     @torch.no_grad()
-    def initialize_identity_proxies(
-        self,
-        palm: torch.Tensor,
-        vein: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> None:
-        identities = labels.long().unique(sorted=True)
-        if identities.numel() > self.max_proxy_identities:
-            raise ValueError("Training identities exceed proxy capacity")
-        self.active_identity_labels.fill_(-1)
-        self.active_identity_labels[: identities.numel()].copy_(identities)
-        self.active_identity_count.fill_(identities.numel())
-        palm_shared = self.palm_projector(palm)
-        vein_shared = self.vein_projector(vein)
-        joint = F.normalize(palm_shared + vein_shared, dim=1)
-        templates, template_labels = _templates(joint, labels)
-        if not torch.equal(template_labels, identities):
-            raise ValueError("Proxy identity order differs from training labels")
-        self.identity_proxies[: identities.numel()].copy_(templates)
+    def build_gallery_memory(
+        self, gallery: dict[str, torch.Tensor], chunk_size: int = 256
+    ) -> dict[str, torch.Tensor]:
+        labels = gallery["labels"].long()
+        memory: dict[str, torch.Tensor] = {"labels": labels.unique(sorted=True)}
+        for modality in ("palm", "vein"):
+            names = ("embedding", "shared", "specific", "hierarchical_specific")
+            encoded = {name: [] for name in names}
+            for start in range(0, labels.numel(), chunk_size):
+                stop = min(start + chunk_size, labels.numel())
+                output = self.encode(
+                    gallery[modality][start:stop],
+                    gallery[f"{modality}_spatial"][start:stop],
+                    modality,
+                )
+                for name in names:
+                    encoded[name].append(output[name])
+            for name, pieces in encoded.items():
+                templates, template_labels = _templates(torch.cat(pieces), labels)
+                if not torch.equal(template_labels, memory["labels"]):
+                    raise ValueError("Gallery identity order differs across modalities")
+                memory[f"{modality}_{name}"] = templates
+        return memory
 
-    def proxy_logits(
-        self, shared: torch.Tensor, labels: torch.Tensor, temperature: float
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        count = int(self.active_identity_count.item())
-        if count < 1:
-            raise RuntimeError("Identity proxies have not been initialized")
-        identity_labels = self.active_identity_labels[:count]
-        targets = torch.searchsorted(identity_labels, labels.long())
-        if not torch.equal(identity_labels[targets], labels.long()):
-            raise ValueError("Batch contains an identity outside the proxy table")
-        proxies = F.normalize(self.identity_proxies[:count], dim=1)
-        logits = F.normalize(shared, dim=1) @ proxies.t() / float(temperature)
-        return logits, targets
-
-    def cycle_reconstruct(
-        self, recovered_target: torch.Tensor, direction: int
-    ) -> torch.Tensor:
-        return F.normalize(self.cycle_heads[direction](recovered_target), dim=1)
-
-    def _balanced_base_weights(self, direction: int) -> torch.Tensor:
-        probabilities = torch.softmax(self.base_weight_logits[direction], dim=0)
-        return self.branch_floor + (1.0 - 3.0 * self.branch_floor) * probabilities
+    def _candidate_keep_mask(self, batch: int, count: int, device) -> torch.Tensor:
+        keep = torch.ones(batch, count, dtype=torch.bool, device=device)
+        if self.training and self.candidate_dropout > 0.0:
+            keep = torch.rand(batch, count, device=device) >= self.candidate_dropout
+            keep[:, 0] = True
+        return keep
 
     def score_from_encoding(
         self,
@@ -176,109 +511,85 @@ class DCCASpecFormerRecovery(RecoveryBackbone):
         available_modality: str,
         memory: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor | str]:
+        backbone = super().score_from_encoding(
+            available, available_modality, memory
+        )
         target_modality, direction = self._direction(available_modality)
-        labels = memory["labels"]
-        branches = torch.stack(
-            [
-                available["embedding"] @ memory[f"{available_modality}_embedding"].t(),
-                available["shared"] @ memory[f"{available_modality}_shared"].t(),
-                available["shared"] @ memory[f"{target_modality}_shared"].t(),
-            ],
-            dim=2,
+        count = min(self.topk_candidates, backbone["posterior"].size(1))
+        top_values, top_indices = backbone["posterior"].topk(count, dim=1)
+        target_embeddings = memory[f"{target_modality}_embedding"][top_indices]
+        target_specific = memory[f"{target_modality}_hierarchical_specific"][
+            top_indices
+        ]
+        candidate_keep = self._candidate_keep_mask(
+            top_values.size(0), count, top_values.device
         )
-        base_weights = self._balanced_base_weights(direction)
-        base_scores = (branches * base_weights.view(1, 1, 3)).sum(dim=2)
-        temperature = self.log_temperatures[direction].exp().clamp(0.003, 0.2)
-        posterior = torch.softmax(base_scores / temperature, dim=1)
-        posterior_used = posterior
-        retrieval_drop_mask = torch.zeros(
-            posterior.size(0), dtype=torch.bool, device=posterior.device
-        )
-        if self.training and self.retrieval_dropout > 0.0:
-            retrieval_drop_mask = (
-                torch.rand(posterior.size(0), device=posterior.device)
-                < self.retrieval_dropout
-            )
-            uniform = torch.full_like(posterior, 1.0 / posterior.size(1))
-            posterior_used = torch.where(
-                retrieval_drop_mask.unsqueeze(1), uniform, posterior
-            )
-        retrieved_target = posterior_used @ memory[f"{target_modality}_embedding"]
-        retrieved_specific = posterior_used @ memory[f"{target_modality}_specific"]
-        recovered, predicted_specific, log_variance = self.recovery_decoder(
-            available["tokens"],
+        candidate_weights = top_values.masked_fill(~candidate_keep, 0.0)
+        candidate_weights = candidate_weights / candidate_weights.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1e-8)
+        hierarchical = self.hierarchical_decoder(
+            available["hierarchical_tokens"],
             available["shared"],
-            retrieved_target,
-            retrieved_specific,
+            available["embedding"],
+            target_embeddings,
+            target_specific,
+            candidate_weights,
+            candidate_keep,
             direction,
         )
-        recovered_scores = recovered @ memory[f"{target_modality}_embedding"].t()
-        posterior_entropy = -(
-            posterior * posterior.clamp_min(1e-12).log()
-        ).sum(dim=1) / math.log(posterior.size(1))
-        top_two = base_scores.topk(k=2, dim=1).values
-        margin = top_two[:, 0] - top_two[:, 1]
-        standardized_margin = margin / base_scores.std(
-            dim=1, unbiased=False
-        ).clamp_min(1e-3)
-        base_top = base_scores.max(dim=1)
-        recovered_top = recovered_scores.max(dim=1)
-        agreement = base_top.indices.eq(recovered_top.indices).float()
-        direction_features = F.one_hot(
-            torch.full(
-                (base_scores.size(0),),
-                direction,
-                device=base_scores.device,
-                dtype=torch.long,
-            ),
-            num_classes=2,
-        ).to(base_scores)
-        gate_features = torch.cat(
-            [
-                posterior_entropy.unsqueeze(1),
-                posterior.max(dim=1).values.unsqueeze(1),
-                standardized_margin.unsqueeze(1),
-                base_top.values.unsqueeze(1),
-                recovered_top.values.unsqueeze(1),
-                (recovered_top.values - base_top.values).unsqueeze(1),
-                agreement.unsqueeze(1),
-                log_variance.exp().unsqueeze(1),
-                direction_features,
-            ],
+        scale = self.max_refinement * torch.sigmoid(self.refinement_logit)
+        proposed = F.normalize(
+            backbone["mean"] + scale * hierarchical["embedding_delta"], dim=1
+        )
+        proposed_scores = proposed @ memory[f"{target_modality}_embedding"].t()
+        backbone_top_two = backbone["recovered_scores"].topk(2, dim=1)
+        proposed_top_two = proposed_scores.topk(2, dim=1)
+        same_identity = backbone_top_two.indices[:, 0].eq(
+            proposed_top_two.indices[:, 0]
+        )
+        backbone_margin = backbone_top_two.values[:, 0] - backbone_top_two.values[:, 1]
+        proposed_margin = proposed_top_two.values[:, 0] - proposed_top_two.values[:, 1]
+        hard_safety = same_identity & proposed_margin.ge(backbone_margin)
+        soft_safety = same_identity.to(proposed) * torch.sigmoid(
+            (proposed_margin - backbone_margin) / 0.02
+        )
+        safety = hard_safety.to(proposed) + soft_safety - soft_safety.detach()
+        recovered = F.normalize(
+            backbone["mean"]
+            + safety.unsqueeze(1) * scale * hierarchical["embedding_delta"],
             dim=1,
         )
-        recovery_weight = self.safe_gate(gate_features)
-        shared_weight = 1.0 - recovery_weight
+        recovered_scores = recovered @ memory[f"{target_modality}_embedding"].t()
         fused_scores = (
-            shared_weight.unsqueeze(1) * base_scores
-            + recovery_weight.unsqueeze(1) * recovered_scores
+            backbone["shared_weight"].unsqueeze(1) * backbone["base_scores"]
+            + backbone["recovery_weight"].unsqueeze(1) * recovered_scores
         )
-        cycle = self.cycle_reconstruct(recovered, direction)
-        return {
-            "shared": available["shared"],
-            "shared_raw": available["shared_raw"],
-            "specific": available["specific"],
-            "predicted_specific": predicted_specific,
-            "mean": recovered,
-            "cycle": cycle,
-            "log_variance": log_variance,
-            "posterior": posterior,
-            "posterior_confidence": posterior.max(dim=1).values,
-            "posterior_entropy": posterior_entropy,
-            "recovery_reliability": margin,
-            "retrieval_drop_mask": retrieval_drop_mask,
-            "retrieval_dropout_fraction": retrieval_drop_mask.float().mean(),
-            "gate_features": gate_features,
-            "learned_gate": recovery_weight,
-            "recovery_gate": recovery_weight,
-            "recovery_weight": recovery_weight,
-            "shared_weight": shared_weight,
-            "base_weights": base_weights.expand(base_scores.size(0), -1),
-            "base_branch_scores": branches,
-            "base_scores": base_scores,
-            "recovered_scores": recovered_scores,
-            "fused_scores": fused_scores,
-            "candidate_labels": labels,
-            "target_modality": target_modality,
-            "temperature": temperature,
-        }
+        orthogonality = F.cosine_similarity(
+            available["orthogonal_reference"],
+            available["hierarchical_specific"],
+            dim=1,
+        ).square()
+        backbone.update(
+            {
+                "mean": recovered,
+                "predicted_specific": hierarchical["predicted_specific"],
+                "cycle": self.cycle_reconstruct(recovered, direction),
+                "log_variance": (
+                    backbone["log_variance"]
+                    + 0.1 * hierarchical["log_variance_delta"]
+                ).clamp(-6.0, 2.0),
+                "recovered_scores": recovered_scores,
+                "fused_scores": fused_scores,
+                "teacher_fused_scores": backbone["fused_scores"],
+                "orthogonality": orthogonality,
+                "candidate_indices": top_indices,
+                "candidate_weights": candidate_weights,
+                "candidate_keep_fraction": candidate_keep.float().mean(),
+                "refinement_gate": safety * scale,
+                "refinement_active_fraction": hard_safety.float().mean(),
+                "hierarchical_stage_one": hierarchical["stage_one_tokens"],
+                "hierarchical_stage_two": hierarchical["stage_two_tokens"],
+            }
+        )
+        return backbone
