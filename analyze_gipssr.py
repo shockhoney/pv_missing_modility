@@ -1,4 +1,4 @@
-"""Audit and summarize the retained three-seed GIPSSR-Net/CUEF experiments."""
+"""Audit and summarize the retained seed-42 GIPSSR-Net/CUEF experiments."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 
 DATASETS = ("tongji", "cumt", "polyu")
-SEEDS = (42, 43, 44)
+SEED = 42
 SCENARIOS = ("palmprint_missing", "palmvein_missing")
 DERIVED_VARIANTS = ("single", "without_recovery_fusion")
 TRAINED_VARIANTS = (
@@ -81,14 +81,10 @@ def scenario_row(payload: dict, scenario: str, variant: str) -> dict[str, float]
     return metric_row(block)
 
 
-def aggregate(rows: list[dict[str, float]]) -> dict:
-    return {
-        metric: {
-            "mean": statistics.fmean(row[metric] for row in rows),
-            "sample_std": statistics.stdev(row[metric] for row in rows),
-        }
-        for metric in METRICS
-    }
+def single_seed_metrics(rows: list[dict[str, float]]) -> dict[str, float]:
+    if len(rows) != 1:
+        raise ValueError(f"Expected one seed-42 metric row, got {len(rows)}")
+    return dict(rows[0])
 
 
 def checkpoint_path(root: Path, dataset: str, seed: int, variant: str) -> Path:
@@ -209,10 +205,7 @@ def audit_result(
 
 def fmt(summary: dict, metric: str) -> str:
     precision = 4 if metric == "eer" else 2
-    return (
-        f"{summary[metric]['mean'] * 100:.{precision}f} ± "
-        f"{summary[metric]['sample_std'] * 100:.{precision}f}"
-    )
+    return f"{summary[metric] * 100:.{precision}f}"
 
 
 def fmt_pair(block: dict, metric: str) -> str:
@@ -234,69 +227,54 @@ def build(
     audits: list[dict] = []
     diagnostics: list[dict] = []
     protocol_hashes = {dataset: set() for dataset in DATASETS}
-    checkpoint_hashes = {
-        dataset: {variant: set() for variant in TRAINED_VARIANTS}
-        for dataset in DATASETS
-    }
     for dataset in DATASETS:
-        for seed in SEEDS:
-            payloads: dict[str, dict] = {}
-            for variant in TRAINED_VARIANTS:
-                path = result_root / dataset / f"seed_{seed}" / f"{variant}.json"
-                if not path.is_file():
-                    raise FileNotFoundError(path)
-                payload = json.loads(path.read_text())
-                payloads[variant] = payload
-                audit = audit_result(
-                    payload,
-                    path,
-                    checkpoint_root,
-                    dataset,
-                    seed,
-                    variant,
-                    require_selection,
-                )
-                audits.append(audit)
-                checkpoint_hashes[dataset][variant].add(audit.get("checkpoint_sha256"))
-                protocol_hashes[dataset].add(
-                    (payload["gallery_protocol_sha256"], payload["probe_protocol_sha256"])
-                )
-                for scenario in SCENARIOS:
-                    raw[dataset][variant][scenario].append(
-                        scenario_row(payload, scenario, variant)
-                    )
-            full = payloads["full"]
-            for variant in DERIVED_VARIANTS:
-                for scenario in SCENARIOS:
-                    raw[dataset][variant][scenario].append(
-                        scenario_row(full, scenario, variant)
-                    )
+        payloads: dict[str, dict] = {}
+        for variant in TRAINED_VARIANTS:
+            path = result_root / dataset / f"seed_{SEED}" / f"{variant}.json"
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            payload = json.loads(path.read_text())
+            payloads[variant] = payload
+            audit = audit_result(
+                payload,
+                path,
+                checkpoint_root,
+                dataset,
+                SEED,
+                variant,
+                require_selection,
+            )
+            audits.append(audit)
+            protocol_hashes[dataset].add(
+                (payload["gallery_protocol_sha256"], payload["probe_protocol_sha256"])
+            )
             for scenario in SCENARIOS:
-                result = full["results"][scenario]
-                diagnostics.append(
-                    {
-                        "dataset": dataset,
-                        "seed": seed,
-                        "scenario": scenario,
-                        "recovery_weight": result["recovery_weight"]["mean"],
-                        "shared_weight": result["shared_weight"]["mean"],
-                        "eer_gain": result["improvement_over_no_recovery"]["eer"],
-                        "tar_1e-3_gain": result["improvement_over_no_recovery"]["tar_1e-3"],
-                        "tar_1e-4_gain": result["improvement_over_no_recovery"]["tar_1e-4"],
-                    }
+                raw[dataset][variant][scenario].append(
+                    scenario_row(payload, scenario, variant)
                 )
+        full = payloads["full"]
+        for variant in DERIVED_VARIANTS:
+            for scenario in SCENARIOS:
+                raw[dataset][variant][scenario].append(
+                    scenario_row(full, scenario, variant)
+                )
+        for scenario in SCENARIOS:
+            result = full["results"][scenario]
+            diagnostics.append(
+                {
+                    "dataset": dataset,
+                    "seed": SEED,
+                    "scenario": scenario,
+                    "recovery_weight": result["recovery_weight"]["mean"],
+                    "shared_weight": result["shared_weight"]["mean"],
+                    "eer_gain": result["improvement_over_no_recovery"]["eer"],
+                    "tar_1e-3_gain": result["improvement_over_no_recovery"]["tar_1e-3"],
+                    "tar_1e-4_gain": result["improvement_over_no_recovery"]["tar_1e-4"],
+                }
+            )
     for dataset, hashes in protocol_hashes.items():
         if len(hashes) != 1:
             audits.append({"passed": False, "errors": [f"{dataset}: {len(hashes)} protocol pairs"]})
-    for dataset, variants in checkpoint_hashes.items():
-        for variant, hashes in variants.items():
-            if len(hashes) != len(SEEDS):
-                audits.append(
-                    {
-                        "passed": False,
-                        "errors": [f"{dataset}/{variant}: seed checkpoints are not unique"],
-                    }
-                )
     failures = [item for item in audits if not item["passed"]]
     if failures:
         raise RuntimeError(f"Ablation audit failed: {json.dumps(failures, indent=2)}")
@@ -306,29 +284,17 @@ def build(
         datasets[dataset] = {}
         for variant in VARIANTS:
             directional = {
-                scenario: aggregate(raw[dataset][variant][scenario])
+                scenario: single_seed_metrics(raw[dataset][variant][scenario])
                 for scenario in SCENARIOS
             }
-            macro_seed_rows = []
-            for index in range(len(SEEDS)):
-                macro_seed_rows.append(
-                    {
-                        metric: statistics.fmean(
-                            raw[dataset][variant][scenario][index][metric]
-                            for scenario in SCENARIOS
-                        )
-                        for metric in METRICS
-                    }
-                )
             datasets[dataset][variant] = {
-                "directional_three_seed_summary": directional,
-                "scenario_macro_three_seed_summary": aggregate(macro_seed_rows),
-                "per_seed": {
-                    str(seed): {
-                        scenario: raw[dataset][variant][scenario][index]
-                        for scenario in SCENARIOS
-                    }
-                    for index, seed in enumerate(SEEDS)
+                "seed": SEED,
+                "directional_summary": directional,
+                "scenario_macro_summary": {
+                    metric: statistics.fmean(
+                        directional[scenario][metric] for scenario in SCENARIOS
+                    )
+                    for metric in METRICS
                 },
             }
 
@@ -336,8 +302,8 @@ def build(
         dataset: {
             variant: {
                 metric: (
-                    datasets[dataset][variant]["scenario_macro_three_seed_summary"][metric]["mean"]
-                    - datasets[dataset]["full"]["scenario_macro_three_seed_summary"][metric]["mean"]
+                    datasets[dataset][variant]["scenario_macro_summary"][metric]
+                    - datasets[dataset]["full"]["scenario_macro_summary"][metric]
                 )
                 * (100 if metric == "eer" else -100)
                 for metric in METRICS
@@ -352,8 +318,8 @@ def build(
         "fusion_name": "CUEF",
         "architecture_version": FINAL_ARCHITECTURE,
         "protocol": {
-            "seeds": list(SEEDS),
-            "aggregation": "directional mean±sample standard deviation over seeds 42/43/44; macro first averages both missing directions inside each seed",
+            "seed": SEED,
+            "aggregation": "raw seed-42 directional metrics; macro averages the two missing directions",
             "selection": "identity-disjoint validation selects epoch; selected epoch is replayed on the full training split; test once",
             "dataset_specific_hyperparameters": False,
             "fallback": False,
@@ -393,12 +359,12 @@ def build(
         },
         "audit": {
             "passed": True,
-            "num_result_checkpoint_pairs": len(DATASETS) * len(SEEDS) * len(TRAINED_VARIANTS),
+            "num_result_checkpoint_pairs": len(DATASETS) * len(TRAINED_VARIANTS),
             "selection_checkpoints_required": require_selection,
             "selection_checkpoints_verified": sum(
                 bool(item.get("selection_verified")) for item in audits
             ),
-            "checks": "SHA-256, architecture, label, fixed-full replay, best epoch, selection SHA when retained, unique seed checkpoints, CUEF/SGSSD/GIPRD structure, no legacy fusion parameters, protocol fingerprints, diagnostics and recovery bounds",
+            "checks": "SHA-256, architecture, label, fixed-full replay, best epoch, selection SHA when retained, CUEF/SGSSD/GIPRD structure, no legacy fusion parameters, protocol fingerprints, diagnostics and recovery bounds",
         },
     }
     out = result_root.parent
@@ -408,7 +374,7 @@ def build(
     lines = [
         "# GIPSSR-Net v3 / CUEF results",
         "",
-        "All metrics are percentages. Per-seed tables report raw test values; summary and ablation tables report mean ± sample standard deviation over seeds 42/43/44. In directional summary cells, the order is palmprint-missing / palmvein-missing.",
+        "All metrics are percentages from seed 42. In directional summary cells, the order is palmprint-missing / palmvein-missing.",
         "",
         "Protocol: identity-disjoint validation selects the epoch, the selected epoch is replayed on the full training split, and the test protocol is evaluated once. No fallback, teacher comparison, deployment blending, or dataset-specific hyperparameter branch is used.",
     ]
@@ -417,35 +383,34 @@ def build(
             "",
             f"## {dataset.upper()}",
             "",
-            "### Per-seed test results: single modality versus recovered fusion",
+            "### Seed-42 test results: single modality versus recovered fusion",
             "",
-            "Each metric is reported as `single available modality → full recovered fusion`; no seed averaging is applied in this table.",
+            "Each metric is reported as `single available modality → full recovered fusion`.",
             "",
-            "| Seed | Missing modality | EER ↓ | Top-1 ↑ | TAR@FAR=1e-3 ↑ | TAR@FAR=1e-4 ↑ |",
-            "| ---: | --- | ---: | ---: | ---: | ---: |",
+            "| Missing modality | EER ↓ | Top-1 ↑ | TAR@FAR=1e-3 ↑ | TAR@FAR=1e-4 ↑ |",
+            "| --- | ---: | ---: | ---: | ---: |",
         ]
-        for seed in SEEDS:
-            for scenario, scenario_label in (
-                ("palmprint_missing", "Palmprint"),
-                ("palmvein_missing", "Palm vein"),
-            ):
-                single = datasets[dataset]["single"]["per_seed"][str(seed)][scenario]
-                full = datasets[dataset]["full"]["per_seed"][str(seed)][scenario]
-                transitions = [
-                    f"{100.0 * single[metric]:.4f} → {100.0 * full[metric]:.4f}"
-                    for metric in METRICS
-                ]
-                transitions_text = " | ".join(transitions)
-                lines.append(f"| {seed} | {scenario_label} | {transitions_text} |")
+        for scenario, scenario_label in (
+            ("palmprint_missing", "Palmprint"),
+            ("palmvein_missing", "Palm vein"),
+        ):
+            single = datasets[dataset]["single"]["directional_summary"][scenario]
+            full = datasets[dataset]["full"]["directional_summary"][scenario]
+            transitions = [
+                f"{100.0 * single[metric]:.4f} → {100.0 * full[metric]:.4f}"
+                for metric in METRICS
+            ]
+            transitions_text = " | ".join(transitions)
+            lines.append(f"| {scenario_label} | {transitions_text} |")
         lines += [
             "",
-            "### Three-seed summary: single modality versus recovered fusion",
+            "### Seed-42 summary: single modality versus recovered fusion",
             "",
             "| Setting | EER ↓ | Top-1 ↑ | TAR@FAR=1e-3 ↑ | TAR@FAR=1e-4 ↑ |",
             "| --- | ---: | ---: | ---: | ---: |",
         ]
         for variant in ("single", "without_recovery_fusion", "full"):
-            directional = datasets[dataset][variant]["directional_three_seed_summary"]
+            directional = datasets[dataset][variant]["directional_summary"]
             lines.append(
                 f"| {LABELS[variant]} | {fmt_pair(directional, 'eer')} | "
                 f"{fmt_pair(directional, 'top1')} | {fmt_pair(directional, 'tar_1e-3')} | "
@@ -459,7 +424,7 @@ def build(
             "| --- | :---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: | ---: |",
         ]
         for variant in TRAINED_VARIANTS:
-            macro = datasets[dataset][variant]["scenario_macro_three_seed_summary"]
+            macro = datasets[dataset][variant]["scenario_macro_summary"]
             checks = ["✓" if enabled else "✗" for enabled in MODULE_MATRIX[variant]]
             lines.append(
                 f"| {LABELS[variant]} | {' | '.join(checks)} | {fmt(macro, 'eer')} | "
@@ -476,11 +441,11 @@ def build(
         "- IGDCA is the decisive cross-dataset component: removing it causes large degradation on every dataset and both directions.",
         "- Differentiable cohort/scale calibration is decisive on Tongji and PolyU and improves the hard CUMT palmprint-missing direction, although CUMT shows an EER direction trade-off.",
         "- Conflict modeling improves CUMT and PolyU but is mixed on Tongji; its claim should be framed as hard-direction/cross-dataset robustness rather than uniform per-direction superiority.",
-        "- Uncertainty weighting improves the three-dataset average and is most visible on CUMT/PolyU; Tongji contains a small direction-specific trade-off.",
-        "- SGSSD and GIPRD provide small, generally positive stabilization. Their effects are much smaller than IGDCA and calibration and should not be overstated with only three seeds.",
+        "- Uncertainty weighting improves the three-dataset average for seed 42 and is most visible on CUMT/PolyU; Tongji contains a small direction-specific trade-off.",
+        "- SGSSD and GIPRD provide small, generally positive changes. Their effects are much smaller than IGDCA and calibration and should not be overstated from a single seed.",
         "- The recovery branch retains nonzero bounded contribution for every probe; the retained full runs use learned weights rather than a fixed rule or test-time fallback.",
         "",
-        f"Audit passed: all {len(DATASETS) * len(SEEDS) * len(TRAINED_VARIANTS)} result/checkpoint pairs match their hashes, architectures, labels, selected epochs, parameter structures, protocol fingerprints, required diagnostics, and recovery-weight bounds.",
+        f"Audit passed: all {len(DATASETS) * len(TRAINED_VARIANTS)} result/checkpoint pairs match their hashes, architectures, labels, selected epochs, parameter structures, protocol fingerprints, required diagnostics, and recovery-weight bounds.",
     ]
     (out / "report.md").write_text("\n".join(lines) + "\n")
     return summary

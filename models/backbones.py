@@ -116,6 +116,11 @@ class ResNet18Encoder(nn.Module):
     def parts_from_features(self, feat_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.split_embedding(self.embedding_from_features(feat_map))
 
+    def parts(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return raw ``(shared, specific)`` head outputs for an image batch."""
+
+        return self.parts_from_features(self.forward_features(x))
+
     def forward(self, x: torch.Tensor, return_spatial: bool = False) -> torch.Tensor:
         feat_map = self.forward_features(x)
         if return_spatial:

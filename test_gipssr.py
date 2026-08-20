@@ -284,7 +284,10 @@ def parse_args(argv=None):
     parser.add_argument("--top_k", type=int, nargs="+", default=[1, 5])
     parser.add_argument("--far_points", type=float, nargs="+", default=[1e-3, 1e-4])
     parser.add_argument("--output", "--metrics_path", dest="metrics_path", default="outputs/gipssr/ablations/results/tongji/seed_42/full.json")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.seed != 42:
+        raise ValueError("GIPSSR evaluation is locked to seed 42")
+    return args
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # GIPSSR-Net: trainable missing-modality recovery and CUEF fusion
 
-This repository retains one method: `gipssr_cuef_state_space_recovery_v3` (GIPSSR-Net, Gallery Identity-Prior State-Space Recovery Network). Palmprint and palm-vein encoders are frozen; every shared-space, recovery, refinement, uncertainty, and score-fusion parameter is optimized by backpropagation.
+This repository retains the proposed method `gipssr_cuef_state_space_recovery_v3` (GIPSSR-Net, Gallery Identity-Prior State-Space Recovery Network) together with only the code required for its ablation studies, full comparison experiments, and hyperparameter experiments. Palmprint and palm-vein encoders are frozen; every shared-space, recovery, refinement, uncertainty, and score-fusion parameter is optimized by backpropagation.
 
 ## Method
 
@@ -23,16 +23,23 @@ CUEF fuses four score branches: available-modality, same-modality shared, cross-
 - `utils/gipssr_training.py`: validation selection, full-split replay, and checkpoint metadata.
 - `train_gipssr.py`: final joint CUEF+SGSSD+GIPRD training entry point.
 - `test_gipssr.py`: strict two-direction gallery/probe evaluation with CUEF diagnostics.
-- `analyze_gipssr.py`: three-seed aggregation and closed-form artifact audit.
+- `analyze_gipssr.py`: seed-42 result summarization and closed-form artifact audit.
 
 Frozen encoder training/evaluation remain in `train_encoder.py` and `test_encoder.py` because they are required to reproduce the input embeddings.
+
+The retained experiment entry points are:
+
+- `run_missing_rate_experiments.py`: proposed-method missing-rate experiment.
+- `train_full_comparison.py`, `test_full_comparison.py`, `run_tongji_full_comparisons.py`, and `run_tongji_full_missing_rate_experiments.py`: full image-level comparison experiments; see `FULL_COMPARISON_REPRODUCTION.md`.
+- `run_tongji_hparams.py`, `summarize_tongji_validation_hparams.py`, and the `*_tongji_*report*` scripts: hyperparameter experiment execution and report generation.
+- `visualizations/gipssr_paper_figures.py`: seed-42 paper figures.
 
 ## Retained artifacts
 
 Final checkpoints and metrics are organized as:
 
-    outputs/gipssr/ablations/checkpoints/{tongji,cumt,polyu}/seed_{42,43,44}/
-    outputs/gipssr/ablations/results/{tongji,cumt,polyu}/seed_{42,43,44}/
+    outputs/gipssr/ablations/checkpoints/{tongji,cumt,polyu}/seed_42/
+    outputs/gipssr/ablations/results/{tongji,cumt,polyu}/seed_42/
 
 The consolidated paper tables and machine-readable statistics are:
 
@@ -43,13 +50,13 @@ Only final full/ablation replay checkpoints are retained. Validation-selection c
 
 ## Formal protocol
 
-All datasets use seeds 42, 43, and 44 and the same model/loss hyperparameters.
+All datasets use seed 42 and the same model/loss hyperparameters.
 
 1. Train for at most 12 epochs on recovery-training identities.
 2. Select the epoch on an identity-disjoint validation protocol.
 3. Reinitialize and replay exactly the selected epoch count on the full training split.
 4. Evaluate the resulting neural model once on the fixed test protocol.
-5. Report each missing direction separately and macro-average the two directions inside each seed before computing mean ± sample standard deviation across seeds.
+5. Report each missing direction separately and macro-average the two directions for seed 42.
 
 CUMT has 6,612 impostor scores per direction, so its smallest positive empirical FAR is 1.5124e-4; its TAR@FAR=1e-4 value is therefore the FAR=0 operating point.
 
@@ -74,11 +81,11 @@ The evaluator defaults to the retained Tongji seed-42 full checkpoint:
 
     conda run -n pvmd python test_gipssr.py
 
-Regenerate the consolidated report after all 72 trained result/checkpoint pairs exist:
+Regenerate the consolidated report after all 24 seed-42 trained result/checkpoint pairs exist:
 
     conda run -n pvmd python analyze_gipssr.py
 
-The analyzer fails closed on result/checkpoint SHA-256, architecture, ablation label, fixed-full replay status, selected epoch, unique seed checkpoint, CUEF/SGSSD/GIPRD parameter structure, unexpected fusion parameters, protocol fingerprints, required diagnostics, or recovery-weight bounds.
+The analyzer fails closed on result/checkpoint SHA-256, architecture, ablation label, fixed-full replay status, selected epoch, CUEF/SGSSD/GIPRD parameter structure, unexpected fusion parameters, protocol fingerprints, required diagnostics, or recovery-weight bounds.
 
 ## Design references
 

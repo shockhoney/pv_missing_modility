@@ -678,67 +678,53 @@ def impostor_normalize(genuine: np.ndarray, impostor: np.ndarray) -> tuple[np.nd
 
 
 def kde_summary(
-    seed_results: list[dict[str, torch.Tensor]],
+    result: dict[str, torch.Tensor],
     score_key: str,
     score_index: int | None,
     grid: np.ndarray,
 ) -> dict[str, Any]:
-    genuine_densities = []
-    impostor_densities = []
-    thresholds = []
-    eers = []
-    for result in seed_results:
-        scores = result[score_key]
-        if score_index is not None:
-            scores = scores[:, :, score_index]
+    scores = result[score_key]
+    if score_index is not None:
+        scores = scores[:, :, score_index]
+    genuine, impostor = genuine_impostor(
+        scores,
+        result["probe_labels"],
+        result["candidate_labels"],
+    )
+    genuine, impostor = impostor_normalize(genuine, impostor)
+    genuine_density = gaussian_kde(genuine)(grid)
+    impostor_density = gaussian_kde(impostor)(grid)
+    metrics = score_matrix_metrics(
+        scores,
+        candidate_labels=result["candidate_labels"],
+        probe_labels=result["probe_labels"],
+        topk=(1, 5),
+        far_points=(1e-3,),
+    )
+    return {
+        "genuine_density": genuine_density,
+        "impostor_density": impostor_density,
+        "threshold": float(np.quantile(impostor, 0.999, method="higher")),
+        "eer": float(metrics["eer"]),
+        "overlap": float(
+            np.trapezoid(np.minimum(genuine_density, impostor_density), grid)
+        ),
+    }
+
+
+def score_grid(result: dict[str, torch.Tensor]) -> np.ndarray:
+    values = []
+    for key, index in (("base_branch_scores", 0), ("fused_scores", None)):
+        scores = result[key]
+        if index is not None:
+            scores = scores[:, :, index]
         genuine, impostor = genuine_impostor(
             scores,
             result["probe_labels"],
             result["candidate_labels"],
         )
         genuine, impostor = impostor_normalize(genuine, impostor)
-        genuine_densities.append(gaussian_kde(genuine)(grid))
-        impostor_densities.append(gaussian_kde(impostor)(grid))
-        thresholds.append(float(np.quantile(impostor, 0.999, method="higher")))
-        metrics = score_matrix_metrics(
-            scores,
-            candidate_labels=result["candidate_labels"],
-            probe_labels=result["probe_labels"],
-            topk=(1, 5),
-            far_points=(1e-3,),
-        )
-        eers.append(float(metrics["eer"]))
-    genuine_stack = np.stack(genuine_densities)
-    impostor_stack = np.stack(impostor_densities)
-    genuine_mean = genuine_stack.mean(axis=0)
-    impostor_mean = impostor_stack.mean(axis=0)
-    return {
-        "genuine_mean": genuine_mean,
-        "genuine_std": genuine_stack.std(axis=0),
-        "impostor_mean": impostor_mean,
-        "impostor_std": impostor_stack.std(axis=0),
-        "threshold_mean": float(np.mean(thresholds)),
-        "threshold_std": float(np.std(thresholds)),
-        "eer_mean": float(np.mean(eers)),
-        "eer_std": float(np.std(eers)),
-        "overlap": float(np.trapezoid(np.minimum(genuine_mean, impostor_mean), grid)),
-    }
-
-
-def score_grid(seed_results: list[dict[str, torch.Tensor]]) -> np.ndarray:
-    values = []
-    for result in seed_results:
-        for key, index in (("base_branch_scores", 0), ("fused_scores", None)):
-            scores = result[key]
-            if index is not None:
-                scores = scores[:, :, index]
-            genuine, impostor = genuine_impostor(
-                scores,
-                result["probe_labels"],
-                result["candidate_labels"],
-            )
-            genuine, impostor = impostor_normalize(genuine, impostor)
-            values.extend((genuine, impostor))
+        values.extend((genuine, impostor))
     combined = np.concatenate(values)
     lower, upper = np.quantile(combined, [0.001, 0.999])
     padding = 0.06 * (upper - lower)
@@ -746,30 +732,14 @@ def score_grid(seed_results: list[dict[str, torch.Tensor]]) -> np.ndarray:
 
 
 def plot_score_density(ax: plt.Axes, grid: np.ndarray, summary: dict[str, Any], panel: str, title: str) -> None:
-    g = summary["genuine_mean"]
-    i = summary["impostor_mean"]
+    g = summary["genuine_density"]
+    i = summary["impostor_density"]
     ax.fill_between(grid, 0, i, color=IMPOSTOR, alpha=0.17)
     ax.fill_between(grid, 0, g, color=GENUINE, alpha=0.17)
     ax.fill_between(grid, 0, np.minimum(g, i), color="#8A8F98", alpha=0.16, hatch="////", edgecolor="#8A8F98", linewidth=0.0)
     ax.plot(grid, i, color=IMPOSTOR, linewidth=1.7, label="Impostor")
     ax.plot(grid, g, color=GENUINE, linewidth=1.7, linestyle="--", label="Genuine")
-    ax.fill_between(
-        grid,
-        np.maximum(0.0, i - summary["impostor_std"]),
-        i + summary["impostor_std"],
-        color=IMPOSTOR,
-        alpha=0.08,
-        linewidth=0,
-    )
-    ax.fill_between(
-        grid,
-        np.maximum(0.0, g - summary["genuine_std"]),
-        g + summary["genuine_std"],
-        color=GENUINE,
-        alpha=0.08,
-        linewidth=0,
-    )
-    threshold = summary["threshold_mean"]
+    threshold = summary["threshold"]
     ax.axvline(threshold, color=INK, linestyle=":", linewidth=1.25)
     ax.text(
         threshold,
@@ -789,7 +759,7 @@ def plot_score_density(ax: plt.Axes, grid: np.ndarray, summary: dict[str, Any], 
     ax.text(
         0.98,
         0.94,
-        f"EER {summary['eer_mean']*100:.3f}±{summary['eer_std']*100:.3f}%\nOverlap {summary['overlap']:.3f}",
+        f"EER {summary['eer']*100:.3f}%\nOverlap {summary['overlap']:.3f}",
         transform=ax.transAxes,
         ha="right",
         va="top",
@@ -818,27 +788,22 @@ def quantile_groups(values: np.ndarray, count: int = 5) -> np.ndarray:
 
 
 def create_figure_two(
-    seed_results: list[dict[str, torch.Tensor]], output_dir: Path, dataset: str
+    result: dict[str, torch.Tensor], output_dir: Path, dataset: str
 ) -> dict[str, Any]:
-    grid = score_grid(seed_results)
-    available_summary = kde_summary(seed_results, "base_branch_scores", 0, grid)
-    fused_summary = kde_summary(seed_results, "fused_scores", None, grid)
+    grid = score_grid(result)
+    available_summary = kde_summary(result, "base_branch_scores", 0, grid)
+    fused_summary = kde_summary(result, "fused_scores", None, grid)
 
-    uncertainty = np.stack([result["log_variance"].exp().numpy() for result in seed_results]).mean(axis=0)
-    recovery_error = np.stack(
-        [
-            (
-                1.0
-                - F.cosine_similarity(
-                    result["mean"],
-                    result["target_embedding"],
-                    dim=1,
-                )
-            ).numpy()
-            for result in seed_results
-        ]
-    ).mean(axis=0)
-    weights = np.stack([result["branch_weights"].numpy() for result in seed_results]).mean(axis=0)
+    uncertainty = result["log_variance"].exp().numpy()
+    recovery_error = (
+        1.0
+        - F.cosine_similarity(
+            result["mean"],
+            result["target_embedding"],
+            dim=1,
+        )
+    ).numpy()
+    weights = result["branch_weights"].numpy()
     groups = quantile_groups(uncertainty, count=5)
     log_uncertainty = np.log10(np.clip(uncertainty, 1e-8, None))
     rho, p_value = spearmanr(log_uncertainty, recovery_error)
@@ -870,7 +835,7 @@ def create_figure_two(
     fig.text(
         0.5,
         0.947,
-        f"{DISPLAY_NAMES[dataset]} · palm available → palm vein missing · full checkpoints, seeds 42/43/44 · n={uncertainty.size} probes",
+        f"{DISPLAY_NAMES[dataset]} · palm available → palm vein missing · seed 42 full checkpoint · n={uncertainty.size} probes",
         ha="center",
         va="center",
         fontsize=7.5,
@@ -973,24 +938,22 @@ def create_figure_two(
     return {
         "dataset": dataset,
         "direction": "palm_available_palmvein_missing",
-        "seeds": [42, 43, 44],
+        "seed": 42,
         "probe_count": int(uncertainty.size),
-        "gallery_identity_count": int(seed_results[0]["candidate_labels"].numel()),
-        "score_counts_per_seed": {
+        "gallery_identity_count": int(result["candidate_labels"].numel()),
+        "score_counts": {
             "genuine": int(uncertainty.size),
             "impostor": int(
-                uncertainty.size * (seed_results[0]["candidate_labels"].numel() - 1)
+                uncertainty.size * (result["candidate_labels"].numel() - 1)
             ),
         },
         "uncertainty_scatter_observations": int(uncertainty.size),
         "available_score": {
-            "eer_mean": available_summary["eer_mean"],
-            "eer_std": available_summary["eer_std"],
+            "eer": available_summary["eer"],
             "distribution_overlap": available_summary["overlap"],
         },
         "fused_score": {
-            "eer_mean": fused_summary["eer_mean"],
-            "eer_std": fused_summary["eer_std"],
+            "eer": fused_summary["eer"],
             "distribution_overlap": fused_summary["overlap"],
         },
         "uncertainty_recovery_error_spearman": {
@@ -1096,18 +1059,19 @@ def main() -> None:
         args.extract_batch_size,
         args.num_workers,
     )
-    figure2_seed_results = []
-    checkpoint_hashes = {}
-    for seed in (42, 43, 44):
-        path = checkpoint_path(figure2_dataset, seed)
-        model, checkpoint = build_model(path, device)
-        verify_encoder_binding(checkpoint, figure2_palm_ckpt, figure2_vein_ckpt)
-        seed_result = run_model(model, figure2_features, device, include_encodings=False)
-        figure2_seed_results.append(seed_result["palm_available"])
-        checkpoint_hashes[str(seed)] = file_sha256(path)
-        del seed_result, model
-        torch.cuda.empty_cache()
-    figure_two_metrics = create_figure_two(figure2_seed_results, output_dir, figure2_dataset)
+    figure2_checkpoint_path = checkpoint_path(figure2_dataset, 42)
+    figure2_model, figure2_checkpoint = build_model(figure2_checkpoint_path, device)
+    verify_encoder_binding(
+        figure2_checkpoint, figure2_palm_ckpt, figure2_vein_ckpt
+    )
+    figure2_result = run_model(
+        figure2_model, figure2_features, device, include_encodings=False
+    )
+    figure_two_metrics = create_figure_two(
+        figure2_result["palm_available"], output_dir, figure2_dataset
+    )
+    del figure2_result, figure2_model
+    torch.cuda.empty_cache()
 
     metadata = {
         "figure1": figure_one_metrics,
@@ -1125,7 +1089,7 @@ def main() -> None:
                 "dataset": figure2_dataset,
                 "palm_encoder_sha256": file_sha256(figure2_palm_ckpt),
                 "vein_encoder_sha256": file_sha256(figure2_vein_ckpt),
-                "checkpoint_sha256": checkpoint_hashes,
+                "checkpoint_sha256": file_sha256(figure2_checkpoint_path),
                 "gallery_sha256": file_sha256(DATASETS[figure2_dataset]["gallery"]),
                 "protocol_sha256": file_sha256(DATASETS[figure2_dataset]["protocol"]),
             },

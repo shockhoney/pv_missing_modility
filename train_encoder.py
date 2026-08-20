@@ -254,6 +254,8 @@ def parse_args(argv=None):
     parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument("--warmup_epochs", type=int, default=0)
     args = parser.parse_args(argv)
+    if args.seed != 42:
+        raise ValueError("Encoder training is locked to seed 42")
     if args.modality == "vein":
         if not args.vein_pretrained:
             parser.error("--vein_pretrained is required for vein encoder training")

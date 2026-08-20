@@ -382,6 +382,9 @@ def parse_args(argv=None):
     parser.add_argument("--safe_weight", type=float, default=1.0)
     parser.add_argument("--evidence_weight", type=float, default=0.2)
     parser.add_argument("--anchor_weight", type=float, default=0.2)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.seed != 42:
+        raise ValueError("GIPSSR experiments are locked to seed 42")
+    return args
 
 

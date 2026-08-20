@@ -809,10 +809,18 @@ def _load(path: str, exists: int, mode: str):
 
 
 class MissingPairTxtDataset:
-    def __init__(self, list_file: str, transform_palm=None, transform_vein=None, split_filter: Optional[str] = None):
+    def __init__(
+        self,
+        list_file: str,
+        transform_palm=None,
+        transform_vein=None,
+        split_filter: Optional[str] = None,
+        paired_transform=None,
+    ):
         self.samples = _read_protocol(list_file, split_filter)
         self.transform_palm = transform_palm
         self.transform_vein = transform_vein
+        self.paired_transform = paired_transform
 
     def __len__(self):
         return len(self.samples)
@@ -821,6 +829,12 @@ class MissingPairTxtDataset:
         sample = self.samples[idx]
         palm = _load(sample["palm_path"], sample["palm_exists"], "RGB")
         vein = _load(sample["vein_path"], sample["vein_exists"], "L")
+        if (
+            self.paired_transform is not None
+            and sample["palm_exists"]
+            and sample["vein_exists"]
+        ):
+            palm, vein = self.paired_transform(palm, vein)
         if self.transform_palm:
             palm = self.transform_palm(palm)
         if self.transform_vein:

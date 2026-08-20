@@ -36,9 +36,8 @@ binding mismatch.
   recovery error relative to the gallery identity template; branch weights
   should adapt across uncertainty quintiles.
 - **Data:** selected-dataset palm-available / palm-vein-missing test direction,
-  full checkpoints for seeds 42/43/44. Score densities are averaged across
-  seed-specific KDEs. Probe-level diagnostics are averaged by probe before
-  binning, avoiding triple-counting the fixed test protocol.
+  the seed-42 full checkpoint. Score densities and probe-level diagnostics
+  are computed directly from that retained run before uncertainty binning.
 - **Visual family:** density comparison, scatter with binned intervals, and
   100% stacked bars.
 - **Encoding:** blue/orange for impostor/genuine distributions; four fixed
